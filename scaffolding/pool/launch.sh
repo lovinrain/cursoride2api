@@ -9,6 +9,7 @@
 #   ./launch.sh down           # tear it down
 #   ./launch.sh status         # status snapshot
 #   ./launch.sh tui            # interactive TUI
+#   ./launch.sh edit           # open launch.yaml in $EDITOR (defaults to vim)
 #
 # Override a single var without editing the YAML:
 #   POOL_SIZE=20 ./launch.sh up
@@ -16,6 +17,9 @@
 #
 # Use a different config file:
 #   RATLC_LAUNCH_CONFIG=/path/to/other.yaml ./launch.sh up
+#
+# Override the editor used by `edit`:
+#   EDITOR=nano ./launch.sh edit
 
 set -euo pipefail
 
@@ -25,6 +29,13 @@ CONFIG="${RATLC_LAUNCH_CONFIG:-$HERE/launch.yaml}"
 if [ ! -f "$CONFIG" ]; then
   echo "launch.sh: config not found: $CONFIG" >&2
   exit 1
+fi
+
+# Handle `edit` before any YAML parsing — it bypasses ratlc.mjs entirely and
+# just opens the config in $EDITOR (defaults to vim). exec'ing means the
+# editor's exit code becomes the script's exit code.
+if [ "${1:-}" = "edit" ]; then
+  exec "${EDITOR:-vim}" "$CONFIG"
 fi
 
 # Parse the YAML with sed: strip comments + blank lines, extract `KEY: value`
