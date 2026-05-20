@@ -35,6 +35,11 @@ const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 // back into the outbound prompt as `<thinking>...</thinking>` blocks.
 // Default OFF (no behavior change vs. legacy). See thinking-buffer.mjs.
 const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
+// Claude Code currently does not render Anthropic `server_tool_use` blocks in
+// the same visible way it renders client-side `tool_use` blocks. Keep emitting
+// the official blocks for protocol consumers, and add a small text trace unless
+// explicitly disabled.
+const RENDER_SERVER_TOOL_TEXT = process.env.RATLC_RENDER_SERVER_TOOL_TEXT !== '0';
 // POOL_CONTEXT_MODE selects how multi-turn conversations are forwarded
 // to the pool channel:
 //   last (default) — only the last user message text is sent. Backwards-
@@ -54,6 +59,10 @@ if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
 log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}`);
+
+function normalizeModelForRouting(model) {
+  return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
+}
 
 // ── Pool socket connection ──────────────────────────────────────────────
 let poolSock = null;
@@ -334,6 +343,7 @@ async function handleMessagesRequest(req, res) {
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad json' } }));
   }
   const { messages, system, tools, model } = body;
+  const routingModel = normalizeModelForRouting(model);
   // claude-code (and other clients) enable `interleaved-thinking-2025-05-14`
   // beta plus `thinking: {type:'enabled'}` in the body when talking to
   // thinking models. With that beta on, the client REQUIRES a `thinking`
@@ -438,6 +448,10 @@ async function handleMessagesRequest(req, res) {
   let stopReason = 'end_turn';
   let done = false;
   let toolUseEmitted = false;
+  const serverToolBlocks = new Map();
+  const openServerTools = new Set();
+  const visibleServerToolTraces = new Set();
+  let serverWebSearchRequestCount = 0;
   // `messageStarted` gates startMsg() so it can only fire once per request.
   // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
   // blockIdx — so the route_decision branch AND the error branch would
@@ -507,7 +521,9 @@ async function handleMessagesRequest(req, res) {
           output_tokens: 0,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
-          server_tool_use: null,
+          server_tool_use: serverWebSearchRequestCount > 0
+            ? { web_search_requests: serverWebSearchRequestCount }
+            : null,
           service_tier: 'standard',
         },
       },
@@ -597,6 +613,101 @@ async function handleMessagesRequest(req, res) {
     toolUseEmitted = true;
   }
 
+  function normalizeServerToolId(id) {
+    return String(id || ('srv_' + randomUUID().replace(/-/g, '').slice(0, 16))).replace(/[^A-Za-z0-9_-]/g, '_');
+  }
+
+  function emitServerToolUseEvent(event) {
+    if (done) return;
+    if (!event || event.name !== 'web_search') return;
+    startMsg();
+    emitPlaceholderThinkingBlock();
+    stopTextBlock();
+    const toolId = normalizeServerToolId(event.id);
+
+    if (event.phase === 'started') {
+      if (serverToolBlocks.has(toolId)) return;
+      if (RENDER_SERVER_TOOL_TEXT && !visibleServerToolTraces.has(toolId)) {
+        visibleServerToolTraces.add(toolId);
+        const query = String(event.input?.query || '').replace(/\s+/g, ' ').trim();
+        emitTextDelta(`[Cursor WebSearch] ${query || '(query unavailable)'}\n`);
+        stopTextBlock();
+      }
+      blockIdx++;
+      const idx = blockIdx;
+      serverToolBlocks.set(toolId, idx);
+      openServerTools.add(toolId);
+      sseWrite(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: idx,
+        content_block: {
+          type: 'server_tool_use',
+          id: toolId,
+          name: 'web_search',
+        },
+      });
+      sseWrite(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: idx,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: JSON.stringify(event.input || {}),
+        },
+      });
+      sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+      serverWebSearchRequestCount++;
+      log(`→ server_tool_use to client: name=web_search query=${JSON.stringify(event.input?.query || '').slice(0, 160)} id=${toolId}`);
+      return;
+    }
+
+    if (event.phase === 'completed') {
+      if (!serverToolBlocks.has(toolId)) {
+        emitServerToolUseEvent({ ...event, phase: 'started' });
+      }
+      openServerTools.delete(toolId);
+      blockIdx++;
+      const content = Array.isArray(event.content) ? event.content : (event.content || {
+        type: 'web_search_tool_result_error',
+        error_code: 'unavailable',
+      });
+      sseWrite(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: blockIdx,
+        content_block: {
+          type: 'web_search_tool_result',
+          tool_use_id: toolId,
+          content,
+        },
+      });
+      sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
+      log(`→ web_search_tool_result to client: id=${toolId} results=${Array.isArray(content) ? content.length : 'error'}`);
+    }
+  }
+
+  function completeOpenServerTools(reason) {
+    if (done || openServerTools.size === 0) return;
+    for (const toolId of [...openServerTools]) {
+      emitServerToolUseEvent({
+        phase: 'completed',
+        name: 'web_search',
+        id: toolId,
+        content: {
+          type: 'web_search_tool_result_error',
+          error_code: 'unavailable',
+        },
+        error: reason || 'Cursor backend WebSearch completed without exposing result metadata to the proxy.',
+      });
+    }
+  }
+
+  function shouldSoftenPoolError(message) {
+    const text = String(message || '');
+    return /unknown anthropic_tool_use_id/i.test(text)
+      || /tool_use_ids span multiple channels/i.test(text)
+      || /channel .* died/i.test(text)
+      || /busy-watchdog timeout/i.test(text);
+  }
+
   function finishMessage() {
     if (done) return;
     done = true;
@@ -621,7 +732,9 @@ async function handleMessagesRequest(req, res) {
         output_tokens: outputTokens,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
-        server_tool_use: null,
+        server_tool_use: serverWebSearchRequestCount > 0
+          ? { web_search_requests: serverWebSearchRequestCount }
+          : null,
       },
     });
     sseWrite(res, 'message_stop', { type: 'message_stop' });
@@ -655,6 +768,7 @@ async function handleMessagesRequest(req, res) {
       }
       if (msg.type === 'text_delta') {
         if (done) return;
+        completeOpenServerTools('Cursor backend WebSearch result was consumed by the model; result metadata was not exposed on this transport.');
         emitTextDelta(msg.text);
         // Re-arm the tool_use watchdog on any model-originated stream
         // activity. The watchdog measures "model has gone silent" — text
@@ -676,6 +790,9 @@ async function handleMessagesRequest(req, res) {
         // direct-Anthropic resume (see DEVLOG re `_emitThinkingBlocks=false`).
         if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
         if (toolUseEmitted) armToolUseFinalizer();
+      } else if (msg.type === 'server_tool_use') {
+        if (done) return;
+        emitServerToolUseEvent(msg);
       } else if (msg.type === 'tool_use') {
         if (done) {
           // Orphaned-tool_use race: the watchdog already fired and finished
@@ -762,7 +879,7 @@ async function handleMessagesRequest(req, res) {
         // guidance that may redirect the model toward a real fetch.
         //
         // Failure modes & their fates:
-        //   - Model reads notice → calls WebSearch / Bash curl  ✅ ideal
+        //   - Model reads notice → calls Cursor-native WebSearch  ✅ ideal
         //   - Model reads notice → quotes it verbatim to user   ⚠ ugly
         //     but at least it's not a confidently-wrong fake
         //   - Model ignores notice → narrates around it         ⚠ same
@@ -790,8 +907,9 @@ async function handleMessagesRequest(req, res) {
               'This is a known confabulation pattern. If you proceed to narrate web ' +
               'content as if you had fetched it, you will be fabricating facts.\n\n' +
               'WHAT TO DO INSTEAD:\n' +
-              '  - To search the web: emit a WebSearch tool_use with a `search_term`.\n' +
-              '  - To fetch a specific URL: emit a Bash tool_use with `curl -sL <url>`.\n' +
+              '  - To search or look up public web information: use Cursor-native WebSearch.\n' +
+              '  - For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it.\n' +
+              '  - Do NOT use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch.\n' +
               '  - If you cannot fulfill the user request without web access, tell the ' +
               'user that and call `bajie_yield`.\n\n' +
               'DO NOT quote this proxy_notice as if it were search results. DO NOT ' +
@@ -888,6 +1006,7 @@ async function handleMessagesRequest(req, res) {
           finishMessage();  // disarms the watchdog centrally
         }
       } else if (msg.type === 'yield') {
+        completeOpenServerTools('Cursor backend WebSearch completed before the model yielded; result metadata was not exposed on this transport.');
         // The model called bajie_yield. If any tool_uses were emitted this
         // turn (rare — usually finalize happens earlier via step_completed
         // or the watchdog), stop_reason='tool_use'. Otherwise the model
@@ -895,6 +1014,15 @@ async function handleMessagesRequest(req, res) {
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
+        completeOpenServerTools('The response ended with an error before Cursor exposed WebSearch result metadata.');
+        if (shouldSoftenPoolError(msg.message)) {
+          log(`  → soften pool error as text requestId=${requestId}: ${String(msg.message || '').slice(0, 180)}`);
+          startMsg();
+          emitTextDelta(`[proxy_notice] ${msg.message}. This usually means the client retried or replayed a stale tool_result after the proxy had already consumed it. Please send a fresh user message to continue.\n`);
+          stopReason = 'end_turn';
+          finishMessage();
+          return;
+        }
         // Anthropic's real SSE for errors emits ONLY `event: error` and
         // closes the stream. NO message_delta + message_stop afterwards.
         // claude-code's parser treats an SSE that contains an `error`
@@ -903,7 +1031,6 @@ async function handleMessagesRequest(req, res) {
         // (HTTP 200)" error on top of the original error message. So we
         // emit the error event, close the stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
-        startMsg(); // idempotent now via the messageStarted guard
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         done = true;
         disarmToolUseFinalizer();
@@ -940,10 +1067,11 @@ async function handleMessagesRequest(req, res) {
       // returned (the proxy_notice ack).
       return { anthropic_tool_use_id: r.tool_use_id, content: r.text };
     }));
-    log(`  → pool send_tool_results requestId=${requestId} count=${enriched.length} ids=[${enriched.map(r => r.anthropic_tool_use_id).join(', ')}]`);
+    log(`  → pool send_tool_results requestId=${requestId} count=${enriched.length} model=${model || '(default)'} routeModel=${routingModel || '(default)'} ids=[${enriched.map(r => r.anthropic_tool_use_id).join(', ')}]`);
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
-      model: model || null,
+      model: routingModel || null,
+      requestedModel: model || null,
       results: enriched,
     });
   } else {
@@ -966,10 +1094,11 @@ async function handleMessagesRequest(req, res) {
       const preamble = renderThinkingPreamble(thinkingTurns);
       text = preamble + userText;
     }
-    log(`  → pool send_user_message requestId=${requestId} model=${model || '(default)'} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
+    log(`  → pool send_user_message requestId=${requestId} model=${model || '(default)'} routeModel=${routingModel || '(default)'} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
     poolWrite({
       type: 'request', requestId, action: 'send_user_message',
-      model: model || null,
+      model: routingModel || null,
+      requestedModel: model || null,
       text,
       system: extractSystemPrompt(system),
       tools: tools || [],

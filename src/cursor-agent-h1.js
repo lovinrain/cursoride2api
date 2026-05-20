@@ -26,7 +26,8 @@
 //    • RunSSE: Node's `https.request` (NOT fetch). We need streaming
 //      response body reads and the ability to detect socket-level
 //      disconnects mid-stream. fetch's WHATWG ReadableStream loses this.
-//    • BidiAppend: Node's `fetch` is fine — unary request, no streaming.
+//    • BidiAppend: Node's `https.request`, also pinned to HTTP/1.1 so the
+//      whole service→Cursor path is auditable as H1-only.
 //
 //  Shared with cursor-agent.js (imported below):
 //    buildMcpToolDefinitions, handleExecMessage, handleKvMessage,
@@ -46,6 +47,7 @@ const {
   handleExecMessage,
   handleKvMessage,
   handleInteractionQuery,
+  extractWebSearchServerToolEvent,
   sendExecClientMessage,
   sendExecClientControlMessage,
   sendExecClientMessageAndClose,
@@ -117,6 +119,29 @@ function _wrapConnectRequest(payload) {
   return buf;
 }
 
+function httpsRequestText(opts, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(opts, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => resolve({
+        statusCode: res.statusCode || 0,
+        statusMessage: res.statusMessage || '',
+        headers: res.headers || {},
+        text,
+      }));
+      res.on('error', reject);
+    });
+    req.setTimeout(config.cursor.requestTimeout, () => {
+      req.destroy(new Error('BidiAppend request timeout'));
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 // ── Deterministic conversation UUID (same as cursor-agent.js) ──
 function deterministicConversationId(convKey) {
   const hex = crypto.createHash('sha256')
@@ -147,6 +172,7 @@ function startConversation(token, options = {}) {
     onTextDelta,
     onThinkingDelta,
     onMcpCall,
+    onServerToolUse,
     onStepCompleted,
     onTurnEnded,
     onError,
@@ -156,6 +182,7 @@ function startConversation(token, options = {}) {
     onTextDelta: onTextDelta || (() => {}),
     onThinkingDelta: onThinkingDelta || (() => {}),
     onMcpCall: onMcpCall || (() => {}),
+    onServerToolUse: onServerToolUse || (() => {}),
     onStepCompleted: onStepCompleted || (() => {}),
     onTurnEnded: onTurnEnded || (() => {}),
     onError: onError || (() => {}),
@@ -163,7 +190,7 @@ function startConversation(token, options = {}) {
 
   function setCallbacks(newCallbacks) {
     if (!newCallbacks || typeof newCallbacks !== 'object') return;
-    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onStepCompleted', 'onTurnEnded', 'onError']) {
+    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError']) {
       if (typeof newCallbacks[k] === 'function') {
         currentCallbacks[k] = newCallbacks[k];
       }
@@ -297,7 +324,6 @@ function startConversation(token, options = {}) {
   async function _doBidiAppend(seqno, dataHex) {
     if (closed) return;
     try {
-      const url = `${_baseUrl}/aiserver.v1.BidiService/BidiAppend`;
       const headers = {
         ..._commonHeaders(token, requestId, sessionId),
         'content-type': 'application/json',
@@ -308,28 +334,35 @@ function startConversation(token, options = {}) {
         // proto int64 → Connect-JSON encodes as string
         append_seqno: String(seqno),
       });
-      const res = await fetch(url, { method: 'POST', headers, body });
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
+      headers['content-length'] = String(Buffer.byteLength(body));
+      const res = await httpsRequestText({
+        method: 'POST',
+        host: _host,
+        port: _port,
+        path: '/aiserver.v1.BidiService/BidiAppend',
+        headers,
+        ALPNProtocols: ['http/1.1'],
+      }, body);
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        const text = res.text || '';
         // Always log — silent failures cause the channel to hang
         // because the SSE side keeps producing heartbeats while the
         // conversation can't progress.
-        console.log(`[cursor-agent-h1] BidiAppend FAIL seqno=${seqno} status=${res.status} body=${text.slice(0, 256)}`);
+        console.log(`[cursor-agent-h1] BidiAppend FAIL seqno=${seqno} status=${res.statusCode} body=${text.slice(0, 256)}`);
         // Surface to the bridge so it can either retry (if no content
         // has been emitted yet — initial runRequest case) or fail-fast
         // (mid-conversation case). failOrRetry's hasEmittedContent
         // gate handles both.
         if (_protoCached) {
-          failOrRetry(_protoCached, `BidiAppend seqno=${seqno} returned ${res.status}: ${text.slice(0, 200)}`, `ERR_BIDI_APPEND_${res.status}`);
+          failOrRetry(_protoCached, `BidiAppend seqno=${seqno} returned ${res.statusCode}: ${text.slice(0, 200)}`, `ERR_BIDI_APPEND_${res.statusCode}`);
         } else {
-          fail(`BidiAppend seqno=${seqno} returned ${res.status} before stream opened`);
+          fail(`BidiAppend seqno=${seqno} returned ${res.statusCode} before stream opened`);
         }
         return;
       }
       // Always log success too — when seeing 200s but no stream progress
       // we need to know the server got the payload but didn't act on it.
-      const okText = await res.text().catch(() => '');
-      console.log(`[cursor-agent-h1] BidiAppend OK seqno=${seqno} body=${okText.slice(0, 64)}`);
+      console.log(`[cursor-agent-h1] BidiAppend OK seqno=${seqno} body=${String(res.text || '').slice(0, 64)}`);
     } catch (e) {
       console.log(`[cursor-agent-h1] BidiAppend EXCEPTION seqno=${seqno} error: ${e.message}`);
       if (_protoCached) {
@@ -639,6 +672,11 @@ function startConversation(token, options = {}) {
         }
         return;
       }
+      const serverToolEvent = extractWebSearchServerToolEvent(iuCase, iuVal);
+      if (serverToolEvent) {
+        try { currentCallbacks.onServerToolUse(serverToolEvent); }
+        catch (e) { console.log(`[cursor-agent-h1] onServerToolUse threw: ${e.message}`); }
+      }
       return;
     }
     if (msgCase === 'conversationCheckpointUpdate') {
@@ -661,6 +699,7 @@ function startConversation(token, options = {}) {
       markUsefulFrame();
       handleInteractionQuery(msg.message.value, sendBinaryFrame, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        onServerToolUse: currentCallbacks.onServerToolUse,
       });
       return;
     }
@@ -771,9 +810,8 @@ function startConversation(token, options = {}) {
       port: _port,
       path: '/agent.v1.AgentService/RunSSE',
       headers,
-      // Force HTTP/1.1 by NOT setting ALPNProtocols (default is 'h2','http/1.1'
-      // but the http module won't try h2). We do this implicitly by using
-      // https.request rather than http2.connect.
+      // Force HTTP/1.1 at TLS ALPN as well as at the Node API layer.
+      ALPNProtocols: ['http/1.1'],
     };
 
     sseReq = https.request(opts, (res) => {

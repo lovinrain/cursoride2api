@@ -146,7 +146,7 @@ function buildPrimingPrompt(system, callerTools) {
   // and Y". The model has the explicit tool list in its prompt; we want it
   // to feel free to use whatever's there, including Cursor's native built-ins
   // (Shell, Read, Write, Grep, ...) that get auto-injected alongside ours.
-  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND any Cursor-native built-ins (such as Shell/Read/Write/Grep/Glob/WebFetch/etc.) that may be present.');
+  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND Cursor-native built-ins. For broad web search, use Cursor-native WebSearch. For a user-explicit URL fetch or a curl test, Bash/curl is allowed when the environment permits it. Do not use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch.');
   lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
   if (POOL_CONTEXT_MODE === 'full') {
     // Full-context mode: each bajie_yield result carries the entire
@@ -194,6 +194,7 @@ function openOnce(initialPrompt, allTools) {
       // currentRequestId exists yet — drop those frames silently. The
       // live-callbacks attachment below is where forwarding kicks in.
       onThinkingDelta: () => {},
+      onServerToolUse: () => {},
       onStepCompleted: () => {},
       onTurnEnded: () => { if (!yieldInfo) resolve({ kind: 'no_yield', textBuf }); },
       onError: (err) => {
@@ -363,6 +364,16 @@ function attachLiveCallbacks() {
         });
         // We stay busy until tool_result(s) feed in.
       }
+    },
+    onServerToolUse: (event) => {
+      if (currentRequestId == null) return;
+      lastActivityAt = Date.now();
+      send({
+        type: 'server_tool_use',
+        channelId: CHANNEL_ID,
+        requestId: currentRequestId,
+        ...event,
+      });
     },
     onStepCompleted: () => {
       // Forward step boundaries so api-server can finalize a tool_use turn

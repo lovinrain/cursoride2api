@@ -43,7 +43,9 @@ const POOL_PID = '/tmp/ratlc-pool.pid';
 const API_PID = '/tmp/ratlc-api.pid';
 const POOL_LOG = '/tmp/ratlc-pool.log';
 const API_LOG = '/tmp/ratlc-api.log';
-const API_URL = process.env.RATLC_API_URL || 'http://127.0.0.1:4242';
+const RATLC_API_HOST = process.env.RATLC_API_HOST || '127.0.0.1';
+const RATLC_API_PORT = process.env.RATLC_API_PORT || '4242';
+const API_URL = process.env.RATLC_API_URL || `http://${RATLC_API_HOST}:${RATLC_API_PORT}`;
 
 // ── ANSI helpers ─────────────────────────────────────────────────────────
 const ANSI = {
@@ -133,6 +135,8 @@ async function cmdUp(args) {
   const env = {
     ...process.env,
     POOL_SIZE: String(size),
+    HOST: RATLC_API_HOST,
+    PORT: RATLC_API_PORT,
   };
   // Defaults we always want exposed:
   env.LOG_REQUEST_TOOLS = '1';

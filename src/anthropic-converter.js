@@ -3,6 +3,7 @@
 // ═══════════════════════════════════════════════
 
 const { v4: uuidv4 } = require('uuid');
+const anthropicToolsPolicy = require('./anthropic-tools');
 
 /**
  * Parse a Bash command string for common file-write idioms and return
@@ -136,6 +137,45 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
   }
 
   const parts = [];
+
+  let clientToolNames = Array.isArray(opts.clientTools)
+    ? opts.clientTools.map(t => t && t.name).filter(Boolean)
+    : [];
+  const hadNativeSearchTool = clientToolNames.some(name => anthropicToolsPolicy.isClientWebSearchToolName(name));
+  const hadBlockedWebLookupTool = clientToolNames.some(name => anthropicToolsPolicy.shouldDropClientWebLookupToolName(name));
+  if (clientToolNames.length > 0) {
+    clientToolNames = clientToolNames.filter(name => !anthropicToolsPolicy.shouldDropClientWebLookupToolName(name));
+  }
+  if (clientToolNames.length > 0) {
+    const prefixedByCursor = new Set([
+      'Read', 'Write', 'Grep', 'Glob', 'WebFetch',
+      'Shell', 'Delete', 'Task', 'TodoWrite', 'AskQuestion',
+      'ListMcpResources', 'ReadLints', 'SwitchMode', 'Ls', 'Fetch',
+      'Diagnostics',
+    ]);
+    const shown = clientToolNames.slice(0, 40).map((name) => (
+      prefixedByCursor.has(name) ? `${name} (may appear as mcp_${name})` : name
+    )).join(', ');
+    const more = clientToolNames.length > 40 ? `, ... (${clientToolNames.length - 40} more)` : '';
+    parts.push(
+      `<system>\n` +
+      `Tool routing note: this conversation is running through cursoride2api as an API bridge. ` +
+      `The MCP/function tools listed for this turn were declared by the external API client ` +
+      `(for example Claude Code), not by the user's Cursor IDE configuration. ` +
+      `When one of these tools is needed, call it normally; do not tell the user to configure it in Cursor. ` +
+      `If Cursor shows an mcp_ prefix for a tool, it is the same client-declared tool with a collision-safe name. ` +
+      `Broad web search and public web lookup requests must be handled by Cursor's native WebSearch, not by client-declared MCP WebSearch, WebFetch, or Fetch. For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files. ` +
+      `Available client-declared tools for this request: ${shown}${more}.\n` +
+      `</system>`
+    );
+  } else if (hadNativeSearchTool || hadBlockedWebLookupTool) {
+    parts.push(
+      `<system>\n` +
+      `Web search is provided by Cursor's native WebSearch in this bridge. ` +
+      `Do not look for or call client-declared MCP WebSearch, WebFetch, Fetch, or mcp_ variants. Do not use Bash, Shell, curl, wget, or local HTTP requests as a broad-search fallback. For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files.\n` +
+      `</system>`
+    );
+  }
 
   // 处理 system prompt
   if (system) {

@@ -15,6 +15,8 @@
 
 const http2 = require('http2');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const { v4: uuidv4 } = require('uuid');
 const config = require('./config');
 const { generateChecksum } = require('./cursor-client');
@@ -433,6 +435,372 @@ function decodeMcpArgs(argsMap) {
 }
 
 // ═══════════════════════════════════════════════
+//  URL guard helpers for Cursor-native fetchArgs
+// ═══════════════════════════════════════════════
+const SERVER_FETCH_ENABLED = process.env.CURSOR_SERVER_WEBFETCH === '1';
+const SERVER_FETCH_TIMEOUT_MS = (() => {
+  const raw = process.env.CURSOR_SERVER_WEBFETCH_TIMEOUT_MS;
+  const n = raw == null || raw === '' ? 15000 : parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 15000;
+})();
+const SERVER_FETCH_MAX_BYTES = (() => {
+  const raw = process.env.CURSOR_SERVER_WEBFETCH_MAX_BYTES;
+  const n = raw == null || raw === '' ? 1_500_000 : parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 1_500_000;
+})();
+const LOCAL_SHELL_NETWORK_ENABLED = process.env.CURSOR_ALLOW_LOCAL_SHELL_NETWORK === '1';
+const AGENT_TOOL_PLACEHOLDER_WRITES_ENABLED = process.env.CURSOR_ALLOW_AGENT_TOOL_PLACEHOLDER_WRITES === '1';
+
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    const [a, b] = parts;
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      a === 169 && b === 254 ||
+      a === 172 && b >= 16 && b <= 31 ||
+      a === 192 && b === 168 ||
+      a >= 224
+    );
+  }
+  if (net.isIPv6(ip)) {
+    const normalized = ip.toLowerCase();
+    return (
+      normalized === '::1' ||
+      normalized === '::' ||
+      normalized.startsWith('fc') ||
+      normalized.startsWith('fd') ||
+      normalized.startsWith('fe8') ||
+      normalized.startsWith('fe9') ||
+      normalized.startsWith('fea') ||
+      normalized.startsWith('feb') ||
+      normalized.startsWith('ff')
+    );
+  }
+  return true;
+}
+
+async function assertPublicFetchUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Invalid URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http and https URLs are supported');
+  }
+  const hostname = parsed.hostname;
+  if (!hostname) throw new Error('URL hostname is required');
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    throw new Error('Localhost URLs are blocked');
+  }
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) throw new Error('Private or local IP URLs are blocked');
+    return parsed;
+  }
+  let records;
+  try {
+    records = await dns.lookup(hostname, { all: true, verbatim: true });
+  } catch (e) {
+    throw new Error(`DNS lookup failed: ${e.message}`);
+  }
+  if (!records || records.length === 0) throw new Error('DNS lookup returned no addresses');
+  for (const rec of records) {
+    if (isPrivateIp(rec.address)) {
+      throw new Error('DNS resolves to a private or local address');
+    }
+  }
+  return parsed;
+}
+
+function htmlToReadableText(html) {
+  const raw = String(html || '');
+  const metadata = [];
+  const title = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (title && title[1]) metadata.push(`Title: ${htmlToPlainSnippet(title[1])}`);
+  const metaRe = /<meta\b([^>]*?)>/gi;
+  let metaMatch;
+  while ((metaMatch = metaRe.exec(raw)) !== null) {
+    const attrs = parseHtmlAttributes(metaMatch[1] || '');
+    const key = attrs.name || attrs.property || attrs.itemprop;
+    const value = attrs.content;
+    if (!key || !value) continue;
+    if (/^(description|keywords|og:title|og:description|twitter:title|twitter:description|name|author)$/i.test(key)) {
+      metadata.push(`${key}: ${htmlToPlainSnippet(value)}`);
+    }
+  }
+  const body = raw
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<\/(p|div|section|article|header|footer|main|aside|nav|li|tr|h[1-6]|blockquote)>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const n = parseInt(hex, 16);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : ' ';
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const n = parseInt(dec, 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : ' ';
+    })
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/\n\s+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  const uniq = [];
+  const seen = new Set();
+  for (const line of metadata) {
+    const key = line.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(line);
+  }
+  const combined = [...uniq, body].filter(Boolean).join('\n\n').trim();
+  return combined || '[No readable text was found in the HTML. The page may require JavaScript rendering.]';
+}
+
+function parseHtmlAttributes(src) {
+  const attrs = {};
+  const re = /([:\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    attrs[m[1].toLowerCase()] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return attrs;
+}
+
+function htmlToPlainSnippet(text) {
+  return String(text || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const n = parseInt(hex, 16);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : ' ';
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const n = parseInt(dec, 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : ' ';
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isRedirectStatus(status) {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function formatFetchContent(resultData) {
+  return [
+    `URL: ${resultData.url}`,
+    `Status: ${resultData.statusCode}`,
+    `Content-Type: ${resultData.contentType}`,
+    '',
+    resultData.content || '',
+  ].join('\n');
+}
+
+async function fetchUrlForCursor(url) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error('Fetch timed out')), SERVER_FETCH_TIMEOUT_MS);
+  try {
+    let currentUrl = url;
+    let response = null;
+    let parsed = null;
+    for (let redirects = 0; redirects <= 5; redirects++) {
+      parsed = await assertPublicFetchUrl(currentUrl);
+      response = await fetch(parsed.toString(), {
+        signal: ac.signal,
+        redirect: 'manual',
+        headers: {
+          'user-agent': `Mozilla/5.0 (compatible; cursoride2api/${config.cursor.clientVersion}; +https://cursor.sh)`,
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,application/json;q=0.8,*/*;q=0.5',
+          'accept-language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7',
+        },
+      });
+      if (!isRedirectStatus(response.status)) break;
+      const location = response.headers.get('location');
+      if (!location) break;
+      currentUrl = new URL(location, parsed).toString();
+      if (redirects === 5) throw new Error('Too many redirects');
+    }
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+    if (!reader) {
+      const text = await response.text();
+      const content = /html/i.test(contentType) ? htmlToReadableText(text) : text;
+      return {
+        url: response.url || parsed.toString(),
+        statusCode: response.status,
+        contentType,
+        content: content.slice(0, SERVER_FETCH_MAX_BYTES),
+      };
+    }
+    const chunks = [];
+    let total = 0;
+    let truncated = false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const remaining = SERVER_FETCH_MAX_BYTES - total;
+      if (remaining <= 0) {
+        truncated = true;
+        try { await reader.cancel(); } catch { /* ignore */ }
+        break;
+      }
+      const chunk = value.length > remaining ? value.slice(0, remaining) : value;
+      chunks.push(Buffer.from(chunk));
+      total += chunk.length;
+      if (value.length > remaining) {
+        truncated = true;
+        try { await reader.cancel(); } catch { /* ignore */ }
+        break;
+      }
+    }
+    let content = Buffer.concat(chunks).toString('utf8');
+    if (/html/i.test(contentType)) content = htmlToReadableText(content);
+    if (truncated) {
+      content += `\n\n[Content truncated at ${SERVER_FETCH_MAX_BYTES} bytes by cursoride2api]`;
+    }
+    return {
+      url: response.url || parsed.toString(),
+      statusCode: response.status,
+      contentType,
+      content,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeFetchToolName(toolName) {
+  return String(toolName || '')
+    .replace(/^mcp_/, '')
+    .replace(/^mcp__[^_]+__/, '');
+}
+
+function isServerFetchTool(toolName) {
+  const normalized = normalizeFetchToolName(toolName).toLowerCase();
+  return normalized === 'webfetch' || normalized === 'fetch';
+}
+
+function extractFetchToolUrl(args) {
+  if (!args || typeof args !== 'object') return '';
+  return args.url || args.uri || args.href || args.URL || '';
+}
+
+function isShellTool(toolName) {
+  const normalized = normalizeFetchToolName(toolName).toLowerCase();
+  return normalized === 'bash' || normalized === 'shell';
+}
+
+function extractShellCommand(args) {
+  if (!args || typeof args !== 'object') return '';
+  return args.command || args.cmd || args.script || '';
+}
+
+function looksLikeAgentToolPlaceholderWrite(path, content) {
+  const p = String(path || '').replace(/\\/g, '/');
+  const c = String(content ?? '').trim();
+  return /^agent-tools\/[^/]+\.txt$/i.test(p) && (c === '' || c === '(No content)');
+}
+
+function sendMcpTextResult(create, A, id, execId, text, sendBinaryFrame) {
+  const mcpResult = create(A.McpResultSchema, {
+    result: {
+      case: 'success',
+      value: create(A.McpSuccessSchema, {
+        content: [
+          create(A.McpToolResultContentItemSchema, {
+            content: {
+              case: 'text',
+              value: create(A.McpTextContentSchema, { text }),
+            },
+          }),
+        ],
+        isError: false,
+      }),
+    },
+  });
+  sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+}
+
+function sendMcpErrorResult(create, A, id, execId, error, sendBinaryFrame) {
+  const mcpResult = create(A.McpResultSchema, {
+    result: { case: 'error', value: create(A.McpErrorSchema, { error }) },
+  });
+  sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
+}
+
+function shellCommandLooksNetworked(command) {
+  const c = String(command || '').toLowerCase();
+  return /\b(curl|wget|httpie|http|https|lynx|links|elinks|w3m)\b/.test(c) ||
+    /\b(python|python3|node|perl|ruby|php)\b[\s\S]*\b(requests|urllib|fetch|axios|http\.get|https\.get)\b/.test(c) ||
+    /https?:\/\//.test(c);
+}
+
+function rejectNativeShell(A, create, id, execId, msgValue, sendBinaryFrame, reason) {
+  const result = create(A.ShellResultSchema, {
+    result: {
+      case: 'rejected',
+      value: create(A.ShellRejectedSchema, {
+        command: msgValue?.command || '',
+        workingDirectory: msgValue?.workingDirectory || msgValue?.working_directory || '',
+        reason,
+        isReadonly: false,
+      }),
+    },
+  });
+  sendExecClientMessageAndClose(id, execId, 'shellResult', result, sendBinaryFrame);
+}
+
+function rejectNativeShellStream(A, create, id, execId, msgValue, sendBinaryFrame, reason) {
+  const result = create(A.ShellStreamSchema, {
+    event: {
+      case: 'rejected',
+      value: create(A.ShellRejectedSchema, {
+        command: msgValue?.command || '',
+        workingDirectory: msgValue?.workingDirectory || msgValue?.working_directory || '',
+        reason,
+        isReadonly: false,
+      }),
+    },
+  });
+  sendExecClientMessageAndClose(id, execId, 'shellStream', result, sendBinaryFrame);
+}
+
+function rejectNativeBackgroundShell(A, create, id, execId, msgValue, sendBinaryFrame, reason) {
+  const result = create(A.BackgroundShellSpawnResultSchema, {
+    result: {
+      case: 'rejected',
+      value: create(A.ShellRejectedSchema, {
+        command: msgValue?.command || '',
+        workingDirectory: msgValue?.workingDirectory || msgValue?.working_directory || '',
+        reason,
+        isReadonly: false,
+      }),
+    },
+  });
+  sendExecClientMessageAndClose(id, execId, 'backgroundShellSpawnResult', result, sendBinaryFrame);
+}
+
+// ═══════════════════════════════════════════════
 //  Build McpToolDefinition list for RequestContext / runRequest
 // ═══════════════════════════════════════════════
 // Cursor's upstream Anthropic provider rejects requests with tool-name
@@ -555,6 +923,13 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
   // to the right native result schema by consulting nativeExecKinds.
   if (passthroughNative && nativeExecKinds) {
     if (msgCase === 'shellArgs') {
+      if (!LOCAL_SHELL_NETWORK_ENABLED && shellCommandLooksNetworked(msgValue?.command || '')) {
+        rejectNativeShell(
+          A, create, id, execId, msgValue, sendBinaryFrame,
+          'Local network shell commands are disabled. All web search requests must be handled by Cursor native WebSearch.'
+        );
+        return 'shell-network-disabled';
+      }
       const args = {
         command: msgValue?.command || '',
         ...(msgValue?.working_directory ? { description: `(cwd: ${msgValue.working_directory})` } : {}),
@@ -564,6 +939,13 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'shell-passthrough';
     }
     if (msgCase === 'shellStreamArgs') {
+      if (!LOCAL_SHELL_NETWORK_ENABLED && shellCommandLooksNetworked(msgValue?.command || '')) {
+        rejectNativeShellStream(
+          A, create, id, execId, msgValue, sendBinaryFrame,
+          'Local network shell commands are disabled. All web search requests must be handled by Cursor native WebSearch.'
+        );
+        return 'shellStream-network-disabled';
+      }
       // Streaming shell — same idea as shellArgs but the result is a
       // ShellStream (multi-event), not a ShellResult. Routes to Bash too;
       // sendToolResult builds stdout + exit events.
@@ -576,6 +958,13 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'shellStream-passthrough';
     }
     if (msgCase === 'backgroundShellSpawnArgs') {
+      if (!LOCAL_SHELL_NETWORK_ENABLED && shellCommandLooksNetworked(msgValue?.command || '')) {
+        rejectNativeBackgroundShell(
+          A, create, id, execId, msgValue, sendBinaryFrame,
+          'Local network shell commands are disabled. All web search requests must be handled by Cursor native WebSearch.'
+        );
+        return 'backgroundShell-network-disabled';
+      }
       const args = {
         command: msgValue?.command || '',
         run_in_background: true,
@@ -595,6 +984,19 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'read-passthrough';
     }
     if (msgCase === 'writeArgs') {
+      if (!AGENT_TOOL_PLACEHOLDER_WRITES_ENABLED && looksLikeAgentToolPlaceholderWrite(msgValue?.path || '', msgValue?.file_text || '')) {
+        const result = create(A.WriteResultSchema, {
+          result: {
+            case: 'rejected',
+            value: create(A.WriteRejectedSchema, {
+              path: msgValue?.path || '',
+              reason: 'Empty agent-tools placeholder writes are disabled. Do not create local placeholder files for unavailable web/search tools.',
+            }),
+          },
+        });
+        sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
+        return 'write-agent-tools-placeholder-disabled';
+      }
       nativeExecKinds.set(execId, { kind: 'write', path: msgValue?.path || '' });
       onMcpCall({
         id, execId,
@@ -605,25 +1007,46 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       return 'write-passthrough';
     }
     if (msgCase === 'fetchArgs') {
-      // Cursor's FetchArgs proto only carries `url` and `tool_call_id` —
-      // there's no model-supplied prompt/query field. Previously we
-      // hardcoded "Summarize this content." which biased every WebFetch
-      // toward a summary regardless of what the model actually wanted to
-      // extract (a price, a date, a structured field). Switch to a neutral
-      // "return the content as-is" instruction so claude-code's WebFetch
-      // extraction layer doesn't pre-summarize. See WEBSEARCH_WEBFETCH_REVIEW.md
-      // Issue 3 for context.
-      nativeExecKinds.set(execId, { kind: 'fetch', url: msgValue?.url || '' });
-      onMcpCall({
-        id, execId,
-        toolCallId: `native-fetch-${execId.slice(0, 8)}`,
-        toolName: 'WebFetch',
-        args: {
-          url: msgValue?.url || '',
-          prompt: 'Return the page content as-is for the calling model to interpret. Do not summarize, do not filter.',
+      const url = msgValue?.url || '';
+      if (SERVER_FETCH_ENABLED) {
+        fetchUrlForCursor(url)
+          .then((resultData) => {
+            const result = create(A.FetchResultSchema, {
+              result: {
+                case: 'success',
+                value: create(A.FetchSuccessSchema, {
+                  url: resultData.url,
+                  content: resultData.content,
+                  statusCode: resultData.statusCode,
+                  contentType: resultData.contentType,
+                }),
+              },
+            });
+            sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
+            if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+              console.log(`[cursor-agent] server-webfetch ok url=${url.slice(0, 160)} status=${resultData.statusCode} bytes=${Buffer.byteLength(resultData.content || '')}`);
+            }
+          })
+          .catch((e) => {
+            const result = create(A.FetchResultSchema, {
+              result: { case: 'error', value: create(A.FetchErrorSchema, { url, error: e.message || 'Fetch failed' }) },
+            });
+            sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
+            console.log(`[cursor-agent] server-webfetch failed url=${url.slice(0, 160)} error=${e.message}`);
+        });
+        return 'fetch-server';
+      }
+      const result = create(A.FetchResultSchema, {
+        result: {
+          case: 'error',
+          value: create(A.FetchErrorSchema, {
+            url,
+            error: 'Local WebFetch is disabled. Use Cursor native WebSearch for web lookup; do not fetch URLs from the proxy host.',
+          }),
         },
       });
-      return 'fetch-passthrough';
+      sendExecClientMessageAndClose(id, execId, 'fetchResult', result, sendBinaryFrame);
+      return 'fetch-disabled';
     }
     if (msgCase === 'grepArgs') {
       nativeExecKinds.set(execId, 'grep');
@@ -667,7 +1090,14 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       repositoryInfo: [],
       gitRepos: [],
       projectLayouts: [],
-      mcpInstructions: [],
+      mcpInstructions: mcpToolDefs.length > 0 ? [
+        create(A.McpInstructionsSchema, {
+          serverName: 'cursoride2api-client-tools',
+          instructions:
+            'These MCP/function tools were declared by the external API client for this request and are executed through the cursoride2api bridge. They are not configured inside the user\'s Cursor IDE. If a listed tool is relevant, call it normally instead of asking the user to configure it in Cursor. Some tools may be exposed with an mcp_ prefix to avoid collisions with Cursor-native tools; use that prefixed name when shown.',
+        }),
+      ] : [],
+      webSearchEnabled: true,
       fileContents: {},
       customSubagents: [],
     });
@@ -684,11 +1114,53 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     const args = decodeMcpArgs(m.args || {});
     const toolCallId = m.toolCallId || `tc_${Math.random().toString(36).slice(2)}`;
     const toolName = m.toolName || m.name || '';
+    if (SERVER_FETCH_ENABLED && isServerFetchTool(toolName)) {
+      const url = extractFetchToolUrl(args);
+      fetchUrlForCursor(url)
+        .then((resultData) => {
+          const resultText = formatFetchContent(resultData);
+          sendMcpTextResult(create, A, id, execId, resultText, sendBinaryFrame);
+          if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+            console.log(`[cursor-agent] server-mcp-webfetch ok tool=${toolName} url=${url.slice(0, 160)} status=${resultData.statusCode} bytes=${Buffer.byteLength(resultData.content || '')}`);
+          }
+        })
+        .catch((e) => {
+          sendMcpErrorResult(create, A, id, execId, e.message || 'Fetch failed', sendBinaryFrame);
+          console.log(`[cursor-agent] server-mcp-webfetch failed tool=${toolName} url=${url.slice(0, 160)} error=${e.message}`);
+        });
+      return 'mcp-webfetch-server';
+    }
+    if (!SERVER_FETCH_ENABLED && isServerFetchTool(toolName)) {
+      sendMcpErrorResult(
+        create, A, id, execId,
+        'Local WebFetch is disabled. Use Cursor native WebSearch for web lookup; do not fetch URLs from the proxy host.',
+        sendBinaryFrame
+      );
+      return 'mcp-webfetch-disabled';
+    }
+    if (!LOCAL_SHELL_NETWORK_ENABLED && isShellTool(toolName) && shellCommandLooksNetworked(extractShellCommand(args))) {
+      sendMcpErrorResult(
+        create, A, id, execId,
+        'Local network shell commands are disabled. All web search requests must be handled by Cursor native WebSearch.',
+        sendBinaryFrame
+      );
+      return 'mcp-shell-network-disabled';
+    }
+    if (!AGENT_TOOL_PLACEHOLDER_WRITES_ENABLED && normalizeFetchToolName(toolName).toLowerCase() === 'write' &&
+        looksLikeAgentToolPlaceholderWrite(args.file_path || args.path || '', args.content || '')) {
+      sendMcpErrorResult(
+        create, A, id, execId,
+        'Empty agent-tools placeholder writes are disabled. Do not create local placeholder files for unavailable web/search tools.',
+        sendBinaryFrame
+      );
+      return 'mcp-write-agent-tools-placeholder-disabled';
+    }
     onMcpCall({ id, execId, toolCallId, toolName, args });
     return 'mcp';
   }
 
   const REJECT_REASON = 'Tool not available; use MCP tools.';
+  const HEADLESS_REASON = 'Tool not available in the headless API proxy.';
 
   // ── Reject native Cursor tools so the model falls back to MCP ──
   // Every reject path emits a single ExecClientMessage and then must close
@@ -810,6 +1282,47 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     return 'listMcpResources';
   }
 
+  if (msgCase === 'readMcpResourceExecArgs') {
+    const result = create(A.ReadMcpResourceExecResultSchema, {
+      result: {
+        case: 'rejected',
+        value: create(A.ReadMcpResourceRejectedSchema, {
+          uri: msgValue?.uri || '',
+          reason: REJECT_REASON,
+        }),
+      },
+    });
+    sendExecClientMessageAndClose(id, execId, 'readMcpResourceExecResult', result, sendBinaryFrame);
+    return 'readMcpResource';
+  }
+
+  if (msgCase === 'recordScreenArgs') {
+    const result = create(A.RecordScreenResultSchema, {
+      result: {
+        case: 'failure',
+        value: create(A.RecordScreenFailureSchema, { error: HEADLESS_REASON }),
+      },
+    });
+    sendExecClientMessageAndClose(id, execId, 'recordScreenResult', result, sendBinaryFrame);
+    return 'recordScreen';
+  }
+
+  if (msgCase === 'computerUseArgs') {
+    const result = create(A.ComputerUseResultSchema, {
+      result: {
+        case: 'error',
+        value: create(A.ComputerUseErrorSchema, {
+          error: HEADLESS_REASON,
+          actionCount: 0,
+          durationMs: 0,
+          log: HEADLESS_REASON,
+        }),
+      },
+    });
+    sendExecClientMessageAndClose(id, execId, 'computerUseResult', result, sendBinaryFrame);
+    return 'computerUse';
+  }
+
   console.log(`[cursor-agent] unhandled exec case=${msgCase} execId=${execId}`);
   return 'unknown';
 }
@@ -832,16 +1345,20 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
 //      not a result envelope — we cannot inject Claude Code's WebSearch
 //      output here; the search is fully server-side.
 //   2. REJECT (everything else, or webSearch with passthrough off) — the
-//      model is told the tool isn't available. Originally intended to make
-//      the model fall back to the registered `mcp_`-prefixed equivalent
-//      (e.g. mcp_WebSearch); in practice this fallback is unreliable and
-//      the model often surfaces the rejection text to the user.
+//      model is told the tool isn't available. Client-declared WebSearch /
+//      WebFetch / Fetch tools are filtered before RequestContext.tools by
+//      default, so public web lookup either stays on Cursor backend
+//      WebSearch or is reported unavailable instead of falling back to local
+//      network tools.
 function handleInteractionQuery(iq, sendBinaryFrame, opts) {
   const { create, toBinary, agent } = _requireProto();
   const A = agent;
   const id = iq.id;
   const queryCase = iq.query?.case;
   const passthroughNative = opts && opts.passthroughNativeTools === true;
+  const onServerToolUse = opts && typeof opts.onServerToolUse === 'function'
+    ? opts.onServerToolUse
+    : null;
   const REJECT_REASON = 'Tool not available; use MCP tools.';
 
   if (process.env.CURSOR_AGENT_DEBUG) {
@@ -870,6 +1387,18 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
         // back via interactionUpdate.tool_call_started/completed; no further
         // action needed here.
         const searchTerm = iq.query?.value?.args?.searchTerm || '';
+        if (onServerToolUse) {
+          try {
+            onServerToolUse({
+              phase: 'started',
+              name: 'web_search',
+              serverTool: 'web_search',
+              id: `cursor-websearch-${id}`,
+              input: { query: searchTerm },
+              source: 'interaction_query_approve',
+            });
+          } catch { /* observability hook only */ }
+        }
         resultValue = create(A.WebSearchRequestResponseSchema, {
           result: { case: 'approved', value: create(A.WebSearchRequestResponse_ApprovedSchema, {}) },
         });
@@ -881,19 +1410,9 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
         traceInteraction('reject', `reason="${REJECT_REASON}"`);
       }
       break;
-    // Note: there was a `case 'webFetchRequestQuery'` branch here that
-    // explicitly rejected, but WebFetchRequest* schemas aren't in the
-    // vendored proto and the InteractionQuery oneof doesn't include the
-    // case, so it was dead code. Removed deliberately (rather than left
-    // as a placeholder) because the symmetric pre-`f6cc478` behavior is
-    // for unknown cases to fall through to the `default` branch, which
-    // abandons the response — the model then falls back to the
-    // `mcp_WebFetch` MCP-prefixed tool that we forward through to
-    // claude-code. That's the correct end-state and matches WebSearch's
-    // pre-fix behavior, so if/when proto regen adds webFetchRequestQuery
-    // we want it to land in the abandon path, NOT in a stale reject path
-    // (which would silently break passthrough). See
-    // WEBSEARCH_WEBFETCH_REVIEW.md Issue 4 for context.
+    // There is no webFetchRequestQuery in the vendored proto. If Cursor adds
+    // one later, do not route public URL lookup to the proxy host by default;
+    // keep it Cursor-backend-native or require an explicit local-fetch opt-in.
     case 'exaSearchRequestQuery':
       resultCase = 'exaSearchRequestResponse';
       resultValue = create(A.ExaSearchRequestResponseSchema, {
@@ -925,14 +1444,32 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
       });
       traceInteraction('reject');
       break;
+    case 'createPlanRequestQuery':
+      resultCase = 'createPlanRequestResponse';
+      resultValue = create(A.CreatePlanRequestResponseSchema, {
+        result: create(A.CreatePlanResultSchema, {
+          result: { case: 'error', value: create(A.CreatePlanErrorSchema, { error: REJECT_REASON }) },
+        }),
+      });
+      traceInteraction('reject');
+      break;
+    case 'setupVmEnvironmentArgs':
+      // The proto only exposes SetupVmEnvironmentResult.success, with no
+      // error/rejected variant. Acknowledge it so Cursor's orchestration does
+      // not hang; the proxy does not actually provision or start a VM.
+      resultCase = 'setupVmEnvironmentResult';
+      resultValue = create(A.SetupVmEnvironmentResultSchema, {
+        result: { case: 'success', value: create(A.SetupVmEnvironmentSuccessSchema, {}) },
+      });
+      traceInteraction('empty-success');
+      break;
     default:
-      // Unknown / not in our vendored proto (e.g. createPlanRequestQuery,
-      // setupVmEnvironmentArgs — proto field nums 7-8 added in newer Cursor
-      // releases). Send a bare InteractionResponse with just `id` set.
+      // Unknown / not in our vendored proto. Send a bare InteractionResponse
+      // with just `id` set.
       // Cursor's server treats an unset `result` oneof as "client abandoned
-      // this request"; the model then falls back to its MCP-prefixed
-      // equivalent (e.g. `mcp_WebFetch`) which we route back to the client
-      // like any other tool_use.
+      // this request". Client web lookup tools are filtered before
+      // RequestContext.tools by default, so this should not create a local
+      // WebFetch/WebSearch fallback path.
       console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${id} not handled in vendored proto; abandoning so model falls back to MCP`);
       // Diagnostic: dump the raw bytes of the unknown InteractionQuery so
       // we can identify which new oneof case Cursor is sending. The first
@@ -997,6 +1534,84 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
     message: { case: 'interactionResponse', value: interactionResponse },
   });
   sendBinaryFrame(toBinary(A.AgentClientMessageSchema, wrapper));
+}
+
+function _oneofCase(obj) {
+  return obj && typeof obj === 'object' ? obj.case : undefined;
+}
+
+function _oneofValue(obj) {
+  return obj && typeof obj === 'object' ? obj.value : undefined;
+}
+
+function _asString(v) {
+  return typeof v === 'string' ? v : (v == null ? '' : String(v));
+}
+
+function _normalizeWebSearchErrorCode(resultCase, resultValue) {
+  const raw = _asString(resultValue?.error || resultValue?.reason || resultCase || '').toLowerCase();
+  if (/rate|too many/.test(raw)) return 'too_many_requests';
+  if (/query.*long/.test(raw)) return 'query_too_long';
+  if (/invalid|reject/.test(raw)) return 'invalid_input';
+  return 'unavailable';
+}
+
+function _webSearchResultsFromSuccess(success) {
+  const refs = Array.isArray(success?.references) ? success.references : [];
+  const out = [];
+  for (const r of refs) {
+    const url = _asString(r?.url).trim();
+    if (!url) continue;
+    const title = _asString(r?.title).trim() || url;
+    // Anthropic's web_search_tool_result block only needs title/url for a
+    // visible trace. Cursor already injected the full result text into its own
+    // model context; this synthetic block is for client-side observability.
+    out.push({ type: 'web_search_result', title, url });
+  }
+  return out;
+}
+
+function extractWebSearchServerToolEvent(iuCase, iuVal) {
+  if (iuCase !== 'toolCallStarted' && iuCase !== 'toolCallCompleted') return null;
+  const tc = iuVal?.toolCall;
+  if (_oneofCase(tc) !== 'webSearchToolCall') return null;
+  const inner = _oneofValue(tc) || {};
+  const args = inner.args || {};
+  const query = _asString(args.searchTerm || args.search_term).trim();
+  const cursorToolCallId = _asString(args.toolCallId || args.tool_call_id).trim();
+  const rawId = _asString(iuVal?.callId || cursorToolCallId || iuVal?.modelCallId).trim()
+    || crypto.createHash('sha1').update(`web-search:${query}`).digest('hex').slice(0, 16);
+  const base = {
+    name: 'web_search',
+    serverTool: 'web_search',
+    id: rawId,
+    input: { query },
+  };
+
+  if (iuCase === 'toolCallStarted') {
+    return { ...base, phase: 'started' };
+  }
+
+  const result = inner.result;
+  const resultCase = _oneofCase(result);
+  const resultValue = _oneofValue(result) || {};
+  if (resultCase === 'success') {
+    return {
+      ...base,
+      phase: 'completed',
+      content: _webSearchResultsFromSuccess(resultValue),
+      resultCount: Array.isArray(resultValue.references) ? resultValue.references.length : 0,
+    };
+  }
+  return {
+    ...base,
+    phase: 'completed',
+    content: {
+      type: 'web_search_tool_result_error',
+      error_code: _normalizeWebSearchErrorCode(resultCase, resultValue),
+    },
+    error: _asString(resultValue.error || resultValue.reason || resultCase || 'web_search_failed'),
+  };
 }
 
 // ── Build an ExecClientMessage and send it as a binary connect frame ──
@@ -1115,6 +1730,7 @@ function startConversation(token, options = {}) {
     onTextDelta,
     onThinkingDelta,
     onMcpCall,
+    onServerToolUse,
     onStepCompleted,
     onTurnEnded,
     onError,
@@ -1124,6 +1740,7 @@ function startConversation(token, options = {}) {
     onTextDelta: onTextDelta || (() => {}),
     onThinkingDelta: onThinkingDelta || (() => {}),
     onMcpCall: onMcpCall || (() => {}),
+    onServerToolUse: onServerToolUse || (() => {}),
     onStepCompleted: onStepCompleted || (() => {}),
     onTurnEnded: onTurnEnded || (() => {}),
     onError: onError || (() => {}),
@@ -1131,7 +1748,7 @@ function startConversation(token, options = {}) {
 
   function setCallbacks(newCallbacks) {
     if (!newCallbacks || typeof newCallbacks !== 'object') return;
-    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onStepCompleted', 'onTurnEnded', 'onError']) {
+    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError']) {
       if (typeof newCallbacks[k] === 'function') {
         currentCallbacks[k] = newCallbacks[k];
       }
@@ -1640,6 +2257,11 @@ function startConversation(token, options = {}) {
       // by Cursor's backend before we see this envelope — we cannot rewrite
       // it from here. See WEBSEARCH_WEBFETCH_REVIEW.md Issues 1 and 2 for
       // the broader observability gap.
+      const serverToolEvent = extractWebSearchServerToolEvent(iuCase, iuVal);
+      if (serverToolEvent) {
+        try { currentCallbacks.onServerToolUse(serverToolEvent); }
+        catch (e) { console.log(`[cursor-agent] onServerToolUse threw: ${e.message}`); }
+      }
       if (iuCase === 'toolCallCompleted' && process.env.CURSOR_LOG_INTERACTION === '1') {
         try {
           const tc = iuVal?.toolCall;
@@ -1691,6 +2313,7 @@ function startConversation(token, options = {}) {
       markUsefulFrame();
       handleInteractionQuery(msg.message.value, sendBinaryFrame, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        onServerToolUse: currentCallbacks.onServerToolUse,
       });
       return;
     }
@@ -2248,6 +2871,7 @@ module.exports = {
   handleExecMessage,
   handleKvMessage,
   handleInteractionQuery,
+  extractWebSearchServerToolEvent,
   sendExecClientMessage,
   sendExecClientControlMessage,
   sendExecClientMessageAndClose,

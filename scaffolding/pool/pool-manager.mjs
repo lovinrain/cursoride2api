@@ -117,6 +117,10 @@ if (!['contract', 'translate'].includes(POOL_TOOL_MODE)) {
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [pool]`, ...args);
 
+function normalizeModelForRouting(model) {
+  return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
+}
+
 // ── Groups ───────────────────────────────────────────────────────────────
 // A Group is a named partition of the pool keyed by `model`. Channels in
 // the group are all opened with that model. The DEFAULT group is keyed
@@ -403,6 +407,7 @@ function handleWorkerMessage(ch, msg) {
 
     case 'text_delta':
     case 'thinking_delta':
+    case 'server_tool_use':
     case 'tool_use':
     case 'yield':
     case 'step_completed':
@@ -539,7 +544,7 @@ function pickReadyChannelInGroup(g) {
 function tryPickForJob(job) {
   const dflt = getDefaultGroup();
   if (!dflt) return null;
-  const requestedModel = job.model;
+  const requestedModel = job.routeModel || job.model;
   if (requestedModel) {
     const g = groups.get(requestedModel);
     if (g && !g.draining) {
@@ -570,15 +575,16 @@ function tryPickForJob(job) {
 }
 
 function armFallbackTimer(job) {
-  if (job.waitTimer || !job.model) return;
-  const g = groups.get(job.model);
+  const targetModel = job.routeModel || job.model;
+  if (job.waitTimer || !targetModel) return;
+  const g = groups.get(targetModel);
   if (!g || g.draining) return;
-  if (job.model === POOL_MODEL) return;
+  if (targetModel === POOL_MODEL) return;
   job.waitTimer = setTimeout(() => {
     job.waitTimer = null;
     job.fallbackArmed = true;
     job.fallbackReason = 'group-no-ready';
-    log(`req ${job.requestId}: target group ${job.model} had no ready channel within ${POOL_GROUP_WAIT_MS}ms — eligible for default fallback`);
+    log(`req ${job.requestId}: target group ${job.routeModel || job.model} had no ready channel within ${POOL_GROUP_WAIT_MS}ms — eligible for default fallback`);
     setImmediate(drainQueue);
   }, POOL_GROUP_WAIT_MS);
 }
@@ -625,13 +631,13 @@ function routeRequest(job, pick) {
     requestId: job.requestId,
     channelId: ch.id,
     servedModel: pick.servedModel,
-    requestedModel: job.model || null,
+    requestedModel: job.requestedModel || job.model || null,
     fallback: !!pick.fallback,
     fallbackReason: pick.fallbackReason || null,
   });
   if (pick.fallback) {
-    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel}, FALLBACK from ${job.model}, reason=${pick.fallbackReason})`);
-  } else if (job.model) {
+    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel}, FALLBACK from ${job.requestedModel || job.model}, reason=${pick.fallbackReason})`);
+  } else if (job.routeModel || job.model) {
     log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel})`);
   }
   if (job.action === 'send_user_message') {
@@ -726,7 +732,7 @@ function writeToClient(client, obj) {
 
 function handleClientMessage(client, msg) {
   if (msg.type === 'request') {
-    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model } = msg;
+    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model, requestedModel } = msg;
 
     if (action === 'send_user_message') {
       if (POOL_TOOL_MODE === 'contract') {
@@ -759,6 +765,8 @@ function handleClientMessage(client, msg) {
         payload: { text },
         client,
         model: model || null,
+        routeModel: normalizeModelForRouting(model),
+        requestedModel: requestedModel || model || null,
         queuedAt: Date.now(),
         waitTimer: null,
         fallbackArmed: false,
@@ -769,7 +777,7 @@ function handleClientMessage(client, msg) {
       drainQueue();
       const stillQueued = requestQueue.includes(job);
       if (stillQueued) {
-        log(`no ready channel for req=${requestId} model=${model || '(default)'} — queued (queue depth ${requestQueue.length})`);
+        log(`no ready channel for req=${requestId} model=${requestedModel || model || '(default)'} routeModel=${normalizeModelForRouting(model) || '(default)'} — queued (queue depth ${requestQueue.length})`);
       }
       return;
     }

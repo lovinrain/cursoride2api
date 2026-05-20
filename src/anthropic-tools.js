@@ -4,6 +4,57 @@
 
 const crypto = require('crypto');
 
+function _envFlag(name) {
+  return /^(1|true|yes)$/i.test(process.env[name] || '');
+}
+
+function normalizeClientToolNameForPolicy(name) {
+  return String(name || '')
+    .replace(/^mcp__[^_]+__/, '')
+    .replace(/^mcp_/, '')
+    .replace(/[-_\s.]/g, '')
+    .toLowerCase();
+}
+
+const CLIENT_WEB_SEARCH_TOOL_NAMES = new Set([
+  'websearch',
+  'websearchtool',
+  'search',
+]);
+
+const CLIENT_WEB_FETCH_TOOL_NAMES = new Set([
+  'webfetch',
+  'fetch',
+  'webfetchtool',
+  'browserfetch',
+]);
+
+function isClientWebSearchToolName(name) {
+  return CLIENT_WEB_SEARCH_TOOL_NAMES.has(normalizeClientToolNameForPolicy(name));
+}
+
+function isClientWebFetchToolName(name) {
+  return CLIENT_WEB_FETCH_TOOL_NAMES.has(normalizeClientToolNameForPolicy(name));
+}
+
+function isClientWebLookupToolName(name) {
+  return isClientWebSearchToolName(name) || isClientWebFetchToolName(name);
+}
+
+function shouldDropClientWebLookupToolName(name) {
+  if (isClientWebSearchToolName(name)) {
+    return !(_envFlag('CURSOR_ALLOW_CLIENT_WEB_TOOLS') || _envFlag('CURSOR_ALLOW_CLIENT_WEBSEARCH'));
+  }
+  if (isClientWebFetchToolName(name)) {
+    return !(
+      _envFlag('CURSOR_ALLOW_CLIENT_WEB_TOOLS') ||
+      _envFlag('CURSOR_ALLOW_CLIENT_WEBFETCH') ||
+      _envFlag('CURSOR_SERVER_WEBFETCH')
+    );
+  }
+  return false;
+}
+
 /**
  * Anthropic tool definitions → intermediate MCP tool descriptors.
  *
@@ -42,6 +93,16 @@ function anthropicToolsToMcpTools(tools, providerIdentifier) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return [];
 
   const provider = providerIdentifier || 'cursoride2api';
+  // Keep web lookup native to Cursor by default. Forwarding client-declared
+  // WebSearch/WebFetch/Fetch tools creates MCP aliases that compete with
+  // Cursor's native webSearchRequestQuery path and encourages local fallback
+  // behavior (WebFetch/curl/placeholder files). Explicit opt-ins:
+  //   CURSOR_ALLOW_CLIENT_WEBSEARCH=1  — forward client WebSearch/Search
+  //   CURSOR_ALLOW_CLIENT_WEBFETCH=1   — forward client WebFetch/Fetch
+  //   CURSOR_SERVER_WEBFETCH=1         — forward Fetch/WebFetch to server fetch
+  //   CURSOR_ALLOW_CLIENT_WEB_TOOLS=1  — forward both categories
+  tools = tools.filter(t => !(t && shouldDropClientWebLookupToolName(t.name)));
+
   // Cursor's upstream provider rejects requests with too many tools
   // (empirical threshold ~10-12 tools regardless of trimming). Two knobs:
   //
@@ -652,6 +713,9 @@ function normalizeHallucinatedToolArgs(toolName, args) {
 
 module.exports = {
   anthropicToolsToMcpTools,
+  normalizeClientToolNameForPolicy,
+  isClientWebSearchToolName, isClientWebFetchToolName,
+  isClientWebLookupToolName, shouldDropClientWebLookupToolName,
   encodeToolUseId, decodeToolUseId,
   extractToolResults, extractTools,
   findLatestUserMessage, extractFirstUserText,

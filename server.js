@@ -6,13 +6,21 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
+const { URL } = require('url');
 const { v4: uuidv4 } = require('uuid');
-const cursorClient = require('./src/cursor-client');
 const converter = require('./src/converter');
 const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
-const cursorAgent = require('./src/cursor-agent');
+const CURSOR_DOWNSTREAM_PROTOCOL = String(
+  process.env.CURSOR_DOWNSTREAM_PROTOCOL || process.env.EXTERNAL_HTTP_PROTOCOL || 'http/1.1'
+).toLowerCase();
+const CURSOR_UPSTREAM_TRANSPORT = String(process.env.CURSOR_UPSTREAM_TRANSPORT || 'h2').toLowerCase() === 'h1' ? 'h1' : 'h2';
+const cursorAgent = CURSOR_UPSTREAM_TRANSPORT === 'h1'
+  ? require('./src/cursor-agent-h1')
+  : require('./src/cursor-agent');
 const thinkingHistory = require('./src/thinking-history');
 const anthropicTools = require('./src/anthropic-tools');
 const preprocess = require('./src/preprocess');
@@ -20,6 +28,7 @@ const debugLog = require('./src/debug-log');
 const stallThresholds = require('./src/stall-thresholds');
 const runtimeStats = require('./src/runtime-stats');
 const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
+const { getCursorToolMatrix } = require('./src/cursor-tool-matrix');
 
 // Thinking-block emission. Off by default: sessions created via this proxy
 // must remain portable to direct-Anthropic clients (real Claude API). Real
@@ -39,6 +48,15 @@ const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-
 const _emitThinkingBlocks = process.env.CURSOR_EMIT_THINKING_BLOCKS === '1';
 debugLog.init();
 
+function looksLikeAgentToolPlaceholderWrite(toolName, args) {
+  const normalizedTool = anthropicTools.normalizeClientToolNameForPolicy(toolName);
+  if (normalizedTool !== 'write') return false;
+  const a = args && typeof args === 'object' ? args : {};
+  const p = String(a.file_path || a.path || a.filename || '').replace(/\\/g, '/');
+  const c = String(a.content ?? a.file_text ?? a.text ?? a.body ?? a.data ?? '').trim();
+  return /^agent-tools\/[^/]+\.txt$/i.test(p) && (c === '' || c === '(No content)');
+}
+
 // Configurable "small model" used for warmup pings, compaction summarization,
 // and (optionally) subagent traffic — costs much less than a full Sonnet/Opus
 // turn. Default to the smallest real Claude on Cursor.
@@ -54,6 +72,24 @@ const API_KEY = process.env.API_KEY || '';  // 留空 = 不校验
 const TOKEN_FILE = process.env.TOKEN_FILE || path.join(__dirname, 'token.json');
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-4.5-sonnet';
 const CLIENT_VERSION = process.env.CURSOR_CLIENT_VERSION || '2.6.20';
+const PASSTHROUGH_NATIVE_TOOLS = /^(1|true|yes)$/i.test(process.env.CURSOR_PASSTHROUGH_NATIVE_TOOLS || '');
+const CURSOR_UPSTREAM_H1_ONLY = CURSOR_UPSTREAM_TRANSPORT === 'h1';
+const RATLC_POOL_URL = String(process.env.CURSOR_RATLC_POOL_URL || process.env.RATLC_POOL_URL || '').replace(/\/+$/, '');
+const RATLC_ROUTE_MESSAGES = /^(1|true|yes)$/i.test(process.env.CURSOR_RATLC_ROUTE_MESSAGES || '');
+const RATLC_ROUTE_COUNT_TOKENS = /^(1|true|yes)$/i.test(process.env.CURSOR_RATLC_ROUTE_COUNT_TOKENS || process.env.CURSOR_RATLC_ROUTE_MESSAGES || '');
+const RATLC_FALLBACK_TO_DIRECT = /^(1|true|yes)$/i.test(process.env.CURSOR_RATLC_FALLBACK_TO_DIRECT || '');
+const RATLC_TIMEOUT_MS = parseInt(process.env.CURSOR_RATLC_TIMEOUT_MS || '600000', 10);
+const RATLC_MODELS = String(process.env.CURSOR_RATLC_MODELS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+const RATLC_MODEL_SET = new Set(RATLC_MODELS.map(s => s.toLowerCase()));
+const RATLC_ENABLED = !!(RATLC_POOL_URL && RATLC_MODEL_SET.size > 0);
+let _cursorClient = null;
+function getCursorClient() {
+  if (!_cursorClient) _cursorClient = require('./src/cursor-client');
+  return _cursorClient;
+}
 
 // ── Bridge / conversation caches (Anthropic tool-use flow) ──
 //
@@ -68,6 +104,7 @@ const CLIENT_VERSION = process.env.CURSOR_CLIENT_VERSION || '2.6.20';
 const activeBridges = new Map();
 const bridgesBySessionId = new Map();
 const conversationStates = new Map();
+const responsesStore = new Map();
 
 const CONVERSATION_TTL_MS = 30 * 60 * 1000; // 30 min
 
@@ -109,6 +146,9 @@ function evictStale() {
   const now = Date.now();
   for (const [k, v] of conversationStates) {
     if (now - v.lastAccessMs > CONVERSATION_TTL_MS) conversationStates.delete(k);
+  }
+  for (const [k, v] of responsesStore) {
+    if (now - v.lastAccessMs > CONVERSATION_TTL_MS) responsesStore.delete(k);
   }
   // Collect victims first; drop them outside the iteration so we never
   // mutate activeBridges while iterating.
@@ -300,6 +340,149 @@ function checkApiKey(req, res, next) {
   next();
 }
 
+function shouldRouteAnthropicToRatlc(model) {
+  if (!RATLC_ENABLED || !RATLC_ROUTE_MESSAGES) return false;
+  const requested = normalizeModelForRouting(model || DEFAULT_MODEL || '').toLowerCase();
+  if (RATLC_MODEL_SET.has(requested)) return true;
+  const mapped = anthropicConverter.mapAnthropicModel(
+    anthropicConverter.stripNoThinkingSuffix(normalizeModelForRouting(model || DEFAULT_MODEL)),
+    config.anthropicModelMapping
+  );
+  return RATLC_MODEL_SET.has(normalizeModelForRouting(mapped || '').toLowerCase());
+}
+
+function normalizeModelForRouting(model) {
+  return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
+}
+
+function bodyWithRatlcRoutingModel(body) {
+  const out = { ...(body || {}) };
+  if (typeof out.model === 'string') {
+    const normalized = normalizeModelForRouting(out.model);
+    if (normalized) out.model = normalized;
+  }
+  return out;
+}
+
+function buildRatlcUnavailableResponse(message) {
+  return anthropicConverter.buildAnthropicErrorResponse(message, 'api_error');
+}
+
+function proxyToRatlc(req, res, targetPath, body, opts = {}) {
+  return new Promise((resolve) => {
+    if (!RATLC_POOL_URL) {
+      if (!res.headersSent) {
+        res.status(503).json(buildRatlcUnavailableResponse('RATLC pool URL is not configured'));
+      }
+      return resolve({ proxied: false, error: 'missing_ratlc_url' });
+    }
+
+    let target;
+    try {
+      target = new URL(targetPath, RATLC_POOL_URL + '/');
+    } catch (e) {
+      if (!res.headersSent) {
+        res.status(500).json(buildRatlcUnavailableResponse(`Invalid RATLC pool URL: ${e.message}`));
+      }
+      return resolve({ proxied: false, error: e.message });
+    }
+
+    const payloadBody = bodyWithRatlcRoutingModel(body);
+    const payload = Buffer.from(JSON.stringify(payloadBody || {}), 'utf8');
+    const headers = { ...req.headers };
+    delete headers.host;
+    delete headers.connection;
+    delete headers['content-length'];
+    delete headers['transfer-encoding'];
+    delete headers['accept-encoding'];
+    headers['content-type'] = headers['content-type'] || 'application/json';
+    headers['content-length'] = String(payload.length);
+    headers['x-cursoride-ratlc-proxy'] = '1';
+
+    const transport = target.protocol === 'https:' ? https : http;
+    const upstreamReq = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      method: req.method || 'POST',
+      path: target.pathname + target.search,
+      headers,
+      timeout: Number.isFinite(RATLC_TIMEOUT_MS) && RATLC_TIMEOUT_MS > 0 ? RATLC_TIMEOUT_MS : 600000,
+    }, (upstreamRes) => {
+      const outHeaders = { ...(upstreamRes.headers || {}) };
+      delete outHeaders.connection;
+      delete outHeaders['keep-alive'];
+      delete outHeaders['transfer-encoding'];
+      delete outHeaders['content-length'];
+      outHeaders['x-cursoride-route'] = 'ratlc-pool';
+      outHeaders['x-cursoride-ratlc-url'] = RATLC_POOL_URL;
+      if (opts.model) outHeaders['x-cursoride-ratlc-requested-model'] = String(opts.model);
+      res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+      upstreamRes.pipe(res);
+      upstreamRes.on('end', () => resolve({ proxied: true, statusCode: upstreamRes.statusCode || 0 }));
+      upstreamRes.on('error', (e) => {
+        if (!res.writableEnded) res.end();
+        resolve({ proxied: true, error: e.message });
+      });
+    });
+
+    upstreamReq.on('timeout', () => upstreamReq.destroy(new Error('RATLC pool request timeout')));
+    upstreamReq.on('error', (e) => {
+      if (!res.headersSent) {
+        res.status(503).json(buildRatlcUnavailableResponse(`RATLC pool unavailable: ${e.message}`));
+      } else if (!res.writableEnded) {
+        try { res.end(); } catch { /* ignore */ }
+      }
+      resolve({ proxied: false, error: e.message });
+    });
+    upstreamReq.end(payload);
+  });
+}
+
+async function getRatlcHealth(timeoutMs = 1500) {
+  if (!RATLC_POOL_URL) return { reachable: false, error: 'not_configured' };
+  return new Promise((resolve) => {
+    let target;
+    try { target = new URL('/health', RATLC_POOL_URL + '/'); }
+    catch (e) { return resolve({ reachable: false, error: e.message }); }
+    const transport = target.protocol === 'https:' ? https : http;
+    const req = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      method: 'GET',
+      path: target.pathname + target.search,
+      timeout: timeoutMs,
+    }, (r) => {
+      let text = '';
+      r.setEncoding('utf8');
+      r.on('data', c => { text += c; });
+      r.on('end', () => {
+        try {
+          const body = JSON.parse(text);
+          const pool = body.pool || {};
+          resolve({
+            reachable: r.statusCode >= 200 && r.statusCode < 300,
+            statusCode: r.statusCode,
+            ready: pool.readyCount || 0,
+            busy: pool.busyCount || 0,
+            opening: pool.openingCount || 0,
+            dead: pool.deadCount || 0,
+            actualSize: pool.actualSize || 0,
+            configuredSize: pool.configuredSize || 0,
+            groups: Array.isArray(pool.groups) ? pool.groups : [],
+          });
+        } catch (e) {
+          resolve({ reachable: false, statusCode: r.statusCode, error: `bad_json: ${e.message}` });
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('RATLC health timeout')));
+    req.on('error', e => resolve({ reachable: false, error: e.message }));
+    req.end();
+  });
+}
+
 // ── GET /v1/models ──
 //
 // Cursor's GetUsableModels endpoint opens a fresh H2 connection per call
@@ -309,14 +492,44 @@ function checkApiKey(req, res, next) {
 // over hours, not minutes.
 const _modelsCache = { ts: 0, body: null };
 const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
+const STATIC_CURSOR_MODELS = [
+  'default',
+  'composer-2-fast',
+  'composer-2',
+  'composer-2.5',
+  'composer-2.5-fast',
+];
+
+function buildStaticModelsResponse() {
+  const seen = new Set();
+  const models = [];
+  for (const modelId of [...STATIC_CURSOR_MODELS, ...RATLC_MODELS]) {
+    const key = String(modelId || '').toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    models.push({ modelId });
+  }
+  return anthropicConverter.buildModelsResponseWithAnthropicAliases(
+    models,
+    config.anthropicModelMapping
+  );
+}
+
 app.get('/v1/models', checkApiKey, async (req, res) => {
   const now = Date.now();
   if (_modelsCache.body && (now - _modelsCache.ts) < MODELS_CACHE_TTL_MS) {
     return res.json(_modelsCache.body);
   }
+  if (CURSOR_UPSTREAM_H1_ONLY) {
+    const body = buildStaticModelsResponse();
+    _modelsCache.ts = now;
+    _modelsCache.body = body;
+    return res.json(body);
+  }
   const token = tokenPool.pick();
   if (!token) return res.json({ object: 'list', data: [] });
   try {
+    const cursorClient = getCursorClient();
     const result = await cursorClient.getModels(token);
     const body = anthropicConverter.buildModelsResponseWithAnthropicAliases(
       result.models || [], config.anthropicModelMapping
@@ -336,12 +549,93 @@ app.get('/v1/models', checkApiKey, async (req, res) => {
   }
 });
 
+// ── GET /v1/tools ──
+//
+// Introspection endpoint for the two tool layers this proxy handles:
+// request-declared client tools (third-party/local functions) and Cursor's
+// native protocol tools (built into agent_pb.mjs).
+app.get(['/v1/tools', '/tools'], checkApiKey, (req, res) => {
+  res.json(getCursorToolMatrix({
+    passthroughNativeTools: PASSTHROUGH_NATIVE_TOOLS,
+    clientTools: [],
+  }));
+});
+
 // ── POST /v1/chat/completions ──
 app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
-  const { messages, model, stream } = req.body;
+  const body = req.body || {};
+  const { messages, model, stream } = body;
 
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json(converter.buildErrorResponse('messages is required', 'invalid_request_error', 400));
+  }
+
+  const requestedModel = model || DEFAULT_MODEL;
+  const cursorModel = mapOpenAICompatibleModel(requestedModel);
+  const hasTools = isOpenAIToolRequest(body);
+  if (hasTools) {
+    if (!isToolCapableModel(cursorModel)) {
+      return res.status(400).json(converter.buildErrorResponse(
+        `Model ${requestedModel} is not routed to the tool-capable bridge; use composer-2.5-fast, composer-2.5, or a Claude model for tool calls.`,
+        'invalid_request_error',
+        400
+      ));
+    }
+    if (stream === true) {
+      return res.status(400).json(converter.buildErrorResponse(
+        'Streaming OpenAI tool_calls on /v1/chat/completions is not implemented; use stream=false or /v1/messages for the tool main path.',
+        'invalid_request_error',
+        400
+      ));
+    }
+    const anthropicBody = {
+      model: cursorModel,
+      max_tokens: body.max_tokens || body.max_completion_tokens || 1024,
+      stream: false,
+      system: chatSystemToAnthropic(messages),
+      messages: chatMessagesToAnthropic(messages),
+      tools: openAIToolsToAnthropicTools(body.tools),
+    };
+    console.log(`  🧭 route=bridge-tools /v1/chat/completions | ${requestedModel} → ${cursorModel} | tools=${anthropicBody.tools.length}`);
+    try {
+      const upstream = await invokeAnthropicMessages(req, anthropicBody, handleAnthropicMessagesRequest);
+      if (upstream.statusCode >= 400) return res.status(upstream.statusCode).json(upstream.body || JSON.parse(upstream.bodyText));
+      return res.json(anthropicToChatCompletion(upstream.body, requestedModel));
+    } catch (e) {
+      console.error(`  ❌ chat tool bridge error: ${e.message}`);
+      return res.status(500).json(converter.buildErrorResponse(e.message));
+    }
+  }
+
+  const isStream = stream === true;
+
+  if (CURSOR_UPSTREAM_H1_ONLY) {
+    if (isStream) {
+      return res.status(400).json(converter.buildErrorResponse(
+        'Streaming native /v1/chat/completions is not implemented in H1-only upstream mode; use stream=false or /v1/messages.',
+        'invalid_request_error',
+        400
+      ));
+    }
+    const anthropicBody = {
+      model: cursorModel,
+      max_tokens: body.max_tokens || body.max_completion_tokens || 1024,
+      stream: false,
+      system: chatSystemToAnthropic(messages),
+      messages: chatMessagesToAnthropic(messages),
+      tools: [],
+    };
+    console.log(`  🧭 route=h1-bridge-chat /v1/chat/completions | ${requestedModel} → ${cursorModel}`);
+    try {
+      const upstream = await runAnthropicBridgeOnce(req, anthropicBody);
+      if (upstream.statusCode >= 400) {
+        return res.status(upstream.statusCode).json(upstream.body || JSON.parse(upstream.bodyText));
+      }
+      return res.json(anthropicToChatCompletion(upstream.body, requestedModel));
+    } catch (e) {
+      console.error(`  ❌ h1 bridge chat error: ${e.message}`);
+      return res.status(500).json(converter.buildErrorResponse(e.message));
+    }
   }
 
   const token = tokenPool.pick();
@@ -354,12 +648,9 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   // success/error paths below are still safe to call directly.
   res.on('close', () => tokenPool.release(token, { success: true }));
 
-  const requestedModel = model || 'gpt-4';
-  const cursorModel = converter.mapModel(requestedModel);
   const prompt = converter.messagesToPrompt(messages);
-  const isStream = stream === true;
 
-  console.log(`  📨 [${new Date().toLocaleTimeString()}] ${requestedModel} → ${cursorModel} | stream=${isStream} | ${prompt.substring(0, 80)}...`);
+  console.log(`  📨 [${new Date().toLocaleTimeString()}] route=native-chat ${requestedModel} → ${cursorModel} | stream=${isStream} | ${prompt.substring(0, 80)}...`);
 
   if (isStream) {
     // ── 流式响应 ──
@@ -374,6 +665,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
     res.write(converter.buildRoleChunk(requestedModel, ident));
 
     try {
+      const cursorClient = getCursorClient();
       const result = await cursorClient.chat(token, prompt, cursorModel, {
         stream: true,
         onDelta: (text) => {
@@ -413,6 +705,7 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   } else {
     // ── 非流式响应 ──
     try {
+      const cursorClient = getCursorClient();
       const result = await cursorClient.chat(token, prompt, cursorModel, { stream: false });
 
       if (result.error) {
@@ -435,6 +728,169 @@ app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
   }
 });
 
+// ── POST /v1/responses (OpenAI Responses API MVP) ──
+app.post('/v1/responses', checkApiKey, async (req, res) => {
+  const body = req.body || {};
+  const requestedModel = body.model || DEFAULT_MODEL;
+  const cursorModel = mapOpenAICompatibleModel(requestedModel);
+  const isStream = body.stream === true;
+  const hasTools = isResponsesToolRequest(body);
+
+  if (isStream) {
+    return res.status(400).json(buildResponsesError(
+      'Streaming /v1/responses is not implemented in this bridge yet; use stream=false.',
+      'invalid_request_error',
+      400
+    ));
+  }
+
+  const previous = body.previous_response_id ? responsesStore.get(body.previous_response_id) : null;
+  const previousItems = previous ? [...(previous.inputItems || []), ...(previous.outputItems || [])] : [];
+  if (previous) previous.lastAccessMs = Date.now();
+
+  if (hasTools) {
+    if (!isToolCapableModel(cursorModel)) {
+      return res.status(400).json(buildResponsesError(
+        `Model ${requestedModel} is not routed to the tool-capable bridge; use composer-2.5-fast, composer-2.5, or a Claude model for tool calls.`,
+        'invalid_request_error',
+        400
+      ));
+    }
+
+    const inputItems = normalizeResponsesInputItems(body.input);
+    const anthropicMessages = responsesInputToAnthropicMessages(body.input, previousItems);
+    if (anthropicMessages.length === 0) {
+      return res.status(400).json(buildResponsesError('input is required', 'invalid_request_error', 400));
+    }
+
+    const anthropicBody = {
+      model: cursorModel,
+      max_tokens: body.max_output_tokens || body.max_tokens || 1024,
+      stream: false,
+      system: body.instructions,
+      messages: anthropicMessages,
+      tools: responsesToolsToAnthropicTools(body.tools),
+    };
+    console.log(
+      `  🧭 route=bridge-tools /v1/responses | ${requestedModel} → ${cursorModel} | ` +
+      `tools=${anthropicBody.tools.length} | prev=${body.previous_response_id ? 'yes' : 'no'}`
+    );
+
+    try {
+      const upstream = await invokeAnthropicMessages(req, anthropicBody, handleAnthropicMessagesRequest);
+      if (upstream.statusCode >= 400) {
+        const errBody = upstream.body || (() => {
+          try { return JSON.parse(upstream.bodyText); } catch { return null; }
+        })();
+        return res.status(upstream.statusCode).json(errBody || buildResponsesError(upstream.bodyText || 'Upstream bridge error', 'api_error', upstream.statusCode));
+      }
+
+      const response = anthropicToResponses(upstream.body, requestedModel, { route: 'bridge-tools' });
+      rememberResponse(response, [...previousItems, ...inputItems]);
+      return res.json(response);
+    } catch (e) {
+      console.error(`  ❌ responses tool bridge error: ${e.message}`);
+      return res.status(500).json(buildResponsesError(e.message, 'api_error', 500));
+    }
+  }
+
+  const inputItems = normalizeResponsesInputItems(body.input);
+  const anthropicMessages = responsesInputToAnthropicMessages(body.input, previousItems);
+  if (anthropicMessages.length === 0) {
+    return res.status(400).json(buildResponsesError('input is required', 'invalid_request_error', 400));
+  }
+
+  if (CURSOR_UPSTREAM_H1_ONLY) {
+    const anthropicBody = {
+      model: cursorModel,
+      max_tokens: body.max_output_tokens || body.max_tokens || 1024,
+      stream: false,
+      system: body.instructions,
+      messages: anthropicMessages,
+      tools: [],
+    };
+    console.log(
+      `  🧭 route=h1-bridge-responses /v1/responses | ${requestedModel} → ${cursorModel} | ` +
+      `prev=${body.previous_response_id ? 'yes' : 'no'}`
+    );
+
+    try {
+      const upstream = await runAnthropicBridgeOnce(req, anthropicBody);
+      if (upstream.statusCode >= 400) {
+        const errBody = upstream.body || (() => {
+          try { return JSON.parse(upstream.bodyText); } catch { return null; }
+        })();
+        return res.status(upstream.statusCode).json(errBody || buildResponsesError(upstream.bodyText || 'Upstream bridge error', 'api_error', upstream.statusCode));
+      }
+
+      const response = anthropicToResponses(upstream.body, requestedModel, { route: 'h1-bridge-responses' });
+      rememberResponse(response, [...previousItems, ...inputItems]);
+      return res.json(response);
+    } catch (e) {
+      console.error(`  ❌ h1 bridge responses error: ${e.message}`);
+      return res.status(500).json(buildResponsesError(e.message, 'api_error', 500));
+    }
+  }
+
+  const token = tokenPool.pick();
+  if (!token) {
+    return res.status(503).json(buildResponsesError('No available tokens', 'server_error', 503));
+  }
+  res.on('close', () => tokenPool.release(token, { success: true }));
+
+  const prompt = anthropicConverter.anthropicMessagesToPrompt(anthropicMessages, body.instructions);
+  console.log(
+    `  📨 [${new Date().toLocaleTimeString()}] route=native-chat /v1/responses ${requestedModel} → ${cursorModel} | ` +
+    `prev=${body.previous_response_id ? 'yes' : 'no'} | ${prompt.substring(0, 80)}...`
+  );
+
+  try {
+    const cursorClient = getCursorClient();
+    const result = await cursorClient.chat(token, prompt, cursorModel, { stream: false });
+    if (result.error) {
+      console.error(`  ❌ ${result.error}`);
+      tokenPool.release(token, {
+        error: true,
+        rateLimited: looksLikeRateLimit(result.error),
+      });
+      return res.status(500).json(buildResponsesError(result.error, 'api_error', 500));
+    }
+
+    tokenPool.release(token, { success: true });
+    const response = {
+      id: responseId(),
+      object: 'response',
+      created_at: Math.floor(Date.now() / 1000),
+      status: 'completed',
+      model: requestedModel,
+      output: [{
+        type: 'message',
+        id: outputMessageId(),
+        status: 'completed',
+        role: 'assistant',
+        content: [{
+          type: 'output_text',
+          text: result.text || '',
+          annotations: [],
+        }],
+      }],
+      output_text: result.text || '',
+      usage: {
+        input_tokens: result.inputTokens || 0,
+        output_tokens: result.outputTokens || 0,
+        total_tokens: (result.inputTokens || 0) + (result.outputTokens || 0),
+      },
+      cursoride_route: 'native-chat',
+    };
+    rememberResponse(response, [...previousItems, ...inputItems]);
+    return res.json(response);
+  } catch (e) {
+    console.error(`  ❌ responses native error: ${e.message}`);
+    tokenPool.release(token, { error: true, rateLimited: looksLikeRateLimit(e) });
+    return res.status(500).json(buildResponsesError(e.message, 'api_error', 500));
+  }
+});
+
 // ── SSE helper ──
 function setSSEHeaders(res) {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -442,6 +898,554 @@ function setSSEHeaders(res) {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+}
+
+// ── OpenAI Responses / Chat tool bridge helpers ──
+//
+// Keep the transport split explicit:
+//   native-chat  = Cursor's simple AgentService chat path, lowest overhead
+//   bridge-tools = /v1/messages Cursor Agent bridge, required for tool_use
+function isToolCapableModel(model) {
+  const id = String(model || '').toLowerCase();
+  return id.includes('composer') || id.includes('claude');
+}
+
+function mapOpenAICompatibleModel(model) {
+  const requested = model || DEFAULT_MODEL;
+  const mapped = converter.mapModel(requested);
+  if (mapped !== requested || config.modelMapping[requested]) return mapped;
+
+  const anthropicBase = anthropicConverter.stripNoThinkingSuffix(requested);
+  const anthropicMapped = anthropicConverter.mapAnthropicModel(anthropicBase, config.anthropicModelMapping);
+  if (anthropicMapped && anthropicMapped !== anthropicBase) return anthropicMapped;
+
+  return mapped;
+}
+
+function isOpenAIToolRequest(body = {}) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const hasToolMessages = messages.some(msg => {
+    if (!msg) return false;
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+    if (msg.role === 'tool') return true;
+    if (msg.function_call) return true;
+    return false;
+  });
+  if (hasToolMessages) return true;
+  if (body.tool_choice === 'none') return false;
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (tools.length > 0) return true;
+  return !!body.tool_choice;
+}
+
+function isResponsesToolRequest(body = {}) {
+  const input = body.input;
+  const hasToolOutput = (item) => {
+    if (!item || typeof item !== 'object') return false;
+    if (item.type === 'function_call_output') return true;
+    if (item.type === 'function_call') return true;
+    if (item.type === 'tool_result') return true;
+    if (Array.isArray(item.content)) return item.content.some(hasToolOutput);
+    return false;
+  };
+  if (Array.isArray(input) && input.some(hasToolOutput)) return true;
+  if (body.tool_choice === 'none') return false;
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (tools.length > 0) return true;
+  return !!body.tool_choice;
+}
+
+function responseId() {
+  return `resp_${uuidv4().replace(/-/g, '')}`;
+}
+
+function outputMessageId() {
+  return `msg_${uuidv4().replace(/-/g, '')}`;
+}
+
+function functionCallId() {
+  return `fc_${uuidv4().replace(/-/g, '')}`;
+}
+
+function normalizeTextContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (typeof content === 'number' || typeof content === 'boolean') return String(content);
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (part == null) return '';
+      if (typeof part === 'string') return part;
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.output_text === 'string') return part.output_text;
+      if (typeof part.input_text === 'string') return part.input_text;
+      if (part.type === 'text' && typeof part.content === 'string') return part.content;
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  try { return JSON.stringify(content); } catch { return String(content); }
+}
+
+function openAIContentToAnthropic(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return normalizeTextContent(content);
+
+  const blocks = [];
+  for (const part of content) {
+    if (part == null) continue;
+    if (typeof part === 'string') {
+      blocks.push({ type: 'text', text: part });
+      continue;
+    }
+    if (typeof part.text === 'string') {
+      blocks.push({ type: 'text', text: part.text });
+      continue;
+    }
+    if (typeof part.input_text === 'string') {
+      blocks.push({ type: 'text', text: part.input_text });
+      continue;
+    }
+    if (typeof part.output_text === 'string') {
+      blocks.push({ type: 'text', text: part.output_text });
+      continue;
+    }
+    if (part.type === 'image' && part.source) {
+      blocks.push(part);
+      continue;
+    }
+    if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+      blocks.push({ type: 'text', text: `[image: ${part.image_url.url}]` });
+    }
+  }
+  return blocks.length === 1 && blocks[0].type === 'text' ? blocks[0].text : blocks;
+}
+
+function stringifyArguments(args) {
+  if (typeof args === 'string') return args;
+  try { return JSON.stringify(args || {}); } catch { return '{}'; }
+}
+
+function parseArguments(args) {
+  if (args == null) return {};
+  if (typeof args === 'object') return args;
+  if (typeof args !== 'string') return {};
+  try { return JSON.parse(args); } catch { return {}; }
+}
+
+function openAIToolsToAnthropicTools(tools) {
+  if (!Array.isArray(tools)) return [];
+  const out = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== 'object') continue;
+    if (tool.type && tool.type !== 'function') continue;
+    const fn = tool.function && typeof tool.function === 'object' ? tool.function : tool;
+    const name = fn.name || tool.name;
+    if (!name) continue;
+    out.push({
+      name,
+      description: fn.description || tool.description || '',
+      input_schema: fn.parameters || tool.parameters || { type: 'object', properties: {}, required: [] },
+    });
+  }
+  return out;
+}
+
+function chatMessagesToAnthropic(messages) {
+  const out = [];
+  if (!Array.isArray(messages)) return out;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue;
+    const role = msg.role || 'user';
+
+    if (role === 'system') continue;
+
+    if (role === 'assistant') {
+      const blocks = [];
+      const text = normalizeTextContent(msg.content);
+      if (text) blocks.push({ type: 'text', text });
+      const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+      for (const call of calls) {
+        const fn = call && call.function ? call.function : null;
+        if (!fn || !fn.name) continue;
+        blocks.push({
+          type: 'tool_use',
+          id: call.id || functionCallId(),
+          name: fn.name,
+          input: parseArguments(fn.arguments),
+        });
+      }
+      if (msg.function_call && msg.function_call.name) {
+        blocks.push({
+          type: 'tool_use',
+          id: msg.function_call.id || functionCallId(),
+          name: msg.function_call.name,
+          input: parseArguments(msg.function_call.arguments),
+        });
+      }
+      if (blocks.length > 0) out.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+
+    if (role === 'tool') {
+      out.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id || msg.id || '',
+          content: normalizeTextContent(msg.content),
+        }],
+      });
+      continue;
+    }
+
+    if (role === 'function') {
+      out.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id || msg.name || '',
+          content: normalizeTextContent(msg.content),
+        }],
+      });
+      continue;
+    }
+
+    out.push({ role: 'user', content: openAIContentToAnthropic(msg.content) });
+  }
+
+  return out;
+}
+
+function chatSystemToAnthropic(messages) {
+  if (!Array.isArray(messages)) return undefined;
+  const parts = messages
+    .filter(m => m && m.role === 'system')
+    .map(m => normalizeTextContent(m.content))
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
+function anthropicUsageToOpenAI(usage = {}) {
+  const input = usage.input_tokens || usage.prompt_tokens || 0;
+  const output = usage.output_tokens || usage.completion_tokens || 0;
+  return {
+    prompt_tokens: input,
+    completion_tokens: output,
+    total_tokens: input + output,
+  };
+}
+
+function anthropicToChatCompletion(body, requestedModel) {
+  const content = Array.isArray(body.content) ? body.content : [];
+  const text = content
+    .filter(block => block && block.type === 'text')
+    .map(block => block.text || '')
+    .join('');
+  const toolCalls = content
+    .filter(block => block && block.type === 'tool_use')
+    .map(block => ({
+      id: block.id || functionCallId(),
+      type: 'function',
+      function: {
+        name: block.name || '',
+        arguments: stringifyArguments(block.input || {}),
+      },
+    }));
+
+  const message = { role: 'assistant', content: text || null };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+
+  return {
+    id: `chatcmpl-${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+    }],
+    usage: anthropicUsageToOpenAI(body.usage || {}),
+  };
+}
+
+function buildResponsesError(message, type = 'invalid_request_error', code = 400) {
+  return {
+    error: {
+      message,
+      type,
+      param: null,
+      code,
+    },
+  };
+}
+
+async function runAnthropicBridgeOnce(req, anthropicBody) {
+  return invokeAnthropicMessages(req, anthropicBody, handleAnthropicMessagesRequest);
+}
+
+function responseInputItemToText(item) {
+  if (item == null) return '';
+  if (typeof item === 'string') return item;
+  if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+  if (typeof item.content === 'string') return item.content;
+  if (typeof item.text === 'string') return item.text;
+  if (typeof item.output_text === 'string') return item.output_text;
+  if (typeof item.input_text === 'string') return item.input_text;
+  if (Array.isArray(item.content)) return normalizeTextContent(item.content);
+  return '';
+}
+
+function responsesInputToAnthropicMessages(input, previousItems = []) {
+  const source = [];
+  if (Array.isArray(previousItems)) source.push(...previousItems);
+  if (Array.isArray(input)) source.push(...input);
+  else if (input != null) source.push({ role: 'user', content: input });
+
+  const messages = [];
+  for (const item of source) {
+    if (item == null) continue;
+    if (typeof item === 'string') {
+      messages.push({ role: 'user', content: item });
+      continue;
+    }
+    if (typeof item !== 'object') {
+      messages.push({ role: 'user', content: String(item) });
+      continue;
+    }
+
+    if (item.type === 'function_call_output') {
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: item.call_id || item.id || '',
+          content: item.output == null ? '' : normalizeTextContent(item.output),
+          is_error: item.status === 'failed' || item.is_error === true,
+        }],
+      });
+      continue;
+    }
+
+    if (item.type === 'function_call') {
+      messages.push({
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: item.call_id || item.id || functionCallId(),
+          name: item.name || '',
+          input: parseArguments(item.arguments),
+        }],
+      });
+      continue;
+    }
+
+    if (item.type === 'message' || item.role) {
+      const role = item.role === 'assistant' ? 'assistant' : 'user';
+      const content = Array.isArray(item.content)
+        ? item.content.map(part => {
+            if (!part || typeof part !== 'object') return null;
+            if (part.type === 'output_text' || part.type === 'input_text' || part.type === 'text') {
+              return { type: 'text', text: part.text || '' };
+            }
+            if (part.type === 'tool_result') return part;
+            if (part.type === 'tool_use') return part;
+            return null;
+          }).filter(Boolean)
+        : responseInputItemToText(item);
+      if (Array.isArray(content) && content.length === 0) continue;
+      if (!Array.isArray(content) && !content) continue;
+      messages.push({ role, content });
+      continue;
+    }
+
+    const text = responseInputItemToText(item);
+    if (text) messages.push({ role: 'user', content: text });
+  }
+
+  return messages;
+}
+
+function normalizeResponsesInputItems(input) {
+  if (input == null) return [];
+  if (Array.isArray(input)) return input.slice();
+  if (typeof input === 'string') {
+    return [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: input }],
+    }];
+  }
+  if (typeof input === 'object') return [input];
+  return [{
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: String(input) }],
+  }];
+}
+
+function responsesToolsToAnthropicTools(tools) {
+  return openAIToolsToAnthropicTools(tools);
+}
+
+function anthropicToResponses(body, requestedModel, opts = {}) {
+  const id = opts.id || responseId();
+  const createdAt = Math.floor(Date.now() / 1000);
+  const content = Array.isArray(body.content) ? body.content : [];
+  const output = [];
+  let outputText = '';
+
+  const text = content
+    .filter(block => block && block.type === 'text')
+    .map(block => block.text || '')
+    .join('');
+  if (text) {
+    outputText += text;
+    output.push({
+      type: 'message',
+      id: outputMessageId(),
+      status: 'completed',
+      role: 'assistant',
+      content: [{
+        type: 'output_text',
+        text,
+        annotations: [],
+      }],
+    });
+  }
+
+  for (const block of content) {
+    if (!block || block.type !== 'tool_use') continue;
+    output.push({
+      type: 'function_call',
+      id: functionCallId(),
+      call_id: block.id || functionCallId(),
+      name: block.name || '',
+      arguments: stringifyArguments(block.input || {}),
+      status: 'completed',
+    });
+  }
+
+  const inputTokens = body.usage?.input_tokens || 0;
+  const outputTokens = body.usage?.output_tokens || 0;
+  const resp = {
+    id,
+    object: 'response',
+    created_at: createdAt,
+    status: 'completed',
+    model: requestedModel,
+    output,
+    output_text: outputText,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+    },
+  };
+  if (opts.route) resp.cursoride_route = opts.route;
+  return resp;
+}
+
+function responseOutputToInputItems(response) {
+  if (!response || !Array.isArray(response.output)) return [];
+  const items = [];
+  for (const item of response.output) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'message') {
+      items.push({
+        type: 'message',
+        role: item.role || 'assistant',
+        content: Array.isArray(item.content) ? item.content : [],
+      });
+    } else if (item.type === 'function_call') {
+      items.push({
+        type: 'function_call',
+        id: item.id,
+        call_id: item.call_id,
+        name: item.name,
+        arguments: item.arguments,
+      });
+    }
+  }
+  return items;
+}
+
+function rememberResponse(response, inputItems) {
+  if (!response || !response.id) return;
+  responsesStore.set(response.id, {
+    lastAccessMs: Date.now(),
+    inputItems: Array.isArray(inputItems) ? inputItems : [],
+    outputItems: responseOutputToInputItems(response),
+  });
+}
+
+async function invokeAnthropicMessages(req, anthropicBody, responseAdapter) {
+  return new Promise((resolve, reject) => {
+    let statusCode = 200;
+    const headers = {};
+    const chunks = [];
+    const closeHandlers = [];
+    let settled = false;
+    function finish(payload) {
+      if (settled) return;
+      settled = true;
+      for (const cb of closeHandlers) {
+        try { cb(); } catch { /* ignore */ }
+      }
+      resolve(payload);
+    }
+    const proxyRes = {
+      writableEnded: false,
+      headersSent: false,
+      status(code) {
+        statusCode = code;
+        return this;
+      },
+      setHeader(name, value) {
+        headers[String(name).toLowerCase()] = value;
+      },
+      flushHeaders() {
+        this.headersSent = true;
+      },
+      on(event, cb) {
+        if (event === 'close' && typeof cb === 'function') closeHandlers.push(cb);
+        return this;
+      },
+      write(chunk) {
+        this.headersSent = true;
+        chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+        return true;
+      },
+      end(chunk) {
+        if (chunk) this.write(chunk);
+        this.writableEnded = true;
+        finish({
+          statusCode,
+          headers,
+          bodyText: chunks.join(''),
+          body: null,
+        });
+      },
+      json(obj) {
+        this.headersSent = true;
+        this.writableEnded = true;
+        finish({
+          statusCode,
+          headers,
+          bodyText: JSON.stringify(obj),
+          body: obj,
+        });
+      },
+    };
+
+    const proxyReq = Object.create(req);
+    proxyReq.body = anthropicBody;
+    proxyReq.path = '/v1/messages';
+    proxyReq.method = 'POST';
+    proxyReq.on = () => proxyReq;
+
+    Promise.resolve(responseAdapter(proxyReq, proxyRes)).catch(reject);
+  });
 }
 
 // ── Build the per-turn callback set used by handleFreshTurn / handleContinuation ──
@@ -552,8 +1556,20 @@ function buildTurnCallbacks(ctx) {
 
     let added = 0;
     for (const hit of newHits) {
+      if (anthropicTools.shouldDropClientWebLookupToolName(hit.name)) {
+        console.log(`  hallucinated-tool-call ignored: ${hit.name} (web lookup is Cursor-native only)`);
+        continue;
+      }
       const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
       const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
+      if (anthropicTools.shouldDropClientWebLookupToolName(canonical)) {
+        console.log(`  hallucinated-tool-call ignored: ${hit.name} → ${canonical} (web lookup is Cursor-native only)`);
+        continue;
+      }
+      if (looksLikeAgentToolPlaceholderWrite(canonical, normalizedArgs)) {
+        console.log(`  hallucinated-tool-call ignored: ${hit.name} (empty agent-tools placeholder write)`);
+        continue;
+      }
       const dupKey = (() => {
         try { return canonical + '|' + JSON.stringify(normalizedArgs); }
         catch { return canonical + '|?'; }
@@ -1190,6 +2206,7 @@ async function handleFreshTurn(req, res, token, params) {
   const thinkingHist = thinkingHistory.getHistory(convKey);
   const prompt = anthropicConverter.anthropicMessagesToPrompt(messages, system, {
     thinkingHistory: thinkingHist,
+    clientTools: tools,
   });
   // The assistant-message index this new turn will land at — used by the
   // onTurnEnded handler to key the recorded thinking by position.
@@ -1270,6 +2287,7 @@ async function handleFreshTurn(req, res, token, params) {
     onStepCompleted: callbacks.onStepCompleted,
     onTurnEnded: callbacks.onTurnEnded,
     onError: callbacks.onError,
+    passthroughNativeTools: PASSTHROUGH_NATIVE_TOOLS,
   });
 
   // NOTE: We intentionally do NOT register req.on('close') here. In some Node
@@ -1279,10 +2297,19 @@ async function handleFreshTurn(req, res, token, params) {
   // The TTL eviction loop is responsible for reaping stale bridges.
 }
 
-// ── POST /v1/messages (Anthropic Messages API, full tool-use) ──
-app.post('/v1/messages', checkApiKey, async (req, res) => {
+// Shared Anthropic Messages handler. /v1/messages uses it directly; OpenAI
+// Chat/Responses tool-compatible routes call it through a local adapter.
+async function handleAnthropicMessagesRequest(req, res) {
   const body = req.body || {};
   const { messages, model, system, max_tokens, stream, temperature, top_p, stop_sequences, tools } = body;
+
+  if (shouldRouteAnthropicToRatlc(model)) {
+    console.log(`  🧭 route=ratlc-pool /v1/messages | ${model || DEFAULT_MODEL} → ${RATLC_POOL_URL}`);
+    const result = await proxyToRatlc(req, res, '/v1/messages', body, { model: model || DEFAULT_MODEL });
+    if (result.proxied || !RATLC_FALLBACK_TO_DIRECT) return;
+    if (res.headersSent) return;
+    console.warn(`  ⚠️ RATLC proxy failed (${result.error}); falling back to direct H1`);
+  }
 
   // Optional debug dump
   if (process.env.DUMP_REQUESTS) {
@@ -1302,7 +2329,7 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse('messages is required', 'invalid_request_error'));
   }
 
-  const requestedModel = model || 'claude-sonnet-4-6';
+  const requestedModel = model || DEFAULT_MODEL;
 
   // Run all preprocessing (compaction detect, subagent marker, IDE-tool
   // sanitize) in one pass so server.js only sees a single decision object.
@@ -1464,7 +2491,10 @@ app.post('/v1/messages', checkApiKey, async (req, res) => {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools, requestId,
   });
-});
+}
+
+// ── POST /v1/messages (Anthropic Messages API, full tool-use) ──
+app.post('/v1/messages', checkApiKey, handleAnthropicMessagesRequest);
 
 // ── POST /v1/messages/count_tokens (Anthropic Messages API) ──
 //
@@ -1499,6 +2529,14 @@ app.post('/v1/messages/count_tokens', checkApiKey, async (req, res) => {
   const body = req.body || {};
   const { messages, system, tools } = body;
 
+  if (RATLC_ENABLED && RATLC_ROUTE_COUNT_TOKENS && shouldRouteAnthropicToRatlc(body.model)) {
+    console.log(`  🧭 route=ratlc-pool /v1/messages/count_tokens | ${body.model || DEFAULT_MODEL} → ${RATLC_POOL_URL}`);
+    const result = await proxyToRatlc(req, res, '/v1/messages/count_tokens', body, { model: body.model || DEFAULT_MODEL });
+    if (result.proxied || !RATLC_FALLBACK_TO_DIRECT) return;
+    if (res.headersSent) return;
+    console.warn(`  ⚠️ RATLC count_tokens proxy failed (${result.error}); using local estimator`);
+  }
+
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json(anthropicConverter.buildAnthropicErrorResponse(
       'messages is required', 'invalid_request_error'
@@ -1530,14 +2568,28 @@ app.post('/v1/messages/count_tokens', checkApiKey, async (req, res) => {
 });
 
 // ── 健康检查 ──
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const conn = runtimeStats.getConnectionStats({ recent: 0 });
+  const ratlcHealth = RATLC_ENABLED ? await getRatlcHealth() : { reachable: false, error: RATLC_POOL_URL ? 'no_models_configured' : 'not_configured' };
   res.json({
     ok: true,
     status: 'ok',
     tokens: tokenPool.stats(),
     tokenCount: tokenPool.size(),
     defaultModel: DEFAULT_MODEL,
+    passthroughNativeTools: PASSTHROUGH_NATIVE_TOOLS,
+    upstreamTransport: CURSOR_UPSTREAM_TRANSPORT,
+    downstreamProtocol: CURSOR_DOWNSTREAM_PROTOCOL,
+    directServerProtocol: 'http/1.1',
+    ratlc: {
+      enabled: RATLC_ENABLED,
+      poolUrl: RATLC_POOL_URL || null,
+      routeMessages: RATLC_ROUTE_MESSAGES,
+      routeCountTokens: RATLC_ROUTE_COUNT_TOKENS,
+      fallbackToDirect: RATLC_FALLBACK_TO_DIRECT,
+      models: RATLC_MODELS,
+      ...ratlcHealth,
+    },
     stallThresholds: stallThresholds.getStats(),
     runtime: runtimeStats.getStats({ window: 'last1h' }).totals,
     connections: {
@@ -1654,8 +2706,12 @@ const count = loadTokens();
 watchTokenFile();
 
 // Pre-warm the shared H2 client + proto schemas so the first /v1/messages
-// request doesn't pay the TLS handshake / proto load latency.
-cursorAgent.prewarmSharedClient();
+// request doesn't pay the TLS handshake / proto load latency. The H1
+// RunSSE/BidiAppend transport opens per-turn streams, so it has no shared
+// client prewarm hook.
+if (typeof cursorAgent.prewarmSharedClient === 'function') {
+  cursorAgent.prewarmSharedClient();
+}
 
 // Start runtime-stats persistence (snapshot to logs/runtime-stats.json
 // every minute and on graceful shutdown).
@@ -1690,11 +2746,21 @@ app.listen(PORT, HOST, () => {
   console.log(`  ║  🔌 /v1/chat/completions                  ║`);
   console.log(`  ║  🔌 /v1/messages (Anthropic)               ║`);
   console.log(`  ║  🔌 /v1/messages/count_tokens             ║`);
+  console.log(`  ║  🔌 /v1/responses                         ║`);
+  console.log(`  ║  🔌 /v1/tools                             ║`);
   console.log(`  ║  📋 /v1/models                            ║`);
   console.log('  ╠═══════════════════════════════════════════╣');
   console.log(`  ║  🔑 Tokens: ${String(count).padEnd(30)}║`);
   console.log(`  ║  🤖 Default: ${DEFAULT_MODEL.padEnd(29)}║`);
   console.log(`  ║  🔐 API Key: ${(API_KEY ? 'SET' : 'OPEN (no key)').padEnd(29)}║`);
+  console.log(`  ║  🔁 Cursor upstream: ${CURSOR_UPSTREAM_TRANSPORT.toUpperCase().padEnd(21)}║`);
+  console.log(`  ║  ↕️ Downstream: ${CURSOR_DOWNSTREAM_PROTOCOL.padEnd(27)}║`);
+  console.log(`  ║  🖥️ Direct server: ${'http/1.1'.padEnd(25)}║`);
+  console.log(`  ║  🧭 RATLC route: ${(RATLC_ENABLED && RATLC_ROUTE_MESSAGES ? 'ON' : 'OFF').padEnd(26)}║`);
+  if (RATLC_ENABLED) {
+    console.log(`  ║  🧭 RATLC models: ${String(RATLC_MODELS.length).padEnd(25)}║`);
+  }
+  console.log(`  ║  🧰 Native tools: ${(PASSTHROUGH_NATIVE_TOOLS ? 'PASSTHROUGH' : 'SAFE-REJECT').padEnd(24)}║`);
   if (debugLog.isEnabled()) {
     console.log(`  ║  📝 Debug: ${(debugLog.isVerbose() ? 'verbose' : 'on').padEnd(31)}║`);
   }
