@@ -54,3 +54,4 @@ CURSOR_CLIENT_OS: darwin
 # RATLC_BUSY_STUCK_TIMEOUT_MS: 240000          # busy-watchdog reap threshold (default 240s)
 # RATLC_TOKEN_DEATH_THRESHOLD: 3               # strikes before a token gets marked dead on `other_error`
 # LOG_REQUEST_TOOLS: 1                         # log incoming /v1/messages tools list
+# POOL_REINJECT_THINKING_DEBUG: 1              # enables POST /v1/_debug/render endpoint used by test_render.sh
