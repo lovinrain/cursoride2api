@@ -1318,8 +1318,17 @@ async function handleCountTokens(req, res) {
   // thinking a fork fits when it actually doesn't).
   const inputTokens = Math.ceil(chars / 3.5);
   log(`  count_tokens: messages=${messages.length} tools=${Array.isArray(tools) ? tools.length : 0} system=${system != null} chars=${chars} → ${inputTokens} tokens`);
+  // Return the full Anthropic Messages count_tokens response shape. Newer
+  // claude-code versions (2.1.x) check for the cache fields and treat
+  // responses missing them as malformed → /context display falls back to
+  // its client-side estimator. Zero values are correct for this proxy
+  // since Cursor's backend doesn't expose prompt-caching to us.
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ input_tokens: inputTokens }));
+  res.end(JSON.stringify({
+    input_tokens: inputTokens,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  }));
 }
 
 function handleHealth(req, res) {

@@ -23,15 +23,31 @@ the rest of each channel's lifetime.
 
 ## Recommended launch (for claude-code use)
 
+The cleanest path is via `launch.sh` + `launch.yaml`:
+
 ```bash
-POOL_BRIDGE_PROTOCOL=h1 \
-POOL_TOOL_MODE=translate \
-POOL_CONTEXT_MODE=full \
-POOL_CONCURRENT_OPENS=5 \
-  ./scaffolding/pool/ratlc up 10
+./scaffolding/pool/launch.sh up           # bring pool up using config from launch.yaml
+./scaffolding/pool/launch.sh status       # snapshot
+./scaffolding/pool/launch.sh tui          # interactive TUI
+./scaffolding/pool/launch.sh edit         # edit the config in $EDITOR (defaults vim)
+./scaffolding/pool/launch.sh down         # tear it all down
 ```
 
-Then in another shell:
+`launch.yaml` holds the env-var configuration in one place (pool size,
+model groups, retry tuning, native-tool passthrough, etc.). Override any
+single var at the command line without editing the file:
+
+```bash
+POOL_SIZE=20 ./scaffolding/pool/launch.sh up
+```
+
+Or use a different config:
+
+```bash
+RATLC_LAUNCH_CONFIG=/path/to/other.yaml ./scaffolding/pool/launch.sh up
+```
+
+Then point claude-code at the proxy:
 
 ```bash
 ./scaffolding/pool/ratlc claude
@@ -42,6 +58,55 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4242 \
 
 The first launch takes 1–10 min (probabilistic gate). Subsequent restarts
 are faster as long as you didn't kill `pool-manager.mjs`.
+
+### Legacy inline-env launch (still works)
+
+If you prefer not to use `launch.sh`:
+
+```bash
+POOL_BRIDGE_PROTOCOL=h1 \
+POOL_TOOL_MODE=translate \
+POOL_CONTEXT_MODE=full \
+POOL_CONCURRENT_OPENS=5 \
+RATLC_PASSTHROUGH_NATIVE=1 \
+  ./scaffolding/pool/ratlc up 10
+```
+
+`RATLC_PASSTHROUGH_NATIVE=1` is required for Cursor's native WebSearch /
+ExaSearch to fire — without it the bridge abandons every InteractionQuery
+and the model falls back to confabulation. `launch.yaml` sets this by
+default; if you launch inline make sure it's there.
+
+## Testing toolchain
+
+Three scripts in this directory verify the proxy's behavior end-to-end:
+
+| script | what it checks | needs Cursor backend? |
+|---|---|---|
+| `test_niah.sh` | model can retrieve a needle injected at arbitrary depth in a multi-turn conversation; effective context ceiling | yes |
+| `test_render.sh` | `renderFullContext()` preserves every message + content-block faithfully; isolates rendering from model behavior | no (proxy-internal) |
+| `niah-test.mjs` | older Node-side NIAH harness, structured size × depth matrix | yes |
+
+See `NIAH_RESULTS.md` for measured effective context windows per Cursor
+model variant (4-6 [1m] ~900K tokens, 4-7 plain ~600K).
+
+Recommended verification flow after any proxy change:
+
+```bash
+./scaffolding/pool/launch.sh up                       # bring pool up
+./scaffolding/pool/test_niah.sh                       # smoke: depth=10, ~1s
+DEPTH=300 ./scaffolding/pool/test_niah.sh             # mid: ~64KB body
+DEPTH=2000 ./scaffolding/pool/test_niah.sh            # heavy: ~430KB body
+```
+
+All three should PASS within seconds. If render correctness is in question:
+
+```bash
+# Toggle the debug endpoint on in launch.yaml's optional toggles section:
+#   POOL_REINJECT_THINKING_DEBUG: 1
+./scaffolding/pool/launch.sh up
+./scaffolding/pool/test_render.sh
+```
 
 ## Configuration (env vars)
 
