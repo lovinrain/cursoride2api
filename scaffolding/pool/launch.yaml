@@ -41,6 +41,15 @@ RATLC_PASSTHROUGH_NATIVE: 1
 # to keep the SSE clean and rely on the `server_tool_use` content block alone.
 RATLC_RENDER_SERVER_TOOL_TEXT: 1
 
+# Allow `curl`, `wget`, etc. in Bash/Shell tool calls. PR #1 added a regex
+# in src/cursor-agent.js that REJECTS any shell command matching common
+# network tools when this is unset — intent was to force the model toward
+# Cursor-native WebSearch instead of curl-based workarounds. But the regex
+# blocks legitimate `curl http://localhost/...` ops/diagnostics too.
+# Set to 1 to keep curl/wget working; the system-prompt steering still
+# nudges the model toward native WebSearch for broad search.
+CURSOR_ALLOW_LOCAL_SHELL_NETWORK: 1
+
 # ── OS fingerprint (token-machine binding) ─────────────────────────────────
 # token.json was minted on macOS; Cursor's backend rate-limits hard when the
 # fingerprint doesn't match the running OS. On Linux hosts you MUST set this
