@@ -1,20 +1,74 @@
-# Cursor Bidi Stream Payload Limit — Known Issue
+# Cursor Bidi Stream Payload Limit — Probed, No Workaround Needed
 
-This doc records what we know about Cursor's per-payload size limit on
-the live agent stream, why PR #2's mitigation attempt was incomplete,
-and the design decision to confine truncation to `POOL_CONTEXT_MODE=hybrid`
-so that `full` mode honors its name.
+## TL;DR
 
-This is a separate workstream from the immediate fix — we log it here
-so the underlying constraint can be properly characterized and addressed
-later instead of being papered over with a silent guard.
+**In our test environment, no workaround is needed.** PR #2's claim that
+Cursor's bidi stream closes/stalls above ~96 KB could not be reproduced.
+A probe sweep (`scaffolding/pool/test_bidi_payload_limit.mjs`) returned
+**32/32 successful requests from 32 KB up to 8 MB** on
+`claude-4.6-opus-max-thinking-fast` — zero stalls, zero closed streams,
+zero errors.
 
-## The constraint
+**Decision (commit `d55ed29`, 2026-05-22):**
+- Default `CONTEXT_MAX_BYTES` set to **0** (cap disabled).
+- `POOL_CONTEXT_MODE=full` is now genuinely honest by default — every
+  byte the caller sends reaches the model.
+- Operator escape hatch preserved: `RATLC_CONTEXT_MAX_BYTES=N` re-enables
+  the cap if a deployment actually observes the original problem. When
+  re-enabled, the cap still fires only in hybrid mode (so `full` remains
+  honest no matter what).
+- Probe script kept in tree for any operator to re-measure in their own
+  environment before deciding to enable the cap.
 
-Cursor's bidi agent stream has an empirical payload-size limit somewhere
-around 96–100 KB per `bajie_yield` tool_result. Above that, Cursor's
-backend closes or stalls the live session. This was discovered by the
-author of PR #2 (huaerye23) and recorded in their inline comment at
+**What this means in practice** (claude-4.6 with our token pool):
+
+| Workload | Behavior |
+|----------|----------|
+| Typical claude-code session, any context size | Works as expected, no memory loss |
+| Long sessions, 1-3 MB context | Works, expect ~25s/turn (model thinking budget, not payload) |
+| Very long, 4-8 MB context | Works, with growing latency variance (e.g. 6 MB attempts: 27s, 122s) |
+| Beyond 8 MB | Untested |
+| `claude-opus-4-7-thinking-max-fast` | Today's run was throttled — re-probe in low-load window |
+
+**What did PR #2 likely see?** Most plausibly a misdiagnosis — some
+unrelated failure (network, throttle, channel state, etc.) attributed
+to payload size. Possible alternative explanations: different account
+tier, time-of-day load on Cursor's side, different message structure.
+None reproduced in our window. The cap PR #2 added then silently
+truncated any conversation >96 KB — 38 guard events across 6 of 18
+sessions on the live deployment on 2026-05-22 — destroying conversation
+memory to "fix" a phantom problem.
+
+**Status**: closed for our environment, escape hatches preserved for
+others. The rest of this doc retains the detail (raw measurements,
+hypotheses, code change, future probes) so anyone who DOES hit the
+original problem has the data to push from.
+
+---
+
+## Backstory (what motivated this)
+
+This doc originally recorded an unmeasured constraint inherited from
+PR #2 (huaerye23). PR #2's author had reported that very large
+`bajie_yield` tool_result payloads could make Cursor close or stall the
+live agent stream, and added a 98 KB byte cap as a safety valve. The cap
+silently truncated conversations above that threshold, replacing the
+entire transcript with the latest user message — manifesting as "Claude
+forgot what we discussed" on long sessions. Our first response was to
+gate the cap to `POOL_CONTEXT_MODE=hybrid` only (commit `60fc2aa`) so
+`full` would honor its name. Then we measured the underlying constraint
+to see whether the cap was needed at all. It wasn't, in our environment.
+
+The rest of this doc preserves the empirical record so future operators
+and future-Claude-sessions can either trust the conclusion or re-probe
+in their own environment without rediscovering the analysis from scratch.
+
+## The original claim (since refuted in our environment)
+
+PR #2 (huaerye23) claimed Cursor's bidi agent stream had an empirical
+payload-size limit somewhere around 96–100 KB per `bajie_yield`
+tool_result, above which Cursor's backend would close or stall the live
+session. The claim was recorded in PR #2's inline comment at
 `scaffolding/pool/api-server.mjs:88-93`:
 
 > Safety valve for clients such as Claude Code that echo complete
@@ -25,6 +79,12 @@ author of PR #2 (huaerye23) and recorded in their inline comment at
 PR #2 also added `scaffolding/pool/CACHE_DESIGN.md` which lists
 "compaction/windowing" as roadmap item 5 (cap full-context bytes,
 summarize old messages, truncate large tool results).
+
+Our probe (next section) could not reproduce this claim. We measured up
+to 8 MB with no closures. PR #2's threshold is now treated as either a
+misdiagnosis or an environment-specific anomaly. Operators in different
+environments who DO observe the original problem can re-enable the cap
+with `RATLC_CONTEXT_MAX_BYTES=N` — see Decisions section below.
 
 ## Empirical measurements (2026-05-22)
 
