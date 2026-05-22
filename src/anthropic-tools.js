@@ -481,17 +481,23 @@ function extractClientSessionId(req) {
  *
  * When `clientSessionId` is provided (extracted from the
  * `x-claude-code-session-id` header or `body.metadata.user_id`), we emit
- * a "conv-v2:" hash that depends on only `(modelId, clientSessionId)`.
- * Both fields are stable across continuations of one CLI session and
- * cannot collide across distinct sessions on the same machine, which
- * removes the "two claude-code processes happen to share remoteAddr +
- * first user text + tool list" failure mode of the legacy salt.
+ * a "conv-v2:" hash that ALSO mixes in firstUserText + toolHash. The
+ * sessionId alone solves cross-session collisions (two claude-code CLIs
+ * happening to share remoteAddr/firstUserText/toolList), but it doesn't
+ * solve a within-session subagent collision: a `Task` / `WebSearch`
+ * subagent spawned by claude-code inherits the parent's sessionId but
+ * has a different prompt and tool set; without the extra salt they hash
+ * to the same convKey and the subagent's tool_use_id routes onto the
+ * wrong stream — observed symptom is the subagent's tool returning
+ * empty content and the parent turn stalling.
  */
 function deriveConversationKey(messages, modelId, system, tools, remoteAddr, remotePort, clientSessionId) {
   if (clientSessionId) {
+    const first = extractFirstUserText(messages).slice(0, 200);
+    const toolHash = _toolListHash(tools);
     return crypto
       .createHash('sha256')
-      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId)
+      .update('conv-v2:' + (modelId || '') + ':' + clientSessionId + ':' + first + ':' + toolHash)
       .digest('hex')
       .slice(0, 16);
   }

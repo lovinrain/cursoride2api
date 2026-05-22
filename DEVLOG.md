@@ -10,6 +10,9 @@ A working notebook of what we learned reverse-engineering Cursor's `agent.v1.Age
 4. The Cursor stream stays paused after emitting `mcpArgs` — it will NOT fire `turnEnded` until we send `mcpResult`. So when bridging to Anthropic semantics we have to *synthesize* `stop_reason=tool_use` ourselves (we use a 250 ms debounce to batch parallel tool calls).
 5. Cursor's KV blob channel must be ACKed (both `setBlobArgs` → `setBlobResult: {}` and `getBlobArgs` → `getBlobResult` with whatever we cached). Without this the model just sits there idle.
 6. Verified end-to-end through `claude -p` with `claude-opus-4-7`, `claude-sonnet-4-6`, and `claude-haiku-4-5`. Tool-use round-trip works.
+7. `McpToolDefinition.input_schema` and `McpArgs.args` (map values) changed from `bytes` to `google.protobuf.Value` between Cursor proto versions. The proxy now passes a `Value` *object* on encode and unwraps `Value` *objects* on decode (instead of relying on `bytes`), which works under both definitions. See "Vendored proto regen" entry for the silent-drop failure mode and "decodeMcpArgs" entry for the inbound mirror.
+8. `convKey`/`bridgeKey` derive from claude-code's `x-claude-code-session-id` header (with `firstUserText` + `toolHash` salt) when present, so parallel claude-code sessions with identical prompts don't alias their bridges, and a session's WebSearch/Task subagent doesn't collide with its parent. Fallback to the older circumstantial-hash scheme for non-claude-code callers. See "convKey collision fix" + "convKey v2 subagent regression" entries.
+9. **WebFetch through the proxy works end-to-end.** **WebSearch does not** — claude-code's WebSearch is an Anthropic-server-side tool that bypasses the model's tool-use path; with `ANTHROPIC_BASE_URL=our-proxy` it has no reachable backend. Use an MCP web-search server (Brave/SerpAPI/etc.) if you need real search through this stack.
 
 ---
 
@@ -388,6 +391,8 @@ curl http://localhost:4141/v1/chat/completions \
 ---
 
 ## References
+
+The full catalog of every Cursor RE repo and material we've consulted (including the ones we deliberately skipped, the local `/tmp/` working copies, and the broader 29-repo landscape from the upstream survey) lives at [REFERENCES.md](REFERENCES.md). The lists below are the per-purpose subset relevant to this dev log; see the consolidated file for the wider picture.
 
 ### Primary references (foundational)
 
@@ -893,8 +898,14 @@ Limits: only retries if zero bytes have arrived (mid-stream errors are not retri
 
 We maintain two in-memory caches on the proxy:
 
-- `activeBridges` keyed by `bridgeKey = sha256("bridge:" + modelId + ":" + firstUserText.slice(0,200))` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the **same** Cursor stream. This works.
-- `conversationStates` keyed by `convKey = sha256("conv:" + modelId + ":" + firstUserText.slice(0,200))` — was supposed to cache the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`, so a fresh `/v1/messages` request could resume a previous conversation without re-uploading context. **This does not work** — Cursor's KV blob store is scoped per-H2-stream, not per-conversation-id. Replaying a saved checkpoint on a fresh stream causes `Connect error internal: Blob not found` because the stored blob hashes only existed in the closed stream.
+- `activeBridges` keyed by `bridgeKey` — stores the open H2 stream + pending exec list. Used to route `tool_result` follow-ups back to the **same** Cursor stream. This works.
+- `conversationStates` keyed by `convKey` — was supposed to cache the opaque protobuf checkpoint Cursor sends back via `conversationCheckpointUpdate`, so a fresh `/v1/messages` request could resume a previous conversation without re-uploading context. **This does not work** — Cursor's KV blob store is scoped per-H2-stream, not per-conversation-id. Replaying a saved checkpoint on a fresh stream causes `Connect error internal: Blob not found` because the stored blob hashes only existed in the closed stream.
+
+Key derivation has a preferred path and a fallback path (see `deriveConversationKey` / `deriveBridgeKey` in `src/anthropic-tools.js`):
+- **Preferred (v2):** if the client sends `x-claude-code-session-id` (or the same UUID nested as `body.metadata.user_id.session_id`), keys are `sha256("conv-v2:" + modelId + ":" + sessionId)` / `sha256("bridge-v2:" + ...)`. This is the only signal that reliably distinguishes two concurrent claude-code sessions sharing remoteAddr+remotePort+firstUserText.
+- **Fallback (v1):** for callers that don't send the session header, keys remain `sha256("conv:" + modelId + ":" + sysFingerprint + ":" + firstUserText.slice(0,200) + ":" + addr + ":" + port + ":" + toolHash)`. Less robust but historical behavior.
+
+See the [convKey collision fix](#convkey-collision-fix-2026-05-14) entry below for the bug this addresses.
 
 **Current behavior:** every fresh `/v1/messages` request starts with empty `conversationState`. Cursor rebuilds its blob store from `setBlobArgs` (system prompt, etc.) and the client re-supplies the message history in the prompt anyway. The `conversationStates` Map is preserved as scaffolding for a future architecture where we share an H2 client across requests, but it's not currently populated.
 
@@ -1852,6 +1863,148 @@ So when asked to search, the model usually picks Write-spoof (works via our Bing
 - `484966d` `fix(api-server): close SSE stream after error event, no trailing message_stop`
 - `d411c79` `fix(pool): lastActivityAt race that killed freshly-routed channels`
 - `fa4ca3b` `feat: real web search injection for Write-spoof + unknown-iq diagnostic logging`
+
+---
+## convKey collision fix (2026-05-14)
+
+### The collision class
+
+`deriveConversationKey` and `deriveBridgeKey` hashed `(modelId, systemFingerprint, firstUserText.slice(0,200), remoteAddr, remotePort, toolHash)`. The remoteAddr+remotePort salt was added to defend against two concurrent claude-code processes sharing a host — port is normally distinct per process keep-alive socket. But the defense leaks under two real conditions:
+
+1. **Same prompt, same socket.** Claude Code reuses a single keep-alive socket within a session, but at the *Node HTTP server* level, multiple in-flight requests on one TCP connection report the *same* `remotePort` (the client port doesn't change per request). If a user fires `claude -p "foo"` twice from the same host in close succession and connection reuse picks up, the two POSTs land on the same socket → same port → same firstUserText → **identical convKey**.
+
+2. **Tool-result race.** When the model emits a tool_use, claude-code POSTs the tool_result on the same socket. The bridgeKey lookup happens on that POST — if the proxy has another fresh conversation cached under the same key, the tool_result routes to the wrong stream and the original conversation hangs (we've seen this manifest as stuck "thinking" indicators that never resolve).
+
+The colleague flagged this with a concrete reproducer: two simultaneous prompts → both keyed identically → second overwrites first's bridge entry → first's continuation goes to the wrong H2 stream.
+
+### The signal we found
+
+Empirical capture via a transparent HTTP tap (`/tmp/tap.js`, sits between claude-code and our proxy and logs every request) revealed that claude-code sends two headers carrying a stable per-conversation UUID:
+
+| Source | Path | Notes |
+|---|---|---|
+| `x-claude-code-session-id` | direct header | UUIDv4, stable for the lifetime of one claude-code session |
+| `body.metadata.user_id` | JSON-encoded string with `{device_id, account_uuid, session_id}` | session_id field carries the same UUID as the header |
+
+Verified properties from 3 parallel `claude -p` runs with identical prompts:
+- Within one session, every POST (initial + each tool_result continuation) carries the same UUID.
+- Across two separate `claude -p` invocations, the UUIDs are distinct even with identical prompts, identical remoteAddr, and overlapping wall clock.
+
+### The fix
+
+`extractClientSessionId(req)` (in `src/anthropic-tools.js`) returns the header if present, otherwise parses `body.metadata.user_id` as JSON and pulls `.session_id`. `deriveConversationKey` and `deriveBridgeKey` now accept this id as an additional argument; when present they produce `sha256("conv-v2:" + modelId + ":" + sessionId)` / `sha256("bridge-v2:" + modelId + ":" + sessionId)`. The `-v2:` namespace prevents accidental aliasing with old cache entries during rollout.
+
+The fallback path (no session id) is preserved unchanged for non-claude-code callers (opencode, raw API clients), so this change is purely additive.
+
+### Verification
+
+- 25-assertion unit test (`/tmp/test-conv-key.js`): covers v1 determinism, v2 ignores port/addr but respects sessionId, v2 namespace doesn't alias v1, bridgeKey distinct from convKey, all extract paths (header/body/null/garbage).
+- End-to-end smoke test: two parallel `claude -p "echo parallel test 1"` invocations produce two distinct session UUIDs (`1a9c0a28-…` / `a3d50cf3-…`) → two distinct convKeys, observed in proxy log and confirmed by hashing the captured session ids through the public function.
+- Without sessionId (legacy fallback), the same inputs collide as expected — proves the bug existed and is now skipped by the v2 path.
+
+### Why not just include sessionId in the salt of the existing key?
+
+Considered. Rejected because:
+- Mixing the optional sessionId into the same hash with the always-present (`firstUserText`, etc.) inputs makes "did we use the session id?" un-observable from the wire — debugging two collided conversations becomes ambiguous.
+- A separate v2 namespace makes the rollout cache-safe: existing in-flight conversations under v1 keys keep resolving correctly while new conversations from claude-code start using v2.
+
+---
+
+## convKey v2 subagent regression (2026-05-15)
+
+The first cut at the v2 convKey path (commit `b879706`) hashed only `(modelId, clientSessionId)`. This fixed cross-session collisions (the original colleague-reported bug) but introduced a *within-session* collision: when claude-code spawns a `WebSearch` or `Task` subagent it issues a fresh `/v1/messages` POST with the same `x-claude-code-session-id` as the parent, a different first user prompt, and a different (typically much smaller) tool set. Both POSTs hashed to the same v2 convKey/bridgeKey. The subagent's `bridgeKey=parent` lookup hit the parent's open H2 stream → the parent's `tool_use_id` continuation routed onto the subagent's stream → user-visible symptom was `Web Search(…) ⎿ Did 0 searches in 8s` followed by a 2m+ stall.
+
+Fix: salt the v2 hash with `firstUserText + toolHash` as well. Within one claude-code conversation, the first user message stays stable across continuation turns, so the parent's convKey stays stable. The subagent has a different first user message (and usually a single-tool set), so it gets a distinct convKey. Cross-session defense is unaffected — distinct sessionIds still dominate.
+
+```
+conv-v2: sha256("conv-v2:" + modelId + ":" + sessionId + ":" + firstUserText(0..200) + ":" + toolListHash)
+```
+
+Verified empirically with `claude -p ... --allowed-tools WebSearch`: parent convKey `b801d20f...` and WebSearch subagent convKey `ce6d05fe...` diverge as required; the parent's continuation POST (`toolResults=1`) reuses the parent's convKey and the turn completes with the search result returned through. Unit test (`/tmp/test-conv-key.js`, 28 assertions) covers: parent ≠ subagent same-session, parent-turn-2 == parent-turn-1, cross-session still distinct, v1 fallback unchanged.
+
+---
+
+## MCP resource discovery handler (2026-05-15)
+
+### Symptom
+
+In a session that fired several `WebSearch` tool_use blocks (claude-code routes WebSearch through a `Task` subagent — a fresh conversation with `tools=1`), the proxy log showed:
+
+```
+[cursor-agent] unhandled exec case=listMcpResourcesExecArgs execId=…
+```
+
+The subagent's turn never reached `turnEnded`. The user filed it as "WebSearch seems not supported?" — actually WebSearch was fine (it routed back to claude-code as a normal tool_use); the stall was the *Cursor model inside the subagent* probing for MCP resources and not getting a reply.
+
+### Root cause
+
+`handleExecMessage` in `src/cursor-agent.js` had branches for the common exec cases (read/ls/write/delete/shell/shellStream/backgroundShellSpawn/grep/fetch/writeShellStdin/diagnostics + the mcpArgs bubble-up) but no branch for `listMcpResourcesExecArgs` or `readMcpResourceExecArgs`. The unhandled cases fell to the default `console.log('unhandled exec case=…')` and returned without sending a reply. Cursor's model treats no-reply as "client is still working" — the BiDi stream waits forever.
+
+### Fix
+
+Two new branches in `handleExecMessage`:
+
+- `listMcpResourcesExecArgs` → reply with `ListMcpResourcesExecResult { success: { resources: [] } }`. We host zero MCP resource servers, so empty success is the honest answer.
+- `readMcpResourceExecArgs` → reply with `ReadMcpResourceExecResult { notFound: { uri } }`. List returns empty so the model shouldn't issue these, but a confused model issuing them anyway should get a fast `not_found` instead of stalling.
+
+Verified by unit test that exercises both paths through `_handleExecMessage` (a test-only export added on `src/cursor-agent.js`): correct oneof case selected, expected payload echoed.
+
+---
+
+## Vendored proto regen — root cause of `input_schema` silent drop (2026-05-15)
+
+Regenerated `src/proto/agent_pb.mjs` from `/tmp/cursor-tap/cursor_proto/agent_v1.proto` via `protoc-gen-es` to pick up `WebFetchRequestQuery` / `WebFetchRequestResponse` (proto fields 9 in InteractionQuery/Response — absent from the previous v2.10.2 generation, which caused the existing `case 'webFetchRequestQuery'` handler in `handleInteractionQuery` to be dead code; the model's WebFetch interactions fell through to the default abandon path with `interactionQuery case=undefined id=N` log spam).
+
+First-pass regen broke baseline `claude -p` with consistent 60s+ timeouts even though wire bytes for every message we *send* were byte-identical between old and new proto and direct `curl` against `/v1/messages` worked. Root cause was a schema-definition difference for `McpToolDefinition.input_schema`:
+
+- **Old `.proto` (vendored)**: `bytes input_schema = 3;`
+- **New `.proto` (current upstream)**: `google.protobuf.Value input_schema = 3;`
+
+Our code at `cursor-agent.js:483` pre-encoded the JSON Schema into raw `Value` bytes via `toBinary(wkt.ValueSchema, fromJson(...))` and passed those bytes as `inputSchema`. With the old `bytes`-typed field, that's exactly what proto-es expects. With the new `Value`-typed field, proto-es expects a Value MESSAGE OBJECT and **silently drops the field when handed a Uint8Array** — no error, no warning, just a 0-length encoding for the field. The 51 tools we send to Cursor end up with empty input schemas → Cursor's model can't invoke them → turn never produces text → claude-code times out.
+
+Verified by a minimal round-trip:
+
+```
+raw input_schema bytes: 67
+OLD proto McpToolDefinition encoded: 87 bytes (schema included)
+NEW proto McpToolDefinition encoded: 20 bytes (schema DROPPED)
+NEW proto with Value object: 87 bytes (schema included, identical to OLD)
+```
+
+Fix: `buildMcpToolDefinitions` now produces a `Value` object (`fromJson(wkt.ValueSchema, schema)`) instead of raw bytes. The legacy `inputSchema: Uint8Array` caller shape is preserved by decoding the bytes back into a `Value` via `fromBinary`. Both paths now feed proto-es a Value object, which works under both the old and new schema definitions (proto3 wire-compat: a `Value`-typed field and a `bytes`-typed field with serialized Value content produce identical bytes when the value is present).
+
+End-to-end verification: `claude -p "use WebSearch ..." --dangerously-skip-permissions` now completes; proxy log shows zero `unhandled exec` events and zero `interactionQuery case=undefined` abandons. The model's WebFetch interactionQueries are now properly recognized as `webFetchRequestQuery` and rejected via the existing handler (which causes the model to fall back to MCP-prefixed equivalents).
+
+### Round 2: `decodeMcpArgs` had the same bytes-vs-Value mismatch
+
+After the schema regen unblocked WebFetch tool definitions, the MODEL's `mcp_WebFetch` calls started failing in claude-code with `Invalid tool parameters`. Same proto change, opposite direction:
+
+- old .proto:  `map<string, bytes> args = 2;`            (values arrive as Uint8Array of Value bytes)
+- new .proto:  `map<string, google.protobuf.Value> args = 2;`  (values arrive as parsed Value proto objects)
+
+`decodeMcpArgs` checked `instanceof Uint8Array` / `typeof === 'string'` / else "already a JS value". The else branch passed the raw Value proto object through unchanged. claude-code received `{url: {kind: {case: 'stringValue', value: 'https://...'}}}` instead of `{url: 'https://...'}` and its MCP validator rejected.
+
+Fix: when the map value is a Value proto message (detected by `obj.kind.case`), unwrap via `toJson(wkt.ValueSchema, v)`. Bytes / base64 / Uint8Array paths preserved for backward compat. Both wire shapes now produce identical plain JS values.
+
+Verified end-to-end: `claude -p "use WebFetch to fetch https://example.com..." --dangerously-skip-permissions` completes, model gets real page content, no `Invalid tool parameters` errors. Tool calls in the log show clean JSON args, e.g. `WebFetch({"url":"https://example.com","prompt":"What is on this page?"})`.
+
+**Investigation aside**: the original hypothesis that the `interactionQuery case=undefined` log flood was *causing* user-visible stalls was wrong. The original reproducer log shows 10 abandons inside a subagent turn that nevertheless ended successfully with 866 output bytes. The user-visible stall in that case was a Cursor-backend `Upstream stalled — no progress for 165s` event on the parent's `tool_result` roundtrip, handled by our existing watchdog retry. The abandon noise was cosmetic.
+
+---
+
+## WebFetch works through proxy; WebSearch is architecturally blocked (2026-05-16)
+
+After the proto regen + the two bytes↔Value fixes (encode + decode), end-to-end behavior settled into a clear split:
+
+**WebFetch — works fully through the proxy.** Direct URL fetch, no search backend needed. Verified by `claude -p "use WebFetch to fetch https://github.com/slopus/happy ..." --dangerously-skip-permissions` returning real page content (335,960 bytes from the live page) and the model parsing it to report the real star count.
+
+**WebSearch — fails with `searchCount: 0` regardless of proxy state.** claude-code's `WebSearch` is an Anthropic-server-side tool: it talks directly to Anthropic's search backend, not via the model's MCP/tool-use path. With `ANTHROPIC_BASE_URL=our-proxy`, claude-code's WebSearch HTTP client points at our proxy → our proxy forwards to Cursor → Cursor has no concept of Anthropic's search backend → WebSearch reports `searchCount: 0` and "no web search capability configured." The proxy cannot fix this — it's an architectural mismatch.
+
+Practical workarounds for real web search through this stack:
+- Wire an MCP web-search server (Brave Search MCP, SerpAPI MCP, etc.) into claude-code's `~/.claude/mcp_servers.json` or `.mcp.json`. Those calls traverse as standard MCP tool calls through our proxy and work end-to-end.
+- Use `WebFetch` for direct URL fetches when you already know the URL.
+
+**Earlier misclaim**: in a prior turn I read "Eiffel Tower stands 330 meters..." output from `claude -p "use WebSearch..."` as evidence that WebSearch worked end-to-end. It didn't — the model's own tool_result text explicitly included "(Note: Web search tools were unavailable in this environment, so this answer is from general knowledge rather than a live search)" and I missed that line. Knowledge-based answers from the model are not proof of tool function. When verifying a tool, check the `toolUseResult` block in the session JSONL (`/root/.claude/projects/.../*.jsonl`) for the actual `searchCount`/`results`/`bytes` — that's the ground truth, not the model's prose output.
 
 ---
 

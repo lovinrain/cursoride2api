@@ -404,32 +404,47 @@ function decodeValueBytes(buf) {
   return toJson(wkt.ValueSchema, v);
 }
 
-// ── Decode mcpArgs.args (Map<string, bytes>) into a plain JS object ──
+// ── Decode mcpArgs.args into a plain JS object ──
+// Wire shape varies by McpArgs.args field definition in the .proto:
+//   OLD: map<string, bytes>  — values arrive as Uint8Array of Value bytes
+//   NEW: map<string, google.protobuf.Value> — values arrive as parsed Value objects
+// claude-code's MCP validator needs plain JS values (string/number/bool/object/array),
+// not Value proto messages. If we forward `{url: {kind: {case: 'stringValue', value: 'https://...'}}}`
+// instead of `{url: 'https://...'}`, the validator rejects with "Invalid tool parameters".
 function decodeMcpArgs(argsMap) {
   const out = {};
   if (!argsMap) return out;
-  // Proto-decoded map is a plain object whose values are Uint8Array
   if (typeof argsMap !== 'object') return out;
+  const { wkt, toJson } = _requireProto();
   for (const k of Object.keys(argsMap)) {
     const v = argsMap[k];
-    if (!v) { out[k] = null; continue; }
-    let bytes;
-    if (v instanceof Uint8Array) bytes = v;
-    else if (Buffer.isBuffer(v)) bytes = new Uint8Array(v);
-    else if (typeof v === 'string') {
-      // Legacy connect+json path stored values as base64 strings
-      try { bytes = new Uint8Array(Buffer.from(v, 'base64')); } catch { bytes = null; }
-    } else {
-      out[k] = v; // already a JS value
+    if (v == null) { out[k] = null; continue; }
+    // Raw bytes (old `bytes`-typed map values) — decode via Value codec.
+    if (v instanceof Uint8Array || Buffer.isBuffer(v)) {
+      const bytes = v instanceof Uint8Array ? v : new Uint8Array(v);
+      try { out[k] = decodeValueBytes(bytes); continue; }
+      catch {
+        try { out[k] = Buffer.from(bytes).toString('utf8'); continue; }
+        catch { out[k] = null; continue; }
+      }
+    }
+    // Legacy connect+json path stored values as base64 strings.
+    if (typeof v === 'string') {
+      try {
+        const bytes = new Uint8Array(Buffer.from(v, 'base64'));
+        out[k] = decodeValueBytes(bytes);
+      } catch { out[k] = v; }
       continue;
     }
-    if (!bytes) { out[k] = null; continue; }
-    try {
-      out[k] = decodeValueBytes(bytes);
-    } catch {
-      try { out[k] = Buffer.from(bytes).toString('utf8'); }
-      catch { out[k] = null; }
+    // Already-parsed `Value` message (new `google.protobuf.Value`-typed map values).
+    // Distinguish a Value proto message from a plain JS object by looking for the
+    // tell-tale `kind` oneof. toJson unwraps Value to a plain JSON value.
+    if (typeof v === 'object' && v.kind && typeof v.kind.case === 'string') {
+      try { out[k] = toJson(wkt.ValueSchema, v); continue; }
+      catch { out[k] = null; continue; }
     }
+    // Anything else (plain JS value already): pass through.
+    out[k] = v;
   }
   return out;
 }
@@ -851,20 +866,32 @@ function shouldPrefixToolName(name) {
 
 function buildMcpToolDefinitions(mcpToolsRaw) {
   if (!Array.isArray(mcpToolsRaw) || mcpToolsRaw.length === 0) return [];
-  const { create, fromJson, toBinary, wkt, agent } = _requireProto();
+  const { create, fromJson, fromBinary, toBinary, wkt, agent } = _requireProto();
   const out = [];
   for (const t of mcpToolsRaw) {
     if (!t || !t.name) continue;
-    // Two shapes are accepted:
-    //   { name, toolName, description, providerIdentifier, jsonSchema }
-    //   { name, toolName, description, providerIdentifier, inputSchema } (raw bytes)
+    // McpToolDefinition.input_schema is `google.protobuf.Value` in the proto.
+    // proto-es expects a Value MESSAGE OBJECT here, not raw bytes. Passing a
+    // Uint8Array silently produces a 0-length encoding (no error, just drops
+    // the schema), so Cursor's model receives tools without schemas and stalls
+    // waiting for proper context. Always materialize a Value object.
+    //
+    // Two input shapes from callers:
+    //   { ..., jsonSchema: {...} }           — plain JSON Schema object
+    //   { ..., inputSchema: Uint8Array }     — pre-encoded Value bytes (legacy)
     let inputSchema;
     if (t.inputSchema && (t.inputSchema instanceof Uint8Array || Buffer.isBuffer(t.inputSchema))) {
-      inputSchema = t.inputSchema instanceof Uint8Array ? t.inputSchema : new Uint8Array(t.inputSchema);
+      // Legacy: decode bytes back to a Value object.
+      const bytes = t.inputSchema instanceof Uint8Array ? t.inputSchema : new Uint8Array(t.inputSchema);
+      try {
+        inputSchema = fromBinary(wkt.ValueSchema, bytes);
+      } catch (e) {
+        continue; // Skip if we can't round-trip
+      }
     } else {
       const schema = t.jsonSchema || t.input_schema || { type: 'object', properties: {}, required: [] };
       try {
-        inputSchema = toBinary(wkt.ValueSchema, fromJson(wkt.ValueSchema, schema));
+        inputSchema = fromJson(wkt.ValueSchema, schema);
       } catch (e) {
         // Skip tools whose schema can't be encoded
         continue;
@@ -1269,6 +1296,29 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
     });
     sendExecClientMessageAndClose(id, execId, 'diagnosticsResult', result, sendBinaryFrame);
     return 'diagnostics';
+  }
+  // MCP resource discovery: we host zero MCP resource servers, so reply
+  // with an empty success list. Without a reply the model stalls waiting
+  // for our response (the symptom: `unhandled exec case=
+  // listMcpResourcesExecArgs` followed by the turn never reaching
+  // turnEnded). Empty success is more honest than `rejected` here — the
+  // listing succeeded, the result set is just empty.
+  if (msgCase === 'listMcpResourcesExecArgs') {
+    const result = create(A.ListMcpResourcesExecResultSchema, {
+      result: { case: 'success', value: create(A.ListMcpResourcesSuccessSchema, { resources: [] }) },
+    });
+    sendExecClientMessage(id, execId, 'listMcpResourcesExecResult', result, sendBinaryFrame);
+    return 'listMcpResources';
+  }
+  // Same shape for individual resource reads. With list returning empty
+  // the model shouldn't issue these, but defensively answer not_found so
+  // a confused model doesn't stall the turn.
+  if (msgCase === 'readMcpResourceExecArgs') {
+    const result = create(A.ReadMcpResourceExecResultSchema, {
+      result: { case: 'notFound', value: create(A.ReadMcpResourceNotFoundSchema, { uri: msgValue?.uri || '' }) },
+    });
+    sendExecClientMessage(id, execId, 'readMcpResourceExecResult', result, sendBinaryFrame);
+    return 'readMcpResource';
   }
 
   // listMcpResourcesExecArgs — the model discovers MCP resources via this
@@ -1773,6 +1823,21 @@ function startConversation(token, options = {}) {
   let buffer = Buffer.alloc(0);
   let inputTokens = 0;
   let outputTokens = 0;
+  // Char-count-based fallback estimate for input tokens. Used when Cursor
+  // doesn't send a `conversationCheckpointUpdate` with `tokenDetails.usedTokens`
+  // for the turn — common for short responses. Without this, claude-code's
+  // `/context` displays 0 used because we emit message_delta.usage without
+  // an input_tokens field. The real (Cursor-reported) value overrides this
+  // as soon as it arrives via the checkpoint handler.
+  // Ratio ~3.5 chars/token matches `_countCharsRecursive` in server.js's
+  // count_tokens endpoint, which Anthropic SDK clients trust for fit checks.
+  const _promptTokensEstimate = (() => {
+    let chars = prompt.length;
+    for (const t of (tools || [])) {
+      try { chars += JSON.stringify(t).length; } catch { /* ignore */ }
+    }
+    return Math.ceil(chars / 3.5);
+  })();
   let capturedState = null;
   // Tracks whether Cursor sent us a turnEnded message. If req.on('end') fires
   // before this is set, the upstream cut us off mid-conversation and we need
@@ -2236,7 +2301,14 @@ function startConversation(token, options = {}) {
         try { stallThresholds.recordTurn(modelId, maxIdleMs); } catch { /* ignore */ }
         try {
           currentCallbacks.onTurnEnded({
-            inputTokens, outputTokens, conversationState: capturedState,
+            // Surface the real Cursor-reported count when available;
+            // fall back to the prompt-based estimate so claude-code's
+            // /context tracker has SOMETHING to display instead of 0.
+            // Short turns rarely trigger a checkpointUpdate, so the
+            // fallback covers the common case.
+            inputTokens: inputTokens > 0 ? inputTokens : _promptTokensEstimate,
+            outputTokens,
+            conversationState: capturedState,
             maxIdleMs,
             stallThresholdSource: _stallSource,
             turnRetries: _turnRetries,
@@ -2820,8 +2892,13 @@ function startConversation(token, options = {}) {
       const idleMs = lastUsefulFrameAt > 0 ? now - lastUsefulFrameAt : 0;
       const thresholdMs = hasEmittedContent ? _stallPostMs : _stallPreMs;
       return {
-        // Token counts
-        inputTokens, outputTokens,
+        // Token counts. inputTokens falls back to a prompt-based
+        // estimate when Cursor hasn't sent a tokenDetails checkpoint
+        // yet (common on short turns). Without this, the tool_use
+        // finalize path emits message_delta.usage with no input_tokens
+        // field — breaking claude-code's /context tracker.
+        inputTokens: inputTokens > 0 ? inputTokens : _promptTokensEstimate,
+        outputTokens,
         // Per-turn aggregate signals (final values after turnEnded)
         maxIdleMs,
         turnRetries: _turnRetries,
@@ -2861,6 +2938,7 @@ module.exports = {
   deterministicConversationId,
   encodeFrame,
   buildHeaders,
+  resolveClientFingerprint,
   loadProto,
   prewarmSharedClient,
   // Shared helpers exposed for src/cursor-agent-h1.js (H1 transport variant).
@@ -2877,5 +2955,6 @@ module.exports = {
   sendExecClientMessageAndClose,
   sendKvResponse,
   frameConnectMessage,
-  resolveClientFingerprint,
+  // Internals exposed for unit tests only — not part of the public API.
+  _handleExecMessage: handleExecMessage,
 };
