@@ -33,7 +33,8 @@ const MODEL = process.env.RATLC_MODEL || 'claude-opus-4-7-thinking-max-fast';
 // POOL_CONTEXT_MODE drives the priming prompt: in `full` mode the channel
 // is told each bajie_yield carries the entire conversation history; in
 // `last` mode (default) it's told each yield is the next user message
-// verbatim — the historical behavior.
+// verbatim; in `hybrid`, the api-server chooses per turn between those
+// two payload shapes while the pool-manager keeps session affinity.
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
 
 const TOKEN_PATH = new URL('../../token.json', import.meta.url);
@@ -85,7 +86,14 @@ console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRI
 const PASSTHROUGH_NATIVE = process.env.RATLC_PASSTHROUGH_NATIVE === '1';
 
 const YIELD_TOOL_NAME = 'bajie_yield';
-
+const IMAGE_ONE_SHOT_TIMEOUT_MS = parseInt(process.env.RATLC_IMAGE_ONE_SHOT_TIMEOUT_MS || '300000', 10);
+const IMAGE_ONE_SHOT_MAX_ATTEMPTS = parseInt(process.env.RATLC_IMAGE_ONE_SHOT_MAX_ATTEMPTS || '120', 10);
+const IMAGE_ONE_SHOT_RETRY_MS = parseInt(
+  process.env.RATLC_IMAGE_ONE_SHOT_RETRY_MS
+    || process.env.RATLC_CONSTANT_INTERVAL_MS
+    || '500',
+  10,
+);
 // ── Worker state ─────────────────────────────────────────────────────────
 let bridge = null;
 let currentState = 'spawning';
@@ -94,14 +102,13 @@ let openedAt = 0;
 let lastActivityAt = Date.now();
 let currentRequestId = null;
 let pendingYield = null;
-// Map<execId, info> — tracks every non-yield mcp call we're currently holding.
-// In the parallel-tools case the model emits N tool_uses in one assistant
-// turn (e.g. Bash + Read back-to-back); each gets its own execId. We must
-// retain all of them until tool_results arrive, otherwise the 2nd
-// onMcpCall would clobber the 1st (the original bug). The map is cleared
-// per-execId in the send_tool_result handler after each dispatch.
+// Map<toolUseKey, info> — tracks every non-yield MCP call we're currently
+// holding. H1 Cursor mcpArgs can arrive with an empty execId, so execId is
+// not unique enough for parallel client_mcp_call batches. The pool-manager
+// assigns a stable anthropic tool_use id and sends it back as toolUseKey.
 const pendingMcpInfo = new Map();
 let configuredTools = [];
+const pendingNativeImageTools = new Map();
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 function send(msg) {
@@ -120,6 +127,19 @@ function setState(state, extra = {}) {
     model: MODEL,
     ...extra,
   });
+}
+
+function rememberPendingMcpInfo(key, info) {
+  if (!key || !info) return;
+  if (info.origin === 'native_image_one_shot' && info.originKey) {
+    const pending = pendingNativeImageTools.get(info.originKey);
+    if (pending) {
+      pendingMcpInfo.set(key, { ...info, bridge: pending.bridge });
+      pendingNativeImageTools.delete(info.originKey);
+      return;
+    }
+  }
+  pendingMcpInfo.set(key, info);
 }
 
 function buildYieldTool() {
@@ -146,7 +166,8 @@ function buildPrimingPrompt(system, callerTools) {
   // and Y". The model has the explicit tool list in its prompt; we want it
   // to feel free to use whatever's there, including Cursor's native built-ins
   // (Shell, Read, Write, Grep, ...) that get auto-injected alongside ours.
-  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND Cursor-native built-ins. For broad web search, use Cursor-native WebSearch. For a user-explicit URL fetch or a curl test, Bash/curl is allowed when the environment permits it. Do not use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch.');
+  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND Cursor-native built-ins. For broad web search, use Cursor-native WebSearch. For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it. Do not use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.');
+  lines.push('When a delivered request lists client MCP tools named like `mcp__server__tool` (for example browser-devtools), use the `client_mcp_call` tool: pass the exact MCP name as `tool_name` and the real tool arguments as `input`. Do not say the MCP server is unavailable just because that exact `mcp__...` name is not in this warm pool\'s static tool list.');
   lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
   if (POOL_CONTEXT_MODE === 'full') {
     // Full-context mode: each bajie_yield result carries the entire
@@ -157,6 +178,8 @@ function buildPrimingPrompt(system, callerTools) {
     // delimiters.
     lines.push('Each `bajie_yield` tool result is the COMPLETE conversation context for ONE self-contained request, formatted with explicit delimiters (look for `=== FULL CONVERSATION CONTEXT ===`, `--- SYSTEM ---`, `--- CONVERSATION ---`, and `[user] (RESPOND TO THIS):`).');
     lines.push('Treat each `bajie_yield` delivery as INDEPENDENT. Do NOT assume any continuity with prior `bajie_yield` results. The only context you have is what is contained in the latest delivery. Respond only to the final user turn marked `(RESPOND TO THIS)`. Tool_use / tool_result blocks in the rendered history are PAST events — do not re-execute them.');
+  } else if (POOL_CONTEXT_MODE === 'hybrid') {
+    lines.push('Each `bajie_yield` tool result is either a COMPLETE conversation context with explicit FULL CONVERSATION CONTEXT delimiters, or the next user message verbatim. If delimiters are present, treat that delivery as an authoritative full rebuild and respond only to the final user turn marked `(RESPOND TO THIS)`. If delimiters are absent, treat it as a normal continuation of this same live session.');
   } else {
     lines.push('The bajie_yield tool result is the next user message verbatim.');
   }
@@ -164,8 +187,211 @@ function buildPrimingPrompt(system, callerTools) {
   if (system) {
     lines.push(`Caller system context:\n---\n${typeof system === 'string' ? system : JSON.stringify(system)}\n---`);
   }
-  lines.push('Reply with exactly "READY" to acknowledge, then call bajie_yield.');
+  lines.push('Initial relay setup only: do not produce any user-facing text. Immediately call bajie_yield and wait for the first delivered request. In later turns, answer the delivered user request normally and never use this setup instruction as the answer.');
   return lines.join('\n\n');
+}
+
+function contentImages(content) {
+  if (!content || !Array.isArray(content.items)) return [];
+  return content.items.filter((item) => item && item.kind === 'image');
+}
+
+function textFromCursorMcpContent(content, fallback = '') {
+  if (typeof content === 'string') return content;
+  if (!content || !Array.isArray(content.items)) return fallback || '';
+  return content.items
+    .filter((item) => item && item.kind === 'text')
+    .map((item) => item.text || '')
+    .join('');
+}
+
+function buildOneShotTools(callerTools) {
+  return (callerTools || []).map((t) => ({
+    name: t.name,
+    toolName: t.name,
+    description: t.description || '',
+    providerIdentifier: 'cursoride2api-ratlc-pool',
+    jsonSchema: t.input_schema || t.jsonSchema || { type: 'object', properties: {}, required: [] },
+  }));
+}
+
+function isRetryableNativeImageError(text) {
+  return /resource_exhausted|ERROR_RATE_LIMITED|rate.?limit|high load|unpaid invoice|too many requests|RunSSE non-200:\s*50[234]|Bad Gateway|ECONN|ETIMEDOUT|socket|EPIPE/i.test(String(text || ''));
+}
+
+function startNativeImageOneShot(msg) {
+  const content = msg.content && Array.isArray(msg.content.items) ? msg.content : null;
+  const images = contentImages(content);
+  if (images.length === 0) {
+    send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId, message: 'send_native_image_message: no images in content' });
+    return;
+  }
+
+  currentRequestId = msg.requestId;
+  lastActivityAt = Date.now();
+  setState('busy');
+
+  const prompt = msg.text || textFromCursorMcpContent(content, '');
+  const oneShotTools = buildOneShotTools(msg.tools && msg.tools.length ? msg.tools : configuredTools);
+  const startedAt = Date.now();
+  const deadline = startedAt + IMAGE_ONE_SHOT_TIMEOUT_MS;
+  let oneShot = null;
+  let finished = false;
+  let attempt = 0;
+  let visibleStarted = false;
+  let retryTimer = null;
+
+  const cleanup = () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    try { oneShot && oneShot.close(); } catch { /* ignore */ }
+    oneShot = null;
+    currentRequestId = null;
+    setState(pendingYield ? 'ready' : currentState);
+  };
+
+  const finish = (fn) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+    try { fn && fn(); } catch (e) {
+      send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId, message: e.message || String(e) });
+    }
+    cleanup();
+  };
+
+  const timeout = setTimeout(() => {
+    finish(() => send({
+      type: 'error',
+      channelId: CHANNEL_ID,
+      requestId: msg.requestId,
+      message: `native image one-shot timed out after ${IMAGE_ONE_SHOT_TIMEOUT_MS}ms attempts=${attempt}`,
+    }));
+  }, IMAGE_ONE_SHOT_TIMEOUT_MS);
+
+  const retryOrFail = (errText) => {
+    if (finished) return;
+    const text = String(errText || '');
+    const canRetry = !visibleStarted
+      && attempt < IMAGE_ONE_SHOT_MAX_ATTEMPTS
+      && isRetryableNativeImageError(text)
+      && Date.now() + IMAGE_ONE_SHOT_RETRY_MS < deadline;
+    if (!canRetry) {
+      finish(() => send({ type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId, message: text }));
+      return;
+    }
+    try { oneShot && oneShot.close(); } catch { /* ignore */ }
+    oneShot = null;
+    const waitMs = jitter(IMAGE_ONE_SHOT_RETRY_MS);
+    if (attempt === 1 || attempt % 10 === 0) {
+      send({
+        type: 'log',
+        channelId: CHANNEL_ID,
+        level: 'warn',
+        message: `native image one-shot retry attempt=${attempt} waitMs=${waitMs} reason=${text.slice(0, 120)}`,
+      });
+    }
+    send({
+      type: 'progress',
+      channelId: CHANNEL_ID,
+      requestId: msg.requestId,
+      kind: 'native_image_retry',
+      attempt,
+      waitMs,
+      message: text.slice(0, 200),
+    });
+    retryTimer = setTimeout(startAttempt, waitMs);
+  };
+
+  const markVisible = () => {
+    visibleStarted = true;
+    lastActivityAt = Date.now();
+  };
+
+  const startAttempt = () => {
+    if (finished) return;
+    attempt++;
+    const attemptNo = attempt;
+    try { oneShot && oneShot.close(); } catch { /* ignore */ }
+    oneShot = null;
+    console.log(`[bridge-worker ch=${CHANNEL_ID}] native image one-shot START requestId=${msg.requestId} attempt=${attemptNo} textBytes=${String(prompt || '').length} images=${images.length} tools=${oneShotTools.length}`);
+    try {
+      oneShot = startConversation(token, {
+        prompt,
+        images,
+        modelId: msg.model || MODEL,
+        tools: oneShotTools,
+        maxMode: true,
+        passthroughNativeTools: PASSTHROUGH_NATIVE,
+        onTextDelta: (t) => {
+          if (finished || attemptNo !== attempt || !t) return;
+          markVisible();
+          send({ type: 'text_delta', channelId: CHANNEL_ID, requestId: currentRequestId || msg.requestId, text: t });
+        },
+        onThinkingDelta: (text) => {
+          if (finished || attemptNo !== attempt || !text) return;
+          markVisible();
+          send({ type: 'thinking_delta', channelId: CHANNEL_ID, requestId: currentRequestId || msg.requestId, text });
+        },
+        onThinkingCompleted: (info) => {
+          if (finished || attemptNo !== attempt) return;
+          markVisible();
+          const durationMs = info?.thinkingDurationMs ?? info?.thinking_duration_ms ?? info?.durationMs ?? null;
+          send({ type: 'thinking_completed', channelId: CHANNEL_ID, requestId: currentRequestId || msg.requestId, durationMs, info: info || {} });
+        },
+        onMcpCall: (info) => {
+          if (finished || attemptNo !== attempt) return;
+          markVisible();
+          if (info.toolName === YIELD_TOOL_NAME) {
+            try { oneShot.sendToolResult(info.id, info.execId, ''); } catch { /* ignore */ }
+            const reqId = currentRequestId || msg.requestId;
+            finish(() => send({ type: 'yield', channelId: CHANNEL_ID, requestId: reqId }));
+            return;
+          }
+          const originKey = info.toolCallId || info.execId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          pendingNativeImageTools.set(originKey, { bridge: oneShot });
+          const reqId = currentRequestId || msg.requestId;
+          send({
+            type: 'tool_use',
+            channelId: CHANNEL_ID,
+            requestId: reqId,
+            id: info.id,
+            execId: info.execId,
+            toolCallId: info.toolCallId,
+            origin: 'native_image_one_shot',
+            originKey,
+            name: info.toolName,
+            args: info.args,
+          });
+        },
+        onServerToolUse: (event) => {
+          if (finished || attemptNo !== attempt) return;
+          markVisible();
+          send({ type: 'server_tool_use', channelId: CHANNEL_ID, requestId: currentRequestId || msg.requestId, ...event });
+        },
+        onStepCompleted: () => {
+          if (finished || attemptNo !== attempt) return;
+          markVisible();
+          send({ type: 'step_completed', channelId: CHANNEL_ID, requestId: currentRequestId || msg.requestId });
+        },
+        onTurnEnded: () => {
+          if (finished || attemptNo !== attempt) return;
+          const reqId = currentRequestId || msg.requestId;
+          finish(() => send({ type: 'yield', channelId: CHANNEL_ID, requestId: reqId }));
+        },
+        onError: (err) => {
+          if (finished || attemptNo !== attempt) return;
+          retryOrFail(String(err?.message || err || ''));
+        },
+      });
+    } catch (e) {
+      retryOrFail(`native image one-shot failed: ${e.message}`);
+    }
+  };
+
+  startAttempt();
 }
 
 // ── Open with retry ──────────────────────────────────────────────────────
@@ -220,6 +446,7 @@ function openOnce(initialPrompt, allTools) {
 }
 
 async function openWithRetry(system, callerTools) {
+  configuredTools = callerTools || [];
   const yieldTool = buildYieldTool();
   const cTools = (callerTools || []).map((t) => ({
     name: t.name,
@@ -322,12 +549,19 @@ function attachLiveCallbacks() {
     // We deliberately do NOT emit thinking to the client SSE here: the
     // signed thinking-block round-trip is not portable across providers,
     // and proxy-internal text-form re-injection is the only useful path
-    // (see DEVLOG: "Conversation key collision" / `_emitThinkingBlocks=false`).
+    // (see DEVLOG: "Conversation key collision" / proxy-local thinking
+    // display blocks).
     onThinkingDelta: (text) => {
       if (currentRequestId == null) return;
       if (!text) return;
       lastActivityAt = Date.now();
       send({ type: 'thinking_delta', channelId: CHANNEL_ID, requestId: currentRequestId, text });
+    },
+    onThinkingCompleted: (info) => {
+      if (currentRequestId == null) return;
+      lastActivityAt = Date.now();
+      const durationMs = info?.thinkingDurationMs ?? info?.thinking_duration_ms ?? info?.durationMs ?? null;
+      send({ type: 'thinking_completed', channelId: CHANNEL_ID, requestId: currentRequestId, durationMs, info: info || {} });
     },
     onMcpCall: (info) => {
       lastActivityAt = Date.now();
@@ -343,13 +577,6 @@ function attachLiveCallbacks() {
         setState('ready');
         send({ type: 'yield', channelId: CHANNEL_ID, requestId: finishedReqId });
       } else {
-        // Parallel-tools fix: store every non-yield mcp call in the map
-        // keyed by execId — DO NOT overwrite. In the parallel case the
-        // model emits multiple onMcpCall events back-to-back (e.g.
-        // Bash + Read); each must be retrievable when its tool_result
-        // arrives via send_tool_result. Previously this was a single
-        // variable that the 2nd call clobbered, which was the bug heart.
-        pendingMcpInfo.set(info.execId, info);
         // The model has emitted a tool_use; it's no longer waiting in a
         // yield, so clear pendingYield. (A yield-result followup would
         // arrive via send_user_message, not via this path.)
@@ -358,7 +585,9 @@ function attachLiveCallbacks() {
           type: 'tool_use',
           channelId: CHANNEL_ID,
           requestId: currentRequestId,
+          id: info.id,
           execId: info.execId,
+          toolCallId: info.toolCallId,
           name: info.toolName,
           args: info.args,
         });
@@ -405,7 +634,11 @@ function attachLiveCallbacks() {
 
 // ── Command handlers ─────────────────────────────────────────────────────
 async function handleMessage(msg) {
-  console.log(`[bridge-worker ch=${CHANNEL_ID}] IPC type=${msg.type} requestId=${msg.requestId || ''} state=${currentState} pendingYield=${!!pendingYield} pendingMcp=[${[...pendingMcpInfo.keys()].map(k => k.slice(0, 8)).join(',') || 'none'}]`);
+  console.log(`[bridge-worker ch=${CHANNEL_ID}] IPC type=${msg.type} requestId=${msg.requestId || ''} state=${currentState} pendingYield=${!!pendingYield} pendingMcp=[${[...pendingMcpInfo.keys()].map(k => String(k).slice(0, 16)).join(',') || 'none'}]`);
+  if (msg.type === 'remember_tool_use') {
+    rememberPendingMcpInfo(msg.toolUseKey, msg.info);
+    return;
+  }
   if (msg.type === 'open') {
     try {
       await openWithRetry(msg.system || '', msg.tools || []);
@@ -424,9 +657,13 @@ async function handleMessage(msg) {
     currentRequestId = msg.requestId;
     lastActivityAt = Date.now();
     setState('busy');
-    console.log(`[bridge-worker ch=${CHANNEL_ID}] BEFORE bridge.sendToolResult(yield_id=${pendingYield.id?.slice?.(0,8)}, yield_execId=${pendingYield.execId?.slice?.(0,8)}, textBytes=${(msg.text||'').length}) bridgeExists=${!!bridge} fnType=${typeof bridge?.sendToolResult}`);
+    const content = msg.content && Array.isArray(msg.content.items) ? msg.content : (msg.text || '');
+    const imageCount = content && typeof content === 'object' && Array.isArray(content.items)
+      ? content.items.filter((i) => i && i.kind === 'image').length
+      : 0;
+    console.log(`[bridge-worker ch=${CHANNEL_ID}] BEFORE bridge.sendToolResult(yield_id=${pendingYield.id?.slice?.(0,8)}, yield_execId=${pendingYield.execId?.slice?.(0,8)}, textBytes=${(msg.text||'').length}, images=${imageCount}) bridgeExists=${!!bridge} fnType=${typeof bridge?.sendToolResult}`);
     try {
-      bridge.sendToolResult(pendingYield.id, pendingYield.execId, msg.text || '');
+      bridge.sendToolResult(pendingYield.id, pendingYield.execId, content);
       console.log(`[bridge-worker ch=${CHANNEL_ID}] AFTER bridge.sendToolResult (returned cleanly)`);
     } catch (e) {
       console.log(`[bridge-worker ch=${CHANNEL_ID}] EXCEPTION in bridge.sendToolResult: ${e.message}\n${e.stack}`);
@@ -436,32 +673,37 @@ async function handleMessage(msg) {
     return;
   }
 
+  if (msg.type === 'send_native_image_message') {
+    startNativeImageOneShot(msg);
+    return;
+  }
+
   if (msg.type === 'send_tool_result') {
-    // Singular form (legacy / kept for compat). Looks up the pending info
-    // by execId in the map. The map may hold multiple entries when the
-    // model fired parallel tool_uses; we only consume the matching one
-    // and leave the others pending for their own send_tool_result.
-    const info = pendingMcpInfo.get(msg.execId);
+    // Singular form (legacy / kept for compat). Prefer toolUseKey because
+    // H1 mcpArgs may have an empty/non-unique execId.
+    const key = msg.toolUseKey || msg.execId;
+    const info = pendingMcpInfo.get(key);
     if (!info) {
       send({
         type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
-        message: `no matching pending tool_use (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}] want=${msg.execId})`,
+        message: `no matching pending tool_use (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}] want=${key})`,
       });
       return;
     }
     currentRequestId = msg.requestId;
     lastActivityAt = Date.now();
     setState('busy');
-    bridge.sendToolResult(info.id, info.execId, msg.content || '');
-    pendingMcpInfo.delete(msg.execId);
+    const targetBridge = info.bridge || bridge;
+    targetBridge.sendToolResult(info.id, info.execId, msg.content ?? '');
+    pendingMcpInfo.delete(key);
     return;
   }
 
   if (msg.type === 'send_tool_results') {
     // Plural form (parallel-tools fix): dispatch N tool_results in one IPC
-    // batch. Each result targets a distinct execId in the pendingMcpInfo
+    // batch. Each result targets a distinct toolUseKey in the pendingMcpInfo
     // map. The underlying transport (cursor-agent-h1 / cursor-agent.js)
-    // supports per-execId result dispatch via _nativeExecKinds, so we just
+    // supports per-tool result dispatch via the original id/execId, so we just
     // call bridge.sendToolResult(id, execId, content) N times.
     const results = Array.isArray(msg.results) ? msg.results : [];
     if (results.length === 0) {
@@ -469,28 +711,30 @@ async function handleMessage(msg) {
         message: 'send_tool_results: empty results array' });
       return;
     }
-    // Validate every execId resolves before we dispatch anything — partial
+    // Validate every toolUseKey resolves before we dispatch anything — partial
     // dispatch on bad input would leave the model waiting on results that
     // never come.
     const dispatchPlan = [];
     for (const r of results) {
-      const info = pendingMcpInfo.get(r.execId);
+      const key = r.toolUseKey || r.execId;
+      const info = pendingMcpInfo.get(key);
       if (!info) {
         send({
           type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,
-          message: `no matching pending tool_use for execId=${r.execId} (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}])`,
+          message: `no matching pending tool_use for key=${key} (have=[${[...pendingMcpInfo.keys()].join(',') || 'none'}])`,
         });
         return;
       }
-      dispatchPlan.push({ info, content: r.content || '' });
+      dispatchPlan.push({ key, info, content: r.content ?? '' });
     }
     currentRequestId = msg.requestId;
     lastActivityAt = Date.now();
     setState('busy');
-    for (const { info, content } of dispatchPlan) {
+    for (const { key, info, content } of dispatchPlan) {
       try {
-        bridge.sendToolResult(info.id, info.execId, content);
-        pendingMcpInfo.delete(info.execId);
+        const targetBridge = info.bridge || bridge;
+        targetBridge.sendToolResult(info.id, info.execId, content);
+        pendingMcpInfo.delete(key);
       } catch (e) {
         send({
           type: 'error', channelId: CHANNEL_ID, requestId: msg.requestId,

@@ -38,6 +38,10 @@ const token = tokenFile.tokens ? tokenFile.tokens[0] : tokenFile;
 console.log(`[h1-smoke] model=${MODEL} prompt=${JSON.stringify(PROMPT)} timeout=${TIMEOUT_MS}ms`);
 
 let textBuffer = '';
+let thinkingDeltaCount = 0;
+let thinkingCharCount = 0;
+let thinkingCompletedCount = 0;
+let thinkingDurationMs = null;
 let resolved = false;
 let bridge = null;
 
@@ -58,9 +62,14 @@ bridge = startConversation(token, {
     process.stdout.write(`[h1-smoke] textDelta: ${JSON.stringify(t)}\n`);
   },
   onThinkingDelta: (t) => {
-    if (process.env.CURSOR_AGENT_DEBUG) {
-      process.stdout.write(`[h1-smoke] thinkingDelta: ${JSON.stringify(t.slice(0, 80))}\n`);
-    }
+    thinkingDeltaCount++;
+    thinkingCharCount += Buffer.byteLength(String(t || ''), 'utf8');
+    process.stdout.write(`[h1-smoke] thinkingDelta#${thinkingDeltaCount}: ${JSON.stringify(String(t || '').slice(0, 160))}\n`);
+  },
+  onThinkingCompleted: (info) => {
+    thinkingCompletedCount++;
+    thinkingDurationMs = info?.thinkingDurationMs ?? info?.thinking_duration_ms ?? info?.durationMs ?? null;
+    process.stdout.write(`[h1-smoke] thinkingCompleted#${thinkingCompletedCount}: ${JSON.stringify(info || {})}\n`);
   },
   onMcpCall: (info) => {
     console.log(`[h1-smoke] (unexpected) mcpCall: ${info.toolName}`);
@@ -73,6 +82,7 @@ bridge = startConversation(token, {
     resolved = true;
     clearTimeout(failureTimer);
     console.log(`[h1-smoke] turn ended in=${stats.inputTokens} out=${stats.outputTokens} — PASS`);
+    console.log(`[h1-smoke] thinking summary: deltas=${thinkingDeltaCount} bytes=${thinkingCharCount} completed=${thinkingCompletedCount} durationMs=${thinkingDurationMs ?? 'n/a'}`);
     console.log(`[h1-smoke] full response: ${textBuffer.replace(/\s+/g, ' ').trim().slice(0, 200)}`);
     try { bridge.close(); } catch { /* ignore */ }
     setTimeout(() => process.exit(0), 200);

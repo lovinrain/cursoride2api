@@ -10,6 +10,14 @@ import net from 'node:net';
 import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
+import { isPoolLocalToolName, runPoolLocalTool } from './local-tool-executor.mjs';
+import {
+  consumeClientToolResult,
+  getConsumedClientToolResult,
+  rememberClientToolUse,
+  buildPoolToolResultContentFromClientResult,
+  resolveClientBridgeToolUse,
+} from './client-tool-bridge.mjs';
 import * as thinkingBuffer from './thinking-buffer.mjs';
 import {
   performWebSearch,
@@ -18,15 +26,30 @@ import {
   fallbackNoticeBody,
   resultsLookGeneric,
 } from './spoof-mitigation.mjs';
+import {
+  appendImageAttachments,
+  cursorMcpContentImageCount,
+  cursorMcpContentPayloadBytes,
+  cursorMcpContentToText,
+  extractImageAttachmentsFromMessages,
+  normalizeAnthropicContentForCursorMcp,
+  prependTextContent,
+} from './multimodal-content.mjs';
 
 // Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
 // `deriveConversationKey` and `extractClientSessionId` instead of porting
 // them. The helpers depend on Node `crypto` only — no ESM coupling.
 const _require = createRequire(import.meta.url);
 const anthropicTools = _require('../../src/anthropic-tools.js');
+const { StreamingHallucinationFilter } = _require('../../src/streaming-hallucination-filter.js');
+const {
+  ProxyThinkingBlockAdapter,
+  makeProxyThinkingSignature,
+  isProxyLocalThinkingBlock,
+} = _require('../../src/proxy-thinking-adapter.js');
 
-const PORT = parseInt(process.env.PORT || '4242', 10);
-const HOST = process.env.HOST || '127.0.0.1';
+const PORT = parseInt(process.env.RATLC_API_PORT || process.env.PORT || '4242', 10);
+const HOST = process.env.RATLC_API_HOST || process.env.HOST || '127.0.0.1';
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 // POOL_REINJECT_THINKING — opt-in symmetry with CURSOR_REINJECT_THINKING.
@@ -35,6 +58,7 @@ const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 // back into the outbound prompt as `<thinking>...</thinking>` blocks.
 // Default OFF (no behavior change vs. legacy). See thinking-buffer.mjs.
 const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
+const POOL_PROXY_THINKING_BLOCKS = process.env.POOL_PROXY_THINKING_BLOCKS === '1';
 // Claude Code currently does not render Anthropic `server_tool_use` blocks in
 // the same visible way it renders client-side `tool_use` blocks. Keep emitting
 // the official blocks for protocol consumers, and add a small text trace unless
@@ -51,17 +75,139 @@ const RENDER_SERVER_TOOL_TEXT = process.env.RATLC_RENDER_SERVER_TOOL_TEXT !== '0
 //                    one self-contained prompt. The channel is treated as
 //                    a stateless carrier — each `bajie_yield` result is a
 //                    complete fresh request. Channel rotation is now safe.
+//   hybrid         — first turn / divergent turns send `full`; stable
+//                    continuations send `last` and ask the pool-manager to
+//                    prefer the same channel for this client session.
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
-if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
-  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
+if (!['full', 'last', 'hybrid'].includes(POOL_CONTEXT_MODE)) {
+  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last|hybrid)`);
   process.exit(1);
 }
+const HYBRID_SESSION_TTL_MS = Math.max(60_000, parseInt(process.env.POOL_HYBRID_SESSION_TTL_MS || '1800000', 10));
+// Safety valve for clients such as Claude Code that echo complete messages[]
+// history, tool results, and optional thinking back on every turn. Sending a
+// very large full-context payload as a bajie_yield tool_result can make Cursor
+// close or stall the live session. When full rendering crosses this byte-ish
+// character limit, fall back to sticky last-turn delivery for that request.
+// Set to 0 to disable.
+const CONTEXT_MAX_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MAX_BYTES || process.env.POOL_CONTEXT_MAX_BYTES || '98304', 10));
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
-log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}`);
+log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}`);
+
+const REQUEST_LOG_MAX = Math.max(100, parseInt(process.env.RATLC_REQUEST_LOG_MAX || '500', 10));
+const requestLog = [];
+const requestLogById = new Map();
+
+function rememberRequest(entry) {
+  if (!entry || !entry.requestId) return entry;
+  requestLogById.set(entry.requestId, entry);
+  requestLog.unshift(entry);
+  while (requestLog.length > REQUEST_LOG_MAX) {
+    const old = requestLog.pop();
+    if (old?.requestId) requestLogById.delete(old.requestId);
+  }
+  return entry;
+}
+
+function patchRequest(requestId, patch) {
+  const entry = requestLogById.get(requestId);
+  if (!entry) return null;
+  Object.assign(entry, patch);
+  return entry;
+}
+
+function finishRequestLog(requestId, patch = {}) {
+  const now = Date.now();
+  const entry = requestLogById.get(requestId);
+  if (!entry) return null;
+  Object.assign(entry, patch, {
+    endedAt: patch.endedAt || now,
+    durationMs: now - entry.startedAt,
+  });
+  if (entry.firstByteAt && entry.firstByteMs == null) {
+    entry.firstByteMs = entry.firstByteAt - entry.startedAt;
+  }
+  return entry;
+}
 
 function normalizeModelForRouting(model) {
   return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
+}
+
+function stableHash(value) {
+  let raw;
+  if (typeof value === 'string') raw = value;
+  else {
+    try { raw = JSON.stringify(value || null); }
+    catch { raw = String(value || ''); }
+  }
+  return createHash('sha256').update(raw).digest('hex').slice(0, 16);
+}
+
+function toolsSignature(tools) {
+  if (!Array.isArray(tools)) return '';
+  return tools
+    .filter((t) => t && t.name)
+    .map((t) => `${t.name}:${stableHash(t.input_schema || t.jsonSchema || {})}`)
+    .sort()
+    .join('|');
+}
+
+function messagesFingerprint(messages) {
+  return stableHash(Array.isArray(messages) ? messages : []);
+}
+
+const hybridSessions = new Map();
+
+function evictHybridSessions(now = Date.now()) {
+  for (const [k, v] of hybridSessions) {
+    if (now - v.lastAccessMs > HYBRID_SESSION_TTL_MS) hybridSessions.delete(k);
+  }
+}
+setInterval(evictHybridSessions, 5 * 60_000).unref();
+
+function makeSessionKey({ clientSessionId, convKey, routingModel }) {
+  return clientSessionId
+    ? `sid:${routingModel || ''}:${clientSessionId}`
+    : `conv:${routingModel || ''}:${convKey}`;
+}
+
+function decideHybridContext({ clientSessionId, convKey, routingModel, system, tools, messages }) {
+  const sessionKey = makeSessionKey({ clientSessionId, convKey, routingModel });
+  const now = Date.now();
+  const sysHash = stableHash(extractSystemPrompt(system));
+  const toolHash = toolsSignature(tools);
+  const msgCount = Array.isArray(messages) ? messages.length : 0;
+  const currentTranscriptHash = messagesFingerprint(messages);
+  const prev = hybridSessions.get(sessionKey);
+  const reasons = [];
+  let sendMode = 'full';
+
+  if (!prev) reasons.push('new-session');
+  if (prev && prev.model !== routingModel) reasons.push('model-changed');
+  if (prev && prev.systemHash !== sysHash) reasons.push('system-changed');
+  if (prev && prev.toolsHash !== toolHash) reasons.push('tools-changed');
+  if (prev && msgCount <= prev.messageCount) reasons.push('non-monotonic-messages');
+
+  if (prev && reasons.length === 0) sendMode = 'last';
+
+  hybridSessions.set(sessionKey, {
+    model: routingModel || '',
+    systemHash: sysHash,
+    toolsHash: toolHash,
+    messageCount: msgCount,
+    transcriptHash: currentTranscriptHash,
+    previousTranscriptHash: prev?.transcriptHash || null,
+    lastAccessMs: now,
+  });
+
+  return {
+    sessionKey,
+    sendMode,
+    reason: reasons.length ? reasons.join(',') : 'stable-session',
+    messageCount: msgCount,
+  };
 }
 
 // ── Pool socket connection ──────────────────────────────────────────────
@@ -180,6 +326,18 @@ function extractTextFromContent(content) {
   return content.filter((c) => c.type === 'text').map((c) => c.text || '').join('\n');
 }
 
+function buildLastUserCursorMcpContent(content, thinkingTurns) {
+  const normalized = normalizeAnthropicContentForCursorMcp(content);
+  const preamble = renderThinkingPreamble(thinkingTurns);
+  return prependTextContent(normalized, preamble);
+}
+
+function buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns }) {
+  const text = renderFullContext({ messages, system, tools, thinkingTurns });
+  const attachments = extractImageAttachmentsFromMessages(messages);
+  return appendImageAttachments({ items: [{ kind: 'text', text }] }, attachments);
+}
+
 function findAllToolResults(content) {
   if (!Array.isArray(content)) return [];
   const out = [];
@@ -187,10 +345,26 @@ function findAllToolResults(content) {
     if (c.type === 'tool_result') {
       const text = typeof c.content === 'string' ? c.content :
         Array.isArray(c.content) ? c.content.map((p) => p.type === 'text' ? p.text : JSON.stringify(p)).join('\n') : '';
-      out.push({ tool_use_id: c.tool_use_id, text });
+      out.push({ tool_use_id: c.tool_use_id, text, content: c.content, isError: c.is_error === true });
     }
   }
   return out;
+}
+
+function makeClientBridgeToolUseId(poolToolUseId) {
+  const suffix = String(poolToolUseId || randomUUID()).replace(/[^A-Za-z0-9_-]/g, '').slice(-16);
+  return `toolu_client_${suffix || randomUUID().replace(/-/g, '').slice(0, 16)}`;
+}
+
+function isClientBridgeToolUseId(toolUseId) {
+  return typeof toolUseId === 'string' && toolUseId.startsWith('toolu_client_');
+}
+
+function isSyntheticToolUseId(toolUseId) {
+  if (!toolUseId || typeof toolUseId !== 'string') return false;
+  if (toolUseId.startsWith('toolu_synth_')) return true;
+  const decoded = anthropicTools.decodeToolUseId(toolUseId);
+  return !!decoded && !decoded.execId && String(decoded.toolCallId || '').startsWith('toolu_synth_');
 }
 
 function extractSystemPrompt(system) {
@@ -226,13 +400,16 @@ function renderContentBlocks(blocks) {
       out.push(`<tool_result tool_use_id="${c.tool_use_id || ''}"${err}>\n${inner}\n</tool_result>`);
     } else if (c.type === 'image') {
       out.push('<image/>');
-    } else if (c.type === 'thinking' || c.type === 'redacted_thinking') {
+    } else if (c.type === 'thinking') {
       // claude-code echoes thinking blocks back into messages on the next
-      // turn (interleaved-thinking beta). Render to text so the pool
-      // backend gets the human-readable form. Signature is dropped — we
-      // synthesized it, so Cursor wouldn't accept it anyway.
+      // turn (interleaved-thinking beta). Proxy-local thinking is UI-only and
+      // should not silently become Cursor prompt context; explicit
+      // POOL_REINJECT_THINKING remains the opt-in path for that.
+      if (isProxyLocalThinkingBlock(c)) continue;
       const t = typeof c.thinking === 'string' ? c.thinking : '';
       if (t) out.push(`<thinking>\n${t}\n</thinking>`);
+    } else if (c.type === 'redacted_thinking') {
+      // No plaintext to render on the Cursor AgentService path.
     } else if (typeof c.text === 'string') {
       // Tolerate untyped {text:"..."} entries (older SDKs).
       out.push(c.text);
@@ -275,10 +452,20 @@ function renderFullContext({ messages, system, tools, thinkingTurns }) {
 
   if (Array.isArray(tools) && tools.length > 0) {
     lines.push('--- AVAILABLE TOOLS (for reference; use the live tool list bound to this stream) ---');
+    const clientMcpNames = [];
     for (const t of tools) {
       if (!t || !t.name) continue;
       const desc = t.description ? ` — ${String(t.description).slice(0, 200)}` : '';
       lines.push(`* ${t.name}${desc}`);
+      if (String(t.name).startsWith('mcp__')) clientMcpNames.push(t.name);
+    }
+    if (clientMcpNames.length > 0) {
+      lines.push('');
+      lines.push(
+        'Client MCP tools above are not registered one-by-one in this warm Cursor pool. ' +
+        'To use any tool named `mcp__server__tool`, call `client_mcp_call` with ' +
+        '`tool_name` set to that exact name and `input` set to the tool arguments.'
+      );
     }
     lines.push('');
   }
@@ -335,6 +522,15 @@ function renderThinkingPreamble(thinkingTurns) {
   return blocks.join('\n\n') + '\n\n';
 }
 
+function looksLikeAgentToolPlaceholderWrite(toolName, args) {
+  const normalizedTool = anthropicTools.normalizeClientToolNameForPolicy(toolName);
+  if (normalizedTool !== 'write') return false;
+  const a = args && typeof args === 'object' ? args : {};
+  const p = String(a.file_path || a.path || a.filename || '').replace(/\\/g, '/');
+  const c = String(a.content ?? a.file_text ?? a.text ?? a.body ?? a.data ?? '').trim();
+  return /^agent-tools\/[^/]+\.txt$/i.test(p) && (c === '' || c === '(No content)');
+}
+
 async function handleMessagesRequest(req, res) {
   let body;
   try { body = await readJsonBody(req); }
@@ -347,15 +543,14 @@ async function handleMessagesRequest(req, res) {
   // claude-code (and other clients) enable `interleaved-thinking-2025-05-14`
   // beta plus `thinking: {type:'enabled'}` in the body when talking to
   // thinking models. With that beta on, the client REQUIRES a `thinking`
-  // content block to precede any `tool_use` block in the assistant
-  // response. If we emit only the tool_use, claude-code rejects the
-  // whole stream with "API returned an empty or malformed response
-  // (HTTP 200)". We can't capture upstream signed thinking from Cursor
-  // (different signing keys), so we emit a placeholder thinking block
-  // with a synthetic signature whenever the request asked for thinking.
-  // Cursor's bidi stream doesn't verify Anthropic signatures, so the
-  // block round-tripping back into the next pool request as text is
-  // harmless. Pre-emit guard is on body.thinking.type, NOT the beta
+  // content block to precede any `tool_use` block in the assistant response.
+  // If we emit only the tool_use, claude-code rejects the whole stream with
+  // "API returned an empty or malformed response (HTTP 200)". We cannot
+  // produce Anthropic-signed thinking from Cursor's AgentService stream, so
+  // this server either emits real current-turn Cursor `thinking_delta` as a
+  // proxy-local block (POOL_PROXY_THINKING_BLOCKS=1) or falls back to a
+  // proxy-local placeholder block. Both are stripped from prompt rendering.
+  // Pre-emit guard is on body.thinking.type, NOT the beta
   // header — claude-code v2.1.143 sends both together, and the body
   // field is the authoritative signal.
   const clientThinkingEnabled =
@@ -417,6 +612,41 @@ async function handleMessagesRequest(req, res) {
   // turn). All N must be forwarded to the same pool channel.
   const toolResults = findAllToolResults(lastMsg.content);
   const requestId = 'req-' + randomUUID().replace(/-/g, '').slice(0, 16);
+  const clientBridgeToolResults = [];
+  const replayedClientBridgeToolResults = [];
+  const regularToolResults = [];
+  for (const r of toolResults) {
+    const entry = consumeClientToolResult(r.tool_use_id);
+    if (entry) clientBridgeToolResults.push({ result: r, entry });
+    else if (isClientBridgeToolUseId(r.tool_use_id)) {
+      const consumed = getConsumedClientToolResult(r.tool_use_id);
+      if (consumed) replayedClientBridgeToolResults.push({ result: r, entry: consumed });
+      else regularToolResults.push(r);
+    }
+    else regularToolResults.push(r);
+  }
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const requestIp = forwardedFor || req.headers['x-real-ip'] || req.socket?.remoteAddress || '';
+  const reqLog = rememberRequest({
+    requestId,
+    startedAt: Date.now(),
+    status: 'queued',
+    kind: toolResults.length > 0 ? 'tool_result' : 'user_message',
+    model: model || null,
+    routeModel: routingModel || null,
+    requestIp,
+    forwardedFor: req.headers['x-forwarded-for'] || null,
+    clientSessionId: clientSessionId || null,
+    convKey,
+    messageCount: messages.length,
+    toolCount: Array.isArray(tools) ? tools.length : 0,
+    toolResultCount: toolResults.length,
+    clientBridgeToolResultCount: clientBridgeToolResults.length,
+    replayedClientBridgeToolResultCount: replayedClientBridgeToolResults.length,
+    inputTokensEstimate: Math.ceil(JSON.stringify(messages || []).length / 4),
+    outputTokens: 0,
+    serverWebSearchRequests: 0,
+  });
 
   // HTTP header write is deferred until we receive the pool's route_decision
   // event so we can stamp x-ratlc-routed-to / x-ratlc-channel / x-ratlc-fallback
@@ -447,7 +677,20 @@ async function handleMessagesRequest(req, res) {
   let outputTokens = 0;
   let stopReason = 'end_turn';
   let done = false;
+  let finalStatusOverride = null;
+  let finalErrorMessage = null;
   let toolUseEmitted = false;
+  let thinkingBlockOpen = false;
+  let thinkingBlockStarted = false;
+  let thinkingBlockIndex = null;
+  let thinkingAdapter = null;
+  let emittedTextForDetection = '';
+  let emittedThinkingForDetection = '';
+  let thinkingCompletedCount = 0;
+  let thinkingDurationMs = null;
+  let rescuedHitCount = 0;
+  const emittedToolUseKeys = new Set();
+  const hallucinationFilter = new StreamingHallucinationFilter();
   const serverToolBlocks = new Map();
   const openServerTools = new Set();
   const visibleServerToolTraces = new Set();
@@ -459,6 +702,12 @@ async function handleMessagesRequest(req, res) {
   // shape is malformed enough that claude-code rejects the response with
   // "API returned an empty or malformed response (HTTP 200)".
   let messageStarted = false;
+  let visibleUpstreamEventSeen = false;
+  let noVisibleEventTimer = null;
+  const NO_VISIBLE_EVENT_TIMEOUT_MS = Math.max(5_000, parseInt(
+    process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000',
+    10,
+  ));
   // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
   //
   // In theory the primary finalize signal during a tool_use turn is
@@ -505,6 +754,32 @@ async function handleMessagesRequest(req, res) {
       toolUseFinishTimer = null;
     }
   }
+  function armNoVisibleEventTimer() {
+    if (noVisibleEventTimer || done || visibleUpstreamEventSeen) return;
+    noVisibleEventTimer = setTimeout(() => {
+      noVisibleEventTimer = null;
+      if (done || visibleUpstreamEventSeen) return;
+      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}`);
+      finalStatusOverride = 'upstream_no_visible_event_timeout';
+      finalErrorMessage = `No visible Cursor event within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms after routing`;
+      emitTextDelta(
+        `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms. ` +
+        'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
+      );
+      stopReason = 'end_turn';
+      finishMessage();
+    }, NO_VISIBLE_EVENT_TIMEOUT_MS);
+  }
+  function disarmNoVisibleEventTimer() {
+    if (noVisibleEventTimer) {
+      clearTimeout(noVisibleEventTimer);
+      noVisibleEventTimer = null;
+    }
+  }
+  function markVisibleUpstreamEvent() {
+    visibleUpstreamEventSeen = true;
+    disarmNoVisibleEventTimer();
+  }
 
   function startMsg() {
     if (messageStarted) return;
@@ -534,6 +809,7 @@ async function handleMessagesRequest(req, res) {
   function startTextBlock() {
     // Same ordering invariant as emitToolUseBlock — thinking block first
     // when the client asked for thinking. See emitPlaceholderThinkingBlock.
+    stopThinkingBlock();
     emitPlaceholderThinkingBlock();
     blockIdx++;
     sseWrite(res, 'content_block_start', {
@@ -558,6 +834,60 @@ async function handleMessagesRequest(req, res) {
     textBlockOpen = false;
   }
 
+  function startThinkingBlock() {
+    if (thinkingBlockOpen) return;
+    stopTextBlock();
+    blockIdx++;
+    thinkingBlockIndex = blockIdx;
+    thinkingBlockStarted = true;
+    thinkingAdapter = new ProxyThinkingBlockAdapter({
+      source: 'pool',
+      convKey,
+      requestId,
+      blockIndex: thinkingBlockIndex,
+    });
+    sseWrite(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: thinkingBlockIndex,
+      content_block: { type: 'thinking', thinking: '' },
+    });
+    thinkingBlockOpen = true;
+    // A real proxy-local thinking block satisfies the same ordering
+    // requirement as the placeholder; do not emit both in one assistant turn.
+    placeholderThinkingEmitted = true;
+  }
+
+  function emitThinkingDelta(text) {
+    if (!text) return;
+    if (!thinkingBlockOpen && thinkingBlockStarted) return;
+    if (!thinkingBlockOpen && blockIdx >= 0) return;
+    startThinkingBlock();
+    if (thinkingAdapter) thinkingAdapter.append(text);
+    sseWrite(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: thinkingBlockIndex,
+      delta: { type: 'thinking_delta', thinking: text },
+    });
+  }
+
+  function stopThinkingBlock() {
+    if (!thinkingBlockOpen) return;
+    const signature = thinkingAdapter
+      ? thinkingAdapter.signature({ blockIndex: thinkingBlockIndex })
+      : null;
+    if (signature) {
+      sseWrite(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: thinkingBlockIndex,
+        delta: { type: 'signature_delta', signature },
+      });
+    }
+    sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: thinkingBlockIndex });
+    thinkingBlockOpen = false;
+    thinkingBlockIndex = null;
+    thinkingAdapter = null;
+  }
+
   // Whether we've emitted a placeholder thinking block already on this
   // assistant turn. Anthropic emits at most one thinking block per
   // assistant turn (before any tool_use); we mirror that.
@@ -578,13 +908,18 @@ async function handleMessagesRequest(req, res) {
       type: 'content_block_delta', index: blockIdx,
       delta: { type: 'thinking_delta', thinking: '(thinking captured upstream; not forwarded by proxy)' },
     });
-    // Signature delta: claude-code stores this and may echo it back on
-    // the next request. Cursor's bidi stream doesn't verify Anthropic
-    // signatures, so a synthetic value is safe end-to-end. Use a
-    // base64-looking string of plausible length.
+    // Signature delta: mark this as proxy-local so echoed placeholder blocks
+    // stay UI/protocol-only and are stripped from future prompt rendering.
+    const signature = makeProxyThinkingSignature({
+      source: 'pool-placeholder',
+      convKey,
+      requestId,
+      blockIndex: blockIdx,
+      text: '(thinking captured upstream; not forwarded by proxy)',
+    });
     sseWrite(res, 'content_block_delta', {
       type: 'content_block_delta', index: blockIdx,
-      delta: { type: 'signature_delta', signature: 'proxy-placeholder-signature-' + messageId },
+      delta: { type: 'signature_delta', signature },
     });
     sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
     placeholderThinkingEmitted = true;
@@ -594,6 +929,7 @@ async function handleMessagesRequest(req, res) {
     // claude-code with interleaved-thinking beta REQUIRES a thinking
     // block before any tool_use block, otherwise it rejects the whole
     // SSE as "empty or malformed". Emit a placeholder once per turn.
+    stopThinkingBlock();
     emitPlaceholderThinkingBlock();
     stopTextBlock();
     blockIdx++;
@@ -611,6 +947,9 @@ async function handleMessagesRequest(req, res) {
     });
     sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
     toolUseEmitted = true;
+    markVisibleUpstreamEvent();
+    try { emittedToolUseKeys.add(`${toolName}|${JSON.stringify(args || {})}`); }
+    catch { emittedToolUseKeys.add(`${toolName}|?`); }
   }
 
   function normalizeServerToolId(id) {
@@ -621,6 +960,7 @@ async function handleMessagesRequest(req, res) {
     if (done) return;
     if (!event || event.name !== 'web_search') return;
     startMsg();
+    stopThinkingBlock();
     emitPlaceholderThinkingBlock();
     stopTextBlock();
     const toolId = normalizeServerToolId(event.id);
@@ -700,22 +1040,125 @@ async function handleMessagesRequest(req, res) {
     }
   }
 
-  function shouldSoftenPoolError(message) {
+  function tryRescueHallucinatedToolCalls() {
+    const combined = emittedTextForDetection + (emittedThinkingForDetection ? '\n' + emittedThinkingForDetection : '');
+    if (!combined) return 0;
+    const hits = anthropicTools.parseHallucinatedToolCalls(combined);
+    if (hits.length <= rescuedHitCount) return 0;
+
+    const registered = new Set(
+      (tools || []).flatMap((t) => [t && t.name, t && t.toolName]).filter(Boolean),
+    );
+
+    let added = 0;
+    for (const hit of hits.slice(rescuedHitCount)) {
+      if (anthropicTools.shouldDropClientWebLookupToolName(hit.name)) {
+        log(`  hallucinated-tool-call ignored: ${hit.name} (web lookup is Cursor-native only)`);
+        continue;
+      }
+
+      const canonical = anthropicTools.canonicalizeHallucinatedToolName(hit.name, registered);
+      const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(canonical, hit.args || {});
+      if (anthropicTools.shouldDropClientWebLookupToolName(canonical)) {
+        log(`  hallucinated-tool-call ignored: ${hit.name} → ${canonical} (web lookup is Cursor-native only)`);
+        continue;
+      }
+      if (looksLikeAgentToolPlaceholderWrite(canonical, normalizedArgs)) {
+        log(`  hallucinated-tool-call ignored: ${hit.name} (empty agent-tools placeholder write)`);
+        continue;
+      }
+
+      const key = (() => {
+        try { return `${canonical}|${JSON.stringify(normalizedArgs || {})}`; }
+        catch { return `${canonical}|?`; }
+      })();
+      if (emittedToolUseKeys.has(key)) continue;
+      emittedToolUseKeys.add(key);
+
+      const synthId = anthropicTools.encodeToolUseId(
+        convKey,
+        '',
+        `toolu_synth_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
+        clientSessionId || '',
+      );
+      emitToolUseBlock(synthId, canonical, normalizedArgs);
+      log(`  🩹 hallucinated-tool-call rescued: ${hit.name}${canonical !== hit.name ? ` → ${canonical}` : ''} id=${synthId}`);
+      added++;
+    }
+
+    rescuedHitCount = hits.length;
+    return added;
+  }
+
+  function classifySoftenedPoolError(message, code) {
     const text = String(message || '');
-    return /unknown anthropic_tool_use_id/i.test(text)
-      || /tool_use_ids span multiple channels/i.test(text)
-      || /channel .* died/i.test(text)
-      || /busy-watchdog timeout/i.test(text);
+    if (code === 'no_ready_timeout' || /no ready RATLC channel/i.test(text)) {
+      return {
+        status: 'no_ready_timeout',
+        error: text,
+        text:
+          '[proxy_notice] RATLC pool currently has no ready Cursor channel for this model. ' +
+          'The request reached the server, but Cursor upstream did not provide a usable Agent session before the queue timeout. ' +
+          'Check /ratlc/dashboard for Ready/Opening state and upstream resource_exhausted/rate-limit logs.\n',
+      };
+    }
+    if (/already consumed anthropic_tool_use_id/i.test(text)) {
+      return {
+        status: 'stale_tool_result',
+        error: text,
+        text: `[proxy_notice] ${text}. The client replayed a tool_result that the proxy had already consumed. Please send a fresh user message to continue.\n`,
+      };
+    }
+    if (/unknown anthropic_tool_use_id/i.test(text) || /tool_use_ids span multiple channels/i.test(text)) {
+      return {
+        status: 'stale_tool_result',
+        error: text,
+        text: `[proxy_notice] ${text}. The tool_result does not match the active RATLC channel. Please send a fresh user message to continue.\n`,
+      };
+    }
+    if (/channel .* died/i.test(text)) {
+      return {
+        status: 'channel_died',
+        error: text,
+        text: `[proxy_notice] ${text}. The active RATLC channel exited while handling the request. Please retry after the pool opens a ready channel.\n`,
+      };
+    }
+    if (/busy-watchdog timeout/i.test(text)) {
+      return {
+        status: 'channel_timeout',
+        error: text,
+        text: `[proxy_notice] ${text}. The active RATLC channel stopped making progress and was recycled. Please retry after the pool opens a ready channel.\n`,
+      };
+    }
+    if (/unhandled Cursor exec message/i.test(text)) {
+      return {
+        status: 'unhandled_cursor_exec',
+        error: text,
+        text: `[proxy_notice] ${text}. Cursor upstream sent an exec message this proxy version cannot decode. The channel was closed instead of leaving the outer API stream malformed; retry after the pool opens a replacement channel.\n`,
+      };
+    }
+    return null;
   }
 
   function finishMessage() {
     if (done) return;
+    try {
+      const rescued = tryRescueHallucinatedToolCalls();
+      if (rescued > 0) stopReason = 'tool_use';
+    } catch { /* never let textual tool-call rescue crash finalization */ }
     done = true;
     // Disarm watchdog centrally so the bookkeeping is symmetric across all
     // exit paths (step_completed / yield / error / watchdog / disconnect).
     // The watchdog-fired path used to leave a dangling reference because
     // the disarm was at the call sites of the other paths only.
     disarmToolUseFinalizer();
+    disarmNoVisibleEventTimer();
+    if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen) {
+      emitTextDelta('[proxy_notice] Cursor ended this turn without visible text or tool calls. Any upstream thinking was captured for the next request, but there is no assistant-visible content to display.\n');
+    }
+    const trailing = hallucinationFilter.flush();
+    if (trailing) emitTextDelta(trailing);
+    stopThinkingBlock();
     stopTextBlock();
     // Commit any accumulated thinking text into a stored turn under this
     // convKey BEFORE emitting message_stop. Each /v1/messages POST maps
@@ -724,6 +1167,19 @@ async function handleMessagesRequest(req, res) {
     // whether stopReason was end_turn or tool_use). Mirrors server.js's
     // onTurnEnded → thinkingHistory.recordTurnThinking path.
     if (POOL_REINJECT_THINKING) thinkingBuffer.commitTurn(convKey);
+    finishRequestLog(requestId, {
+      status: finalStatusOverride || (stopReason === 'tool_use' ? 'waiting_tool_result' : 'completed'),
+      stopReason,
+      outputTokens,
+      serverWebSearchRequests: serverWebSearchRequestCount,
+      thinkingCompletedCount,
+      thinkingDurationMs,
+      channelId: routedChannel,
+      servedModel: routedTo,
+      fallback: routeFallback,
+      fallbackReason: routeFallbackReason,
+      error: finalErrorMessage,
+    });
     sseWrite(res, 'message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
@@ -754,6 +1210,14 @@ async function handleMessagesRequest(req, res) {
         routedChannel = msg.channelId || null;
         routeFallback = !!msg.fallback;
         routeFallbackReason = msg.fallbackReason || null;
+        patchRequest(requestId, {
+          status: 'routed',
+          routedAt: Date.now(),
+          channelId: routedChannel,
+          servedModel: routedTo,
+          fallback: routeFallback,
+          fallbackReason: routeFallbackReason,
+        });
         const extra = {};
         if (routedTo) extra['x-ratlc-routed-to'] = routedTo;
         if (routedChannel) extra['x-ratlc-channel'] = routedChannel;
@@ -762,14 +1226,23 @@ async function handleMessagesRequest(req, res) {
         writeHeadersOnce(extra);
         if (!toolUseEmitted && !done && blockIdx === -1) {
           startMsg();
+          armNoVisibleEventTimer();
         }
         log(`  route_decision req=${requestId} → ${routedChannel} group=${routedTo}${routeFallback ? ` (FALLBACK ${msg.requestedModel} → ${routedTo} reason=${routeFallbackReason})` : ''}`);
         return;
       }
       if (msg.type === 'text_delta') {
         if (done) return;
+        markVisibleUpstreamEvent();
+        if (!reqLog.firstByteAt) {
+          reqLog.firstByteAt = Date.now();
+          reqLog.firstByteMs = reqLog.firstByteAt - reqLog.startedAt;
+          reqLog.status = 'streaming';
+        }
         completeOpenServerTools('Cursor backend WebSearch result was consumed by the model; result metadata was not exposed on this transport.');
-        emitTextDelta(msg.text);
+        emittedTextForDetection += msg.text || '';
+        const forwardedText = hallucinationFilter.feed(msg.text || '');
+        if (forwardedText) emitTextDelta(forwardedText);
         // Re-arm the tool_use watchdog on any model-originated stream
         // activity. The watchdog measures "model has gone silent" — text
         // and thinking deltas between tool_uses within the same step are
@@ -783,51 +1256,63 @@ async function handleMessagesRequest(req, res) {
         if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'thinking_delta') {
         if (done) return;
+        markVisibleUpstreamEvent();
+        if (!reqLog.firstByteAt) {
+          reqLog.firstByteAt = Date.now();
+          reqLog.firstByteMs = reqLog.firstByteAt - reqLog.startedAt;
+          reqLog.status = 'thinking';
+        }
         // Capture thinking text into the per-convKey buffer for re-injection
         // on the NEXT turn. Do NOT forward to the client SSE — Anthropic's
         // signed thinking blocks need a signature we can't produce, and
         // emitting unsigned blocks poisons claude-code's session against
-        // direct-Anthropic resume (see DEVLOG re `_emitThinkingBlocks=false`).
+        // direct-Anthropic resume. POOL_PROXY_THINKING_BLOCKS explicitly opts
+        // into proxy-local display blocks with non-Anthropic signatures.
+        emittedThinkingForDetection += msg.text || '';
         if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
+        if (POOL_PROXY_THINKING_BLOCKS && clientThinkingEnabled && msg.text) {
+          emitThinkingDelta(msg.text);
+        }
+        if (toolUseEmitted) armToolUseFinalizer();
+      } else if (msg.type === 'thinking_completed') {
+        if (done) return;
+        thinkingCompletedCount++;
+        const dur = Number.isFinite(msg.durationMs) ? msg.durationMs : Number(msg.durationMs);
+        if (Number.isFinite(dur)) thinkingDurationMs = dur;
+        patchRequest(requestId, {
+          thinkingCompletedCount,
+          thinkingDurationMs,
+        });
+        if (POOL_PROXY_THINKING_BLOCKS && thinkingBlockOpen) stopThinkingBlock();
         if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'server_tool_use') {
         if (done) return;
+        markVisibleUpstreamEvent();
+        if (!reqLog.firstByteAt) {
+          reqLog.firstByteAt = Date.now();
+          reqLog.firstByteMs = reqLog.firstByteAt - reqLog.startedAt;
+        }
+        reqLog.status = 'server_tool';
         emitServerToolUseEvent(msg);
+      } else if (msg.type === 'progress') {
+        if (done) return;
+        if (noVisibleEventTimer) {
+          disarmNoVisibleEventTimer();
+          armNoVisibleEventTimer();
+        }
+        patchRequest(requestId, {
+          status: 'upstream_progress',
+          upstreamProgressKind: msg.kind || null,
+          upstreamProgressAt: Date.now(),
+          upstreamProgressAttempt: msg.attempt || null,
+        });
       } else if (msg.type === 'tool_use') {
         if (done) {
-          // Orphaned-tool_use race: the watchdog already fired and finished
-          // this message, but a tool_use IPC arrived from the pool AFTER
-          // done=true. This happens when the model emits parallel
-          // tool_uses on Cursor's side with >1s gaps between them — the
-          // watchdog (default 1 s) finalizes the turn before the later
-          // tool_uses reach us. claude-code already saw message_stop and
-          // can never POST a tool_result for this one, but the channel's
-          // bridge-worker still has the execId in pendingMcpInfo. Without
-          // intervention the channel sits busy until the 240 s
-          // busy-watchdog reap.
-          //
-          // Send a synthetic [proxy_error] tool_result via the pool so
-          // the bridge unblocks. This is SAFE in this specific scenario
-          // (unlike the Write-spoof synthetic-result attempts in
-          // 3c2f017/4984888) because:
-          //   1. The model on Cursor's side EMITTED this tool_use itself
-          //      and is genuinely waiting for any tool_result.
-          //   2. We send the SAME shape it would get from a real
-          //      claude-code failure — error content with a clear message.
-          //   3. We never claimed success / pretended a side-effect ran.
-          // The model is free to retry, give up, or pick a different
-          // approach on its next turn.
-          log(`⚠ orphaned tool_use after watchdog finalize: name=${msg.name} anthropic_id=${msg.anthropic_id} reqId=${requestId} — sending synthetic error result to unblock channel`);
-          poolWrite({
-            type: 'request',
-            requestId: requestId + ':orphan_unblock_' + (msg.anthropic_id || 'unknown').slice(-8),
-            action: 'send_tool_results',
-            model: model || null,
-            results: [{
-              anthropic_tool_use_id: msg.anthropic_id,
-              content: '[proxy_error] tool_use orphaned by api-server watchdog (model emitted multiple tool_uses with >1s gap between them; the watchdog finalized the turn before this one reached the client). Retry as a single call or in tighter sequence.',
-            }],
-          });
+          // The current SSE response is already closed. Do not synthesize a
+          // tool_result here: pool-manager owns the complete pending tool set
+          // and will hold partial client results, then re-emit any missing
+          // tool_use on the next continuation request.
+          log(`⚠ ignoring tool_use after SSE finalize: name=${msg.name} anthropic_id=${msg.anthropic_id} reqId=${requestId} late=${msg.late ? 1 : 0}`);
           return;
         }
         // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
@@ -908,8 +1393,8 @@ async function handleMessagesRequest(req, res) {
               'content as if you had fetched it, you will be fabricating facts.\n\n' +
               'WHAT TO DO INSTEAD:\n' +
               '  - To search or look up public web information: use Cursor-native WebSearch.\n' +
-              '  - For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it.\n' +
-              '  - Do NOT use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch.\n' +
+              '  - For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it.\n' +
+              '  - Do NOT use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.\n' +
               '  - If you cannot fulfill the user request without web access, tell the ' +
               'user that and call `bajie_yield`.\n\n' +
               'DO NOT quote this proxy_notice as if it were search results. DO NOT ' +
@@ -969,7 +1454,7 @@ async function handleMessagesRequest(req, res) {
             // `send_tool_results` action after the parallel-tools fix).
             poolWrite({
               type: 'request',
-              requestId: requestId + ':auto_reject',
+              requestId,
               action: 'send_tool_results',
               model: model || null,
               results: [{
@@ -981,10 +1466,89 @@ async function handleMessagesRequest(req, res) {
             // never happened from claude-code's POV.
             return;
           }
+          if (isPoolLocalToolName(xlated.name)) {
+            log(`→ local tool adapter: name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)} id=${msg.anthropic_id}`);
+            reqLog.status = 'local_tool';
+            reqLog.lastToolName = xlated.name;
+            runPoolLocalTool(xlated.name, xlated.input || {})
+              .then((result) => {
+                if (!result.ok) {
+                  log(`  ↪ local tool adapter error: name=${result.name || xlated.name} id=${msg.anthropic_id} ${String(result.content || '').slice(0, 200)}`);
+                } else {
+                  log(`  ↪ local tool adapter ok: name=${result.name || xlated.name} id=${msg.anthropic_id} bytes=${Buffer.byteLength(String(result.content || ''))}`);
+                }
+                poolWrite({
+                  type: 'request',
+                  requestId,
+                  action: 'send_tool_results',
+                  model: routingModel || null,
+                  requestedModel: model || null,
+                  results: [{
+                    anthropic_tool_use_id: msg.anthropic_id,
+                    content: result.content || '',
+                  }],
+                });
+              })
+              .catch((e) => {
+                const message = e && e.message ? e.message : String(e);
+                log(`  ↪ local tool adapter threw: name=${xlated.name} id=${msg.anthropic_id} ${message}`);
+                poolWrite({
+                  type: 'request',
+                  requestId,
+                  action: 'send_tool_results',
+                  model: routingModel || null,
+                  requestedModel: model || null,
+                  results: [{
+                    anthropic_tool_use_id: msg.anthropic_id,
+                    content: `[proxy_error] ${message}`,
+                  }],
+                });
+              });
+            return;
+          }
+          const clientBridge = resolveClientBridgeToolUse(tools, xlated.name, xlated.input || {});
+          if (clientBridge.handled && !clientBridge.ok) {
+            log(`→ client MCP bridge reject: name=${xlated.name} requested=${clientBridge.clientToolName || '(none)'} id=${msg.anthropic_id} error=${clientBridge.error}`);
+            reqLog.status = 'client_tool_bridge_rejected';
+            reqLog.lastToolName = clientBridge.clientToolName || xlated.name;
+            poolWrite({
+              type: 'request',
+              requestId,
+              action: 'send_tool_results',
+              model: routingModel || null,
+              requestedModel: model || null,
+              results: [{
+                anthropic_tool_use_id: msg.anthropic_id,
+                content: `[proxy_error] ${clientBridge.error}`,
+              }],
+            });
+            return;
+          }
+          if (clientBridge.ok) {
+            const clientToolUseId = makeClientBridgeToolUseId(msg.anthropic_id);
+            rememberClientToolUse({
+              clientToolUseId,
+              poolToolUseId: msg.anthropic_id,
+              requestId,
+              toolName: clientBridge.clientToolName,
+              input: clientBridge.clientInput || {},
+            });
+            log(`→ client MCP bridge tool_use: name=${clientBridge.clientToolName} via=${xlated.name} poolId=${msg.anthropic_id} clientId=${clientToolUseId} args=${JSON.stringify(clientBridge.clientInput || {}).slice(0, 200)}`);
+            reqLog.status = 'client_tool_bridge';
+            reqLog.lastToolName = clientBridge.clientToolName;
+            emitToolUseBlock(clientToolUseId, clientBridge.clientToolName, clientBridge.clientInput || {});
+            stopReason = 'tool_use';
+            armToolUseFinalizer();
+            return;
+          }
           log(`→ tool_use to client (translated): name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)}`);
+          reqLog.status = 'tool_use';
+          reqLog.lastToolName = xlated.name;
           emitToolUseBlock(msg.anthropic_id, xlated.name, xlated.input);
         } else {
           log(`→ tool_use to client: name=${msg.name} args=${JSON.stringify(msg.args).slice(0, 200)}`);
+          reqLog.status = 'tool_use';
+          reqLog.lastToolName = msg.name;
           emitToolUseBlock(msg.anthropic_id, msg.name, msg.args);
         }
         // Mark that we should end with stop_reason='tool_use' when the
@@ -995,6 +1559,7 @@ async function handleMessagesRequest(req, res) {
         stopReason = 'tool_use';
         armToolUseFinalizer();
       } else if (msg.type === 'step_completed') {
+        markVisibleUpstreamEvent();
         // The pool's bridge-worker observed `interactionUpdate.stepCompleted`
         // from cursor-agent. If any tool_uses have been emitted on this
         // turn, the model is now paused waiting for the tool_result(s).
@@ -1006,6 +1571,7 @@ async function handleMessagesRequest(req, res) {
           finishMessage();  // disarms the watchdog centrally
         }
       } else if (msg.type === 'yield') {
+        markVisibleUpstreamEvent();
         completeOpenServerTools('Cursor backend WebSearch completed before the model yielded; result metadata was not exposed on this transport.');
         // The model called bajie_yield. If any tool_uses were emitted this
         // turn (rare — usually finalize happens earlier via step_completed
@@ -1014,11 +1580,15 @@ async function handleMessagesRequest(req, res) {
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
+        markVisibleUpstreamEvent();
         completeOpenServerTools('The response ended with an error before Cursor exposed WebSearch result metadata.');
-        if (shouldSoftenPoolError(msg.message)) {
+        const softened = classifySoftenedPoolError(msg.message, msg.code);
+        if (softened) {
           log(`  → soften pool error as text requestId=${requestId}: ${String(msg.message || '').slice(0, 180)}`);
+          finalStatusOverride = softened.status;
+          finalErrorMessage = softened.error || msg.message || null;
           startMsg();
-          emitTextDelta(`[proxy_notice] ${msg.message}. This usually means the client retried or replayed a stale tool_result after the proxy had already consumed it. Please send a fresh user message to continue.\n`);
+          emitTextDelta(softened.text);
           stopReason = 'end_turn';
           finishMessage();
           return;
@@ -1031,9 +1601,16 @@ async function handleMessagesRequest(req, res) {
         // (HTTP 200)" error on top of the original error message. So we
         // emit the error event, close the stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
+        finishRequestLog(requestId, {
+          status: 'error',
+          error: msg.message,
+          stopReason: 'error',
+          outputTokens,
+        });
         sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
         done = true;
         disarmToolUseFinalizer();
+        stopThinkingBlock();
         if (POOL_REINJECT_THINKING) thinkingBuffer.commitTurn(convKey);
         try { res.end(); } catch { /* ignore */ }
         reqHandlers.delete(requestId);
@@ -1043,6 +1620,118 @@ async function handleMessagesRequest(req, res) {
 
   // Send to pool
   if (toolResults.length > 0) {
+    if (replayedClientBridgeToolResults.length > 0 && clientBridgeToolResults.length === 0 && regularToolResults.length === 0) {
+      log(`  → ignore replayed client-tool bridge results requestId=${requestId} count=${replayedClientBridgeToolResults.length} ids=[${replayedClientBridgeToolResults.map(r => r.result.tool_use_id).join(', ')}]`);
+      patchRequest(requestId, {
+        status: 'ignored_replayed_client_tool_bridge_result',
+        forwardedAt: Date.now(),
+        toolResultCount: replayedClientBridgeToolResults.length,
+        toolResultIds: replayedClientBridgeToolResults.map(r => r.result.tool_use_id),
+      });
+      startMsg();
+      emitTextDelta('[proxy_notice] Duplicate client MCP tool_result replay ignored; the result was already forwarded to the Cursor pool. Continue with a fresh user message if needed.\n');
+      stopReason = 'end_turn';
+      finishMessage();
+      return;
+    }
+
+    if (replayedClientBridgeToolResults.length > 0) {
+      log(`  → reject mixed replayed client-bridge/other tool_result batch requestId=${requestId} replayed=${replayedClientBridgeToolResults.length} bridged=${clientBridgeToolResults.length} regular=${regularToolResults.length}`);
+      finalStatusOverride = 'error';
+      finalErrorMessage = 'mixed replayed client-bridge and other tool_result batch';
+      startMsg();
+      emitTextDelta('[proxy_error] Replayed client MCP tool results were mixed with new tool results. Retry with a fresh user message so the proxy can rebuild from the current conversation history.\n');
+      stopReason = 'end_turn';
+      finishMessage();
+      return;
+    }
+
+    if (clientBridgeToolResults.length > 0 && regularToolResults.length === 0) {
+      const bridged = clientBridgeToolResults.map(({ result, entry }) => ({
+        anthropic_tool_use_id: entry.poolToolUseId,
+        content: buildPoolToolResultContentFromClientResult(result),
+      }));
+      log(`  → pool client-tool bridge results requestId=${requestId} count=${bridged.length} ids=[${bridged.map(r => r.anthropic_tool_use_id).join(', ')}]`);
+      patchRequest(requestId, {
+        status: 'forwarded_client_tool_bridge_result',
+        forwardedAt: Date.now(),
+        toolResultCount: bridged.length,
+        toolResultIds: bridged.map(r => r.anthropic_tool_use_id),
+      });
+      poolWrite({
+        type: 'request', requestId, action: 'send_tool_results',
+        model: routingModel || null,
+        requestedModel: model || null,
+        results: bridged,
+      });
+      return;
+    }
+
+    if (clientBridgeToolResults.length > 0 && regularToolResults.length > 0) {
+      log(`  → reject mixed client-bridge/regular tool_result batch requestId=${requestId} bridged=${clientBridgeToolResults.length} regular=${regularToolResults.length}`);
+      finalStatusOverride = 'error';
+      finalErrorMessage = 'mixed client-bridge and regular tool_result batch';
+      startMsg();
+      emitTextDelta('[proxy_error] Mixed client-bridge and regular tool results arrived in one batch. Send these tool results in separate turns.\n');
+      stopReason = 'end_turn';
+      finishMessage();
+      return;
+    }
+
+    const syntheticToolResults = regularToolResults.filter((r) => isSyntheticToolUseId(r.tool_use_id));
+    if (syntheticToolResults.length > 0 && syntheticToolResults.length !== regularToolResults.length) {
+      log(`  → reject mixed synthetic/real tool_result batch requestId=${requestId} synthetic=${syntheticToolResults.length} total=${regularToolResults.length}`);
+      finalStatusOverride = 'error';
+      finalErrorMessage = 'mixed synthetic and real tool_result batch';
+      startMsg();
+      emitTextDelta('[proxy_error] Mixed synthetic and real tool results arrived in one batch. Retry the last request so the proxy can rebuild the turn from full message history.');
+      stopReason = 'end_turn';
+      finishMessage();
+      return;
+    }
+
+    if (syntheticToolResults.length === regularToolResults.length) {
+      // These tool_use blocks were synthesized from textual `[Tool call ...]`
+      // markers, so Cursor is not paused on a real pending execId. Claude Code
+      // will still execute the client-side tool and POST a tool_result. Feeding
+      // that ID through pool-manager would fail `unknown anthropic_tool_use_id`;
+      // instead rebuild a fresh request from the full messages[] history so the
+      // inner model sees the synthetic tool_use + real tool_result as context.
+      const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+      const content = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns });
+      const imageCount = cursorMcpContentImageCount(content);
+      const poolAction = 'send_user_message';
+      const text = cursorMcpContentToText(content);
+      const contentBytes = cursorMcpContentPayloadBytes(content);
+      const sessionKey = makeSessionKey({ clientSessionId, convKey, routingModel });
+      log(`  → pool synthetic tool_result rebuild ${poolAction} requestId=${requestId} count=${regularToolResults.length} model=${model || '(default)'} routeModel=${routingModel || '(default)'} sessionKey=${sessionKey || '(none)'} textBytes=${text.length} contentBytes=${contentBytes} images=${imageCount} msgCount=${messages.length} reinjectTurns=${thinkingTurns.length}`);
+      patchRequest(requestId, {
+        status: 'forwarded_synthetic_tool_result_rebuild',
+        forwardedAt: Date.now(),
+        contextMode: 'synthetic-rebuild',
+        effectiveContextMode: 'full',
+        sessionKey: sessionKey || null,
+        textBytes: text.length,
+        contentBytes,
+        imageCount,
+        reinjectTurns: thinkingTurns.length,
+        toolResultIds: regularToolResults.map((r) => r.tool_use_id),
+      });
+      poolWrite({
+        type: 'request', requestId, action: poolAction,
+        model: routingModel || null,
+        requestedModel: model || null,
+        text,
+        content,
+        system: extractSystemPrompt(system),
+        tools: tools || [],
+        sessionKey: sessionKey || null,
+        contextMode: 'full',
+        hybridReason: 'synthetic-tool-result-rebuild',
+      });
+      return;
+    }
+
     // Batch send: pool-manager + bridge-worker both understand
     // `send_tool_results` (plural) with an array of entries. All N entries
     // must resolve to the same channel — the manager defensively checks
@@ -1056,7 +1745,7 @@ async function handleMessagesRequest(req, res) {
     // claude-code wrote a real file with proxy_notice but the model
     // doesn't necessarily read the file back — putting results inline
     // in the tool_result is the reliable channel.
-    const enriched = await Promise.all(toolResults.map(async (r) => {
+    const enriched = await Promise.all(regularToolResults.map(async (r) => {
       const injected = await consumeSpoofResult(r.tool_use_id);
       if (injected) {
         log(`  ↪ spoof-result injection: tool_use_id=${r.tool_use_id} replacing ${r.text ? r.text.length + 'B ack' : 'empty ack'} with ${injected.length}B search payload`);
@@ -1065,9 +1754,24 @@ async function handleMessagesRequest(req, res) {
       // Either no playbook entry (normal tool_result) or search failed/
       // timed out — forward whatever claude-code's Write actually
       // returned (the proxy_notice ack).
-      return { anthropic_tool_use_id: r.tool_use_id, content: r.text };
+      if (r.isError) {
+        return {
+          anthropic_tool_use_id: r.tool_use_id,
+          content: { error: r.text || 'Tool failed' },
+        };
+      }
+      return {
+        anthropic_tool_use_id: r.tool_use_id,
+        content: normalizeAnthropicContentForCursorMcp(r.content === undefined ? r.text : r.content),
+      };
     }));
     log(`  → pool send_tool_results requestId=${requestId} count=${enriched.length} model=${model || '(default)'} routeModel=${routingModel || '(default)'} ids=[${enriched.map(r => r.anthropic_tool_use_id).join(', ')}]`);
+    patchRequest(requestId, {
+      status: 'forwarded_tool_result',
+      forwardedAt: Date.now(),
+      toolResultCount: enriched.length,
+      toolResultIds: enriched.map(r => r.anthropic_tool_use_id),
+    });
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
       model: routingModel || null,
@@ -1086,32 +1790,96 @@ async function handleMessagesRequest(req, res) {
     // to the user-message text as a leading sequence of `<thinking>`
     // blocks, since there's no history to attach to.
     const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+    const hybrid = POOL_CONTEXT_MODE === 'hybrid'
+      ? decideHybridContext({ clientSessionId, convKey, routingModel, system, tools, messages })
+      : null;
+    let effectiveContextMode = hybrid ? hybrid.sendMode : POOL_CONTEXT_MODE;
+    let contextGuardReason = null;
     let text;
-    if (POOL_CONTEXT_MODE === 'full') {
-      text = renderFullContext({ messages, system, tools, thinkingTurns });
+    let content;
+    // Bidi-stream payload guard. Cursor's live agent stream has an empirical
+    // payload-size limit around ~96 KB; PR #2 added CONTEXT_MAX_BYTES to back
+    // off in that case. We gate the guard on `hybrid` mode only: hybrid has
+    // session affinity, so the sticky channel already holds prior turns in
+    // its native memory and falling back to `last` is a legitimate
+    // continuation. In pure `full` mode the caller explicitly opted into
+    // complete history; honoring that contract is more important than
+    // sidestepping Cursor's payload limit (silent context loss is worse than
+    // a visible upstream error). See BIDI_PAYLOAD_LIMIT.md for the full
+    // rationale and the planned follow-up workstream.
+    const guardActive = (POOL_CONTEXT_MODE === 'hybrid') && CONTEXT_MAX_BYTES > 0;
+    const lastUserContent = buildLastUserCursorMcpContent(lastMsg.content, thinkingTurns);
+    if (cursorMcpContentImageCount(lastUserContent) > 0) {
+      content = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns });
+      text = cursorMcpContentToText(content);
+      const imageFullContentBytes = cursorMcpContentPayloadBytes(content);
+      if (guardActive && imageFullContentBytes > CONTEXT_MAX_BYTES) {
+        contextGuardReason = `image-full-context-too-large:${imageFullContentBytes}>${CONTEXT_MAX_BYTES}`;
+        content = lastUserContent;
+        text = cursorMcpContentToText(content);
+        effectiveContextMode = 'last';
+      } else {
+        effectiveContextMode = 'full';
+      }
+    } else if (effectiveContextMode === 'full') {
+      content = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns });
+      text = cursorMcpContentToText(content);
+      if (guardActive && text.length > CONTEXT_MAX_BYTES) {
+        contextGuardReason = `full-context-too-large:${text.length}>${CONTEXT_MAX_BYTES}`;
+        content = lastUserContent;
+        text = cursorMcpContentToText(content);
+        effectiveContextMode = 'last';
+      }
     } else {
-      const userText = extractTextFromContent(lastMsg.content);
-      const preamble = renderThinkingPreamble(thinkingTurns);
-      text = preamble + userText;
+      content = lastUserContent;
+      text = cursorMcpContentToText(content);
     }
-    log(`  → pool send_user_message requestId=${requestId} model=${model || '(default)'} routeModel=${routingModel || '(default)'} mode=${POOL_CONTEXT_MODE} textBytes=${text.length} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
+    const sessionKey = hybrid?.sessionKey || makeSessionKey({ clientSessionId, convKey, routingModel });
+    const imageCount = cursorMcpContentImageCount(content);
+    const poolAction = 'send_user_message';
+    const contentBytes = cursorMcpContentPayloadBytes(content);
+    log(`  → pool ${poolAction} requestId=${requestId} model=${model || '(default)'} routeModel=${routingModel || '(default)'} mode=${POOL_CONTEXT_MODE}${hybrid ? '/' + hybrid.sendMode + ' reason=' + hybrid.reason : ''}${contextGuardReason ? ' guard=' + contextGuardReason : ''} sessionKey=${sessionKey || '(none)'} textBytes=${text.length} contentBytes=${contentBytes} images=${imageCount} msgCount=${messages.length} tools=${(tools || []).length} reinjectTurns=${thinkingTurns.length}`);
+    patchRequest(requestId, {
+      status: 'forwarded',
+      forwardedAt: Date.now(),
+      contextMode: POOL_CONTEXT_MODE,
+      effectiveContextMode,
+      hybridReason: hybrid?.reason || null,
+      contextGuardReason,
+      sessionKey: sessionKey || null,
+      textBytes: text.length,
+      contentBytes,
+      imageCount,
+      reinjectTurns: thinkingTurns.length,
+    });
     poolWrite({
-      type: 'request', requestId, action: 'send_user_message',
+      type: 'request', requestId, action: poolAction,
       model: routingModel || null,
       requestedModel: model || null,
       text,
+      content,
       system: extractSystemPrompt(system),
       tools: tools || [],
+      sessionKey: sessionKey || null,
+      contextMode: effectiveContextMode,
+      hybridReason: contextGuardReason || hybrid?.reason || null,
     });
   }
 
-  // Handle client disconnect
-  req.on('close', () => {
-    if (!done) {
-      log(`client disconnected mid-stream for ${requestId}`);
-      finishMessage();  // disarms the watchdog centrally
-    }
-  });
+	  function cancelForClientDisconnect() {
+	    if (done) return;
+	    log(`client disconnected mid-stream for ${requestId}`);
+	    patchRequest(requestId, { clientDisconnectedAt: Date.now() });
+	    poolWrite({ type: 'cancel_request', requestId, reason: 'client_disconnected' });
+	    finishMessage();  // disarms the watchdog centrally
+	  }
+
+	  // req.close can fire after the request body is fully read, before the SSE
+	  // response has actually finished. res.close is the reliable signal for a
+	  // streaming client disconnect.
+	  res.on('close', () => {
+	    if (!res.writableEnded) cancelForClientDisconnect();
+	  });
 }
 
 function handleModels(req, res) {
@@ -1159,6 +1927,9 @@ function handleMetrics(req, res) {
       lines.push('# HELP ratlc_pool_tool_use_held Tool_use round-trips currently held awaiting tool_result.');
       lines.push('# TYPE ratlc_pool_tool_use_held gauge');
       lines.push(`ratlc_pool_tool_use_held ${p.toolUseIndex || 0}`);
+      lines.push('# HELP ratlc_pool_tool_use_consumed Cached consumed tool_use ids kept for replay detection.');
+      lines.push('# TYPE ratlc_pool_tool_use_consumed gauge');
+      lines.push(`ratlc_pool_tool_use_consumed ${p.consumedToolUseIndex || 0}`);
       lines.push('# HELP ratlc_channel_rounds Successful rounds served per channel.');
       lines.push('# TYPE ratlc_channel_rounds counter');
       for (const ch of (p.channels || [])) {
@@ -1247,9 +2018,12 @@ function handleRenderDebug(req, res) {
       );
     }
     const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
-    const mode = (modeOverride === 'last' || modeOverride === 'full') ? modeOverride : POOL_CONTEXT_MODE;
+    const mode = (modeOverride === 'last' || modeOverride === 'full' || modeOverride === 'hybrid') ? modeOverride : POOL_CONTEXT_MODE;
+    const effectiveMode = mode === 'hybrid'
+      ? decideHybridContext({ clientSessionId: 'debug', convKey, routingModel: normalizeModelForRouting(model), system, tools, messages: messages || [] }).sendMode
+      : mode;
     let rendered;
-    if (mode === 'full') {
+    if (effectiveMode === 'full') {
       rendered = renderFullContext({ messages: messages || [], system, tools, thinkingTurns });
     } else {
       const lastMsg = (messages || []).slice(-1)[0];
@@ -1260,6 +2034,7 @@ function handleRenderDebug(req, res) {
     res.end(JSON.stringify({
       enabled: POOL_REINJECT_THINKING,
       mode,
+      effectiveMode,
       convKey,
       thinkingTurnCount: thinkingTurns.length,
       rendered,
@@ -1365,6 +2140,24 @@ function handleHealth(req, res) {
   });
 }
 
+function handleRequests(req, res) {
+  const url = new URL(req.url, 'http://localhost');
+  const limitRaw = parseInt(url.searchParams.get('limit') || '100', 10);
+  const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 100, 1), REQUEST_LOG_MAX);
+  const now = Date.now();
+  const items = requestLog.slice(0, limit).map((r) => ({
+    ...r,
+    ageMs: now - r.startedAt,
+  }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    max: REQUEST_LOG_MAX,
+    count: requestLog.length,
+    items,
+  }));
+}
+
 // ── Server ──────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const path = (req.url || '').split('?')[0];
@@ -1373,6 +2166,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && path === '/v1/messages/count_tokens') return handleCountTokens(req, res);
   if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return handleModels(req, res);
   if (req.method === 'GET' && path === '/health') return handleHealth(req, res);
+  if (req.method === 'GET' && path === '/requests') return handleRequests(req, res);
   if (req.method === 'GET' && path === '/metrics') return handleMetrics(req, res);
   if (req.method === 'GET' && path === '/v1/_debug/thinking_buffer') return handleThinkingBufferDebug(req, res);
   if (req.method === 'POST' && path === '/v1/_debug/render') return handleRenderDebug(req, res);

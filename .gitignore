@@ -3,6 +3,7 @@ package-lock.json
 
 # 真实 token 文件 (不要提交!)
 token.json
+token.json.bak-*
 
 # 环境变量
 .env
@@ -12,3 +13,6 @@ token.json
 Thumbs.db
 *.log
 logs/
+agent-tools/
+claude-code-sourcemap-main.zip
+scaffolding/chat-probe-results.json

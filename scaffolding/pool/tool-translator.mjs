@@ -45,6 +45,22 @@ const ANTHROPIC_TO_CURSOR_NAME = Object.fromEntries(
   Object.entries(CURSOR_TO_ANTHROPIC_NAME).map(([c, a]) => [a, c])
 );
 
+const MCP_WIRE_ALIAS_TOOL_NAMES = new Set([
+  'AskQuestion', 'Delete', 'Edit', 'EditNotebook', 'FetchMcpResource',
+  'GenerateImage', 'Glob', 'Grep', 'ListMcpResources', 'Read',
+  'ReadLints', 'Shell', 'StrReplace', 'SwitchMode', 'Task',
+  'TodoWrite', 'WebFetch', 'WebSearch', 'Write',
+]);
+
+function normalizeCursorToolName(cursorName) {
+  const name = String(cursorName || '');
+  if (name.startsWith('mcp_') && !name.startsWith('mcp__')) {
+    const unprefixed = name.slice(4);
+    if (MCP_WIRE_ALIAS_TOOL_NAMES.has(unprefixed)) return unprefixed;
+  }
+  return name;
+}
+
 // Tools Cursor provides natively but with no equivalent on the
 // claude-code side. When the model calls these, the proxy returns a
 // structured tool_error result rather than forwarding to the client.
@@ -135,6 +151,7 @@ const ARG_CURSOR_TO_ANTHROPIC = {
 //   { ok: true, name, input }                   — forward to client
 //   { ok: false, error, name }                  — return tool_error to inner agent
 export function cursorToAnthropic(cursorName, cursorArgs) {
+  cursorName = normalizeCursorToolName(cursorName);
   if (CURSOR_ONLY_TOOLS.has(cursorName)) {
     return {
       ok: false,
@@ -175,6 +192,8 @@ export function anthropicResultToCursor(anthropicName, content) {
 //
 // search_codebase is kept as the placeholder that proves "tools.length>0"
 // to Cursor's default-toolset injector.
+export const CLIENT_MCP_DISPATCH_TOOL_NAME = 'client_mcp_call';
+
 export function defaultTranslateModeTools() {
   return [
     {
@@ -186,6 +205,28 @@ export function defaultTranslateModeTools() {
         type: 'object',
         properties: { query: { type: 'string', description: 'search query' } },
         required: ['query'],
+      },
+    },
+    {
+      name: CLIENT_MCP_DISPATCH_TOOL_NAME,
+      description:
+        'Call a client-declared MCP tool listed in the current request context. ' +
+        'Use this for tools named like mcp__server__tool, including browser-devtools. ' +
+        'Arguments: tool_name is the exact mcp__server__tool name; input is the JSON object to pass.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          tool_name: {
+            type: 'string',
+            description: 'Exact client MCP tool name, for example mcp__browser-devtools__click.',
+          },
+          input: {
+            type: 'object',
+            description: 'JSON arguments for the selected client MCP tool.',
+            additionalProperties: true,
+          },
+        },
+        required: ['tool_name', 'input'],
       },
     },
     // Anthropic `Edit` — alias for Cursor's `StrReplace` but with the exact
@@ -269,8 +310,9 @@ export function defaultTranslateModeTools() {
 
 // Names the model should never directly invoke (proxy-internal).
 // `search_codebase` is internal scaffolding; `bajie_yield` is the relay
-// signal. Edit/Glob/NotebookEdit/TodoWrite are registered as MCP tools
-// (above) and DO bubble up to the client when called — they aren't internal.
+// signal. Edit/Glob/NotebookEdit/TodoWrite/client_mcp_call are registered
+// as MCP tools (above) and DO bubble up to the API layer when called — they
+// aren't internal.
 export function isInternalTool(name) {
   return name === 'bajie_yield' || name === 'search_codebase';
 }

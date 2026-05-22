@@ -124,6 +124,7 @@ the children + api-server).
 | `POOL_GROUPS` | `modelA:N,modelB:M,...` | unset | Extra **named groups** at boot. Each `model:N` declares a group of N channels pinned to that Cursor model. Channels are partitioned across groups; per-request `body.model` picks which group serves. Groups can also be added/removed at runtime via `ratlc add-group`/`remove-group`. **Equivalent** to putting the same entries in CSV-form `POOL_MODEL` — the two are merged identically. |
 | `POOL_GROUP_WAIT_MS` | milliseconds | `5000` | When a request names a known group whose channels are all opening/busy, wait this long for one to surface before falling back to the default group. Set to `0` for immediate fallback. |
 | `POOL_REINJECT_THINKING` | `0` \| `1` | `0` | Captures the model's `thinking_delta` per `convKey`; on the next turn for the same conversation, prepends `<thinking>…</thinking>` text into the outbound prompt. Pool-side symmetry with `server.js`'s `CURSOR_REINJECT_THINKING`. See [§ Thinking continuity](#thinking-continuity) below. |
+| `POOL_PROXY_THINKING_BLOCKS` | `0` \| `1` | `0` | Streams Cursor's real current-turn `thinking_delta` to Claude Code as proxy-local `thinking` blocks with `proxy-local-thinking-v1.*` signatures. UI-only; not Anthropic-signed and not prompt reinjection. |
 | `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` | int | `4096` | Cap on captured bytes per assistant turn (truncates further deltas in the same turn). Matches server.js's default. |
 | `POOL_REINJECT_THINKING_MAX_TURNS` | int | `5` | Number of past assistant turns kept per `convKey`; FIFO-evicts older. |
 | `POOL_REINJECT_THINKING_DEBUG` | `1` | unset | Exposes `/v1/_debug/thinking_buffer` and `/v1/_debug/render` for buffer inspection. Off in normal operation. |
@@ -414,6 +415,12 @@ only way to give the model a useful reasoning carry-over within the
 existing wire constraints (Cursor's transport strips signed extended-
 thinking blocks regardless of source — see `DEVLOG.md` "Proxy-side
 thinking re-injection" for that constraint).
+
+`POOL_PROXY_THINKING_BLOCKS=1` is separate. It does not feed thinking back to
+Cursor; it only wraps the current turn's real upstream `thinking_delta` in
+Claude-compatible `thinking` SSE blocks so the client can display the thinking
+UI. The generated signatures are explicitly proxy-local and are stripped from
+full-context prompt rendering.
 
 ### How conversations are identified
 

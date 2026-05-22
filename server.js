@@ -6,11 +6,13 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const { Writable } = require('stream');
 const { URL } = require('url');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4 } = require('./src/uuid');
 const converter = require('./src/converter');
 const anthropicConverter = require('./src/anthropic-converter');
 const config = require('./src/config');
@@ -29,23 +31,17 @@ const stallThresholds = require('./src/stall-thresholds');
 const runtimeStats = require('./src/runtime-stats');
 const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
 const { getCursorToolMatrix } = require('./src/cursor-tool-matrix');
+const { ProxyThinkingBlockAdapter } = require('./src/proxy-thinking-adapter');
 
-// Thinking-block emission. Off by default: sessions created via this proxy
-// must remain portable to direct-Anthropic clients (real Claude API). Real
-// Anthropic rejects assistant messages whose thinking blocks lack a valid
-// server-issued cryptographic signature — and we can't forge that signature
-// because we don't have Anthropic's signing key, and Cursor's upstream
-// provider doesn't pass the original signatures back to us.
-//
-// Trade-off when off: claude-code's `✻ Cogitated for Xs (ctrl+o to expand)`
-// collapsed display disappears. The model's actual response is unaffected,
-// only the visible-reasoning UI. The hallucination rescue still scans the
-// internal thinking buffer for `[Tool call: ...]` patterns, so structural
-// protection isn't lost.
-//
-// Opt back in with CURSOR_EMIT_THINKING_BLOCKS=1 if you don't intend to
-// resume the session against direct Anthropic.
-const _emitThinkingBlocks = process.env.CURSOR_EMIT_THINKING_BLOCKS === '1';
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Proxy-local thinking-block emission. Off by default: Cursor AgentService
+// exposes only plaintext thinkingDelta frames, not Anthropic signed thinking
+// blocks. When enabled, we wrap those real Cursor deltas in Anthropic-shaped
+// thinking blocks with a clearly proxy-local signature so Claude Code can show
+// the thinking UI. These blocks are for this proxy only; they are not portable
+// to direct Anthropic sessions.
+const PROXY_THINKING_BLOCKS = process.env.CURSOR_PROXY_THINKING_BLOCKS === '1';
 debugLog.init();
 
 function looksLikeAgentToolPlaceholderWrite(toolName, args) {
@@ -93,7 +89,7 @@ function getCursorClient() {
 
 // ── Bridge / conversation caches (Anthropic tool-use flow) ──
 //
-// activeBridges:    bridgeKey  -> { bridge, lastAccessMs, mcpTools, pendingExecs, convKey, conversationId, sessionId, requestedModel, cursorModel }
+// activeBridges:    bridgeKey  -> { bridge, lastAccessMs, mcpTools, pendingExecs, convKey, conversationId, sessionId, requestedModel, cursorModel, clientThinkingEnabled }
 //                   pendingExecs: [{ execMsgId, execId, toolCallId, toolName, args, anthropicToolUseId, blockIndex }]
 // bridgesBySessionId: sessionId -> same entry as above (alternate index — same
 //                   object, two pointers). Used to find the bridge across TCP
@@ -329,13 +325,29 @@ function watchTokenFile() {
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use((req, res, next) => {
+  const incoming = req.headers['x-request-id'];
+  const requestId = typeof incoming === 'string' && incoming.trim()
+    ? incoming.trim()
+    : `req_${uuidv4().replace(/-/g, '').slice(0, 24)}`;
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
+app.use('/assets', express.static(path.join(PUBLIC_DIR, 'assets'), {
+  immutable: true,
+  maxAge: '1h',
+}));
 
 // ── API Key 简单校验 ──
 function checkApiKey(req, res, next) {
   if (!API_KEY) return next();
   const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: { message: 'Missing Authorization header', type: 'auth_error' } });
-  const key = auth.replace(/^Bearer\s+/i, '');
+  const xApiKey = req.headers['x-api-key'];
+  const key = typeof xApiKey === 'string' && xApiKey
+    ? xApiKey
+    : (auth ? auth.replace(/^Bearer\s+/i, '') : '');
+  if (!key) return res.status(401).json({ error: { message: 'Missing API key', type: 'auth_error' } });
   if (key !== API_KEY) return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
   next();
 }
@@ -368,6 +380,46 @@ function buildRatlcUnavailableResponse(message) {
   return anthropicConverter.buildAnthropicErrorResponse(message, 'api_error');
 }
 
+function safeJoinPublic(relPath) {
+  const p = path.resolve(PUBLIC_DIR, relPath);
+  return p.startsWith(PUBLIC_DIR + path.sep) || p === PUBLIC_DIR ? p : null;
+}
+
+function sendDashboard(req, res) {
+  const p = safeJoinPublic('ratlc-dashboard.html');
+  if (!p || !fs.existsSync(p)) return res.status(404).send('dashboard not found');
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(fs.readFileSync(p, 'utf8'));
+}
+
+async function proxyRatlcGet(req, res, targetPath, timeoutMs = 2500) {
+  if (!RATLC_POOL_URL) return res.status(503).json({ ok: false, error: 'RATLC pool URL is not configured' });
+  let target;
+  try { target = new URL(targetPath, RATLC_POOL_URL + '/'); }
+  catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  const transport = target.protocol === 'https:' ? https : http;
+  const upstream = transport.request({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    method: 'GET',
+    path: target.pathname + target.search,
+    timeout: timeoutMs,
+  }, (r) => {
+    let text = '';
+    r.setEncoding('utf8');
+    r.on('data', c => { text += c; });
+    r.on('end', () => {
+      res.status(r.statusCode || 502);
+      res.setHeader('Content-Type', r.headers['content-type'] || 'application/json');
+      res.send(text);
+    });
+  });
+  upstream.on('timeout', () => upstream.destroy(new Error('RATLC pool request timeout')));
+  upstream.on('error', (e) => res.status(503).json({ ok: false, error: e.message }));
+  upstream.end();
+}
+
 function proxyToRatlc(req, res, targetPath, body, opts = {}) {
   return new Promise((resolve) => {
     if (!RATLC_POOL_URL) {
@@ -398,6 +450,9 @@ function proxyToRatlc(req, res, targetPath, body, opts = {}) {
     headers['content-type'] = headers['content-type'] || 'application/json';
     headers['content-length'] = String(payload.length);
     headers['x-cursoride-ratlc-proxy'] = '1';
+    const remoteIp = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
+    if (remoteIp) headers['x-forwarded-for'] = String(remoteIp);
+    if (req.socket?.remoteAddress) headers['x-real-ip'] = req.socket.remoteAddress;
 
     const transport = target.protocol === 'https:' ? https : http;
     const upstreamReq = transport.request({
@@ -470,7 +525,10 @@ async function getRatlcHealth(timeoutMs = 1500) {
             dead: pool.deadCount || 0,
             actualSize: pool.actualSize || 0,
             configuredSize: pool.configuredSize || 0,
+            pendingRequests: pool.pendingRequests || 0,
             groups: Array.isArray(pool.groups) ? pool.groups : [],
+            channels: Array.isArray(pool.channels) ? pool.channels : [],
+            config: body.config || null,
           });
         } catch (e) {
           resolve({ reachable: false, statusCode: r.statusCode, error: `bad_json: ${e.message}` });
@@ -561,171 +619,13 @@ app.get(['/v1/tools', '/tools'], checkApiKey, (req, res) => {
   }));
 });
 
-// ── POST /v1/chat/completions ──
-app.post('/v1/chat/completions', checkApiKey, async (req, res) => {
-  const body = req.body || {};
-  const { messages, model, stream } = body;
-
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json(converter.buildErrorResponse('messages is required', 'invalid_request_error', 400));
-  }
-
-  const requestedModel = model || DEFAULT_MODEL;
-  const cursorModel = mapOpenAICompatibleModel(requestedModel);
-  const hasTools = isOpenAIToolRequest(body);
-  if (hasTools) {
-    if (!isToolCapableModel(cursorModel)) {
-      return res.status(400).json(converter.buildErrorResponse(
-        `Model ${requestedModel} is not routed to the tool-capable bridge; use composer-2.5-fast, composer-2.5, or a Claude model for tool calls.`,
-        'invalid_request_error',
-        400
-      ));
-    }
-    if (stream === true) {
-      return res.status(400).json(converter.buildErrorResponse(
-        'Streaming OpenAI tool_calls on /v1/chat/completions is not implemented; use stream=false or /v1/messages for the tool main path.',
-        'invalid_request_error',
-        400
-      ));
-    }
-    const anthropicBody = {
-      model: cursorModel,
-      max_tokens: body.max_tokens || body.max_completion_tokens || 1024,
-      stream: false,
-      system: chatSystemToAnthropic(messages),
-      messages: chatMessagesToAnthropic(messages),
-      tools: openAIToolsToAnthropicTools(body.tools),
-    };
-    console.log(`  🧭 route=bridge-tools /v1/chat/completions | ${requestedModel} → ${cursorModel} | tools=${anthropicBody.tools.length}`);
-    try {
-      const upstream = await invokeAnthropicMessages(req, anthropicBody, handleAnthropicMessagesRequest);
-      if (upstream.statusCode >= 400) return res.status(upstream.statusCode).json(upstream.body || JSON.parse(upstream.bodyText));
-      return res.json(anthropicToChatCompletion(upstream.body, requestedModel));
-    } catch (e) {
-      console.error(`  ❌ chat tool bridge error: ${e.message}`);
-      return res.status(500).json(converter.buildErrorResponse(e.message));
-    }
-  }
-
-  const isStream = stream === true;
-
-  if (CURSOR_UPSTREAM_H1_ONLY) {
-    if (isStream) {
-      return res.status(400).json(converter.buildErrorResponse(
-        'Streaming native /v1/chat/completions is not implemented in H1-only upstream mode; use stream=false or /v1/messages.',
-        'invalid_request_error',
-        400
-      ));
-    }
-    const anthropicBody = {
-      model: cursorModel,
-      max_tokens: body.max_tokens || body.max_completion_tokens || 1024,
-      stream: false,
-      system: chatSystemToAnthropic(messages),
-      messages: chatMessagesToAnthropic(messages),
-      tools: [],
-    };
-    console.log(`  🧭 route=h1-bridge-chat /v1/chat/completions | ${requestedModel} → ${cursorModel}`);
-    try {
-      const upstream = await runAnthropicBridgeOnce(req, anthropicBody);
-      if (upstream.statusCode >= 400) {
-        return res.status(upstream.statusCode).json(upstream.body || JSON.parse(upstream.bodyText));
-      }
-      return res.json(anthropicToChatCompletion(upstream.body, requestedModel));
-    } catch (e) {
-      console.error(`  ❌ h1 bridge chat error: ${e.message}`);
-      return res.status(500).json(converter.buildErrorResponse(e.message));
-    }
-  }
-
-  const token = tokenPool.pick();
-  if (!token) {
-    return res.status(503).json(converter.buildErrorResponse('No available tokens', 'server_error', 503));
-  }
-
-  // Belt-and-suspenders: if the response closes for any reason without a
-  // matching release, clean up the token slot. release() is idempotent so the
-  // success/error paths below are still safe to call directly.
-  res.on('close', () => tokenPool.release(token, { success: true }));
-
-  const prompt = converter.messagesToPrompt(messages);
-
-  console.log(`  📨 [${new Date().toLocaleTimeString()}] route=native-chat ${requestedModel} → ${cursorModel} | stream=${isStream} | ${prompt.substring(0, 80)}...`);
-
-  if (isStream) {
-    // ── 流式响应 ──
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-    // OpenAI clients expect one chatcmpl-id and one created timestamp
-    // across every chunk in a stream. Mint once per request and reuse.
-    const ident = converter.newStreamIdentity();
-    res.write(converter.buildRoleChunk(requestedModel, ident));
-
-    try {
-      const cursorClient = getCursorClient();
-      const result = await cursorClient.chat(token, prompt, cursorModel, {
-        stream: true,
-        onDelta: (text) => {
-          if (!res.writableEnded) {
-            res.write(converter.buildStreamChunk(text, requestedModel, null, ident));
-          }
-        },
-      });
-
-      if (result.error && !res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${result.error}]`, requestedModel, null, ident));
-      }
-
-      if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop', ident));
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-
-      tokenPool.release(token, {
-        success: !result.error,
-        error: !!result.error,
-        rateLimited: looksLikeRateLimit(result.error),
-      });
-      console.log(`  ✅ stream done | in=${result.inputTokens} out=${result.outputTokens}`);
-    } catch (e) {
-      console.error(`  ❌ stream error: ${e.message}`);
-      tokenPool.release(token, { error: true, rateLimited: looksLikeRateLimit(e) });
-      if (!res.writableEnded) {
-        res.write(converter.buildStreamChunk(`\n\n[Error: ${e.message}]`, requestedModel, null, ident));
-        res.write(converter.buildStreamChunk(null, requestedModel, 'stop', ident));
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    }
-
-  } else {
-    // ── 非流式响应 ──
-    try {
-      const cursorClient = getCursorClient();
-      const result = await cursorClient.chat(token, prompt, cursorModel, { stream: false });
-
-      if (result.error) {
-        console.error(`  ❌ ${result.error}`);
-        tokenPool.release(token, {
-          error: true,
-          rateLimited: looksLikeRateLimit(result.error),
-        });
-        return res.status(500).json(converter.buildErrorResponse(result.error));
-      }
-
-      tokenPool.release(token, { success: true });
-      console.log(`  ✅ done | in=${result.inputTokens} out=${result.outputTokens}`);
-      res.json(converter.buildChatResponse(result.text, requestedModel, result.inputTokens, result.outputTokens));
-    } catch (e) {
-      console.error(`  ❌ ${e.message}`);
-      tokenPool.release(token, { error: true, rateLimited: looksLikeRateLimit(e) });
-      res.status(500).json(converter.buildErrorResponse(e.message));
-    }
-  }
+app.get(['/ratlc', '/ratlc/dashboard'], sendDashboard);
+app.get('/ratlc/requests', checkApiKey, (req, res) => {
+  const qs = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  proxyRatlcGet(req, res, '/requests' + qs, 3000);
+});
+app.get('/ratlc/health', checkApiKey, (req, res) => {
+  proxyRatlcGet(req, res, '/health', 3000);
 });
 
 // ── POST /v1/responses (OpenAI Responses API MVP) ──
@@ -785,7 +685,9 @@ app.post('/v1/responses', checkApiKey, async (req, res) => {
         return res.status(upstream.statusCode).json(errBody || buildResponsesError(upstream.bodyText || 'Upstream bridge error', 'api_error', upstream.statusCode));
       }
 
-      const response = anthropicToResponses(upstream.body, requestedModel, { route: 'bridge-tools' });
+      const response = anthropicToResponses(upstream.body, requestedModel, {
+        route: responseRouteFromUpstream(upstream, 'bridge-tools'),
+      });
       rememberResponse(response, [...previousItems, ...inputItems]);
       return res.json(response);
     } catch (e) {
@@ -823,7 +725,9 @@ app.post('/v1/responses', checkApiKey, async (req, res) => {
         return res.status(upstream.statusCode).json(errBody || buildResponsesError(upstream.bodyText || 'Upstream bridge error', 'api_error', upstream.statusCode));
       }
 
-      const response = anthropicToResponses(upstream.body, requestedModel, { route: 'h1-bridge-responses' });
+      const response = anthropicToResponses(upstream.body, requestedModel, {
+        route: responseRouteFromUpstream(upstream, 'h1-bridge-responses'),
+      });
       rememberResponse(response, [...previousItems, ...inputItems]);
       return res.json(response);
     } catch (e) {
@@ -1346,6 +1250,13 @@ function anthropicToResponses(body, requestedModel, opts = {}) {
   return resp;
 }
 
+function responseRouteFromUpstream(upstream, fallback) {
+  const headers = upstream && upstream.headers ? upstream.headers : {};
+  const route = String(headers['x-cursoride-route'] || '').toLowerCase();
+  if (route === 'ratlc-pool') return 'ratlc-responses';
+  return fallback;
+}
+
 function responseOutputToInputItems(response) {
   if (!response || !Array.isArray(response.output)) return [];
   const items = [];
@@ -1379,6 +1290,148 @@ function rememberResponse(response, inputItems) {
   });
 }
 
+function parseSseEvents(text) {
+  const events = [];
+  let event = 'message';
+  let dataLines = [];
+  const flush = () => {
+    if (dataLines.length === 0) {
+      event = 'message';
+      return;
+    }
+    const raw = dataLines.join('\n');
+    dataLines = [];
+    const name = event;
+    event = 'message';
+    if (!raw || raw === '[DONE]') return;
+    try {
+      events.push({ event: name, data: JSON.parse(raw) });
+    } catch {
+      events.push({ event: name, data: raw });
+    }
+  };
+
+  for (const line of String(text || '').replace(/\r\n/g, '\n').split('\n')) {
+    if (line === '') {
+      flush();
+      continue;
+    }
+    if (line.startsWith(':')) continue;
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim() || 'message';
+      continue;
+    }
+    if (line.startsWith('data:')) {
+      let data = line.slice(5);
+      if (data.startsWith(' ')) data = data.slice(1);
+      dataLines.push(data);
+    }
+  }
+  flush();
+  return events;
+}
+
+function compactAnthropicBlock(block) {
+  if (!block || typeof block !== 'object') return block;
+  const out = { ...block };
+  if (out._inputJson != null) {
+    if (out.type === 'tool_use' || out.type === 'server_tool_use') {
+      try { out.input = out._inputJson ? JSON.parse(out._inputJson) : (out.input || {}); }
+      catch { out.input = out.input || {}; }
+    }
+    delete out._inputJson;
+  }
+  delete out._stopped;
+  return out;
+}
+
+function parseAnthropicSseMessage(text) {
+  const events = parseSseEvents(text);
+  let message = null;
+  const blocks = new Map();
+  const content = [];
+  let finalUsage = null;
+  let finalDelta = null;
+
+  const pushBlock = (idx) => {
+    const block = blocks.get(idx);
+    if (!block || block._stopped) return;
+    block._stopped = true;
+    content.push(compactAnthropicBlock(block));
+  };
+
+  for (const evt of events) {
+    const data = evt.data;
+    if (!data || typeof data !== 'object') continue;
+    if (data.type === 'message_start' && data.message) {
+      message = { ...data.message, content: [] };
+      continue;
+    }
+    if (data.type === 'content_block_start') {
+      const idx = Number(data.index);
+      const block = { ...(data.content_block || {}) };
+      if (block.type === 'text') block.text = block.text || '';
+      if (block.type === 'thinking') block.thinking = block.thinking || '';
+      if (block.type === 'tool_use' || block.type === 'server_tool_use') {
+        block.input = block.input || {};
+        block._inputJson = '';
+      }
+      blocks.set(idx, block);
+      continue;
+    }
+    if (data.type === 'content_block_delta') {
+      const idx = Number(data.index);
+      const block = blocks.get(idx) || {};
+      const delta = data.delta || {};
+      if (delta.type === 'text_delta') block.text = String(block.text || '') + String(delta.text || '');
+      else if (delta.type === 'input_json_delta') block._inputJson = String(block._inputJson || '') + String(delta.partial_json || '');
+      else if (delta.type === 'thinking_delta') block.thinking = String(block.thinking || '') + String(delta.thinking || '');
+      else if (delta.type === 'signature_delta') block.signature = String(block.signature || '') + String(delta.signature || '');
+      blocks.set(idx, block);
+      continue;
+    }
+    if (data.type === 'content_block_stop') {
+      pushBlock(Number(data.index));
+      continue;
+    }
+    if (data.type === 'message_delta') {
+      finalDelta = data.delta || null;
+      finalUsage = data.usage || null;
+    }
+  }
+
+  for (const idx of [...blocks.keys()].sort((a, b) => a - b)) pushBlock(idx);
+
+  const usage = {
+    ...(message?.usage || {}),
+    ...(finalUsage || {}),
+  };
+  if (message?.usage?.input_tokens != null && (!usage.input_tokens || usage.input_tokens === 0)) {
+    usage.input_tokens = message.usage.input_tokens;
+  }
+
+  return {
+    id: message?.id || `msg_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+    type: 'message',
+    role: 'assistant',
+    content,
+    model: message?.model || DEFAULT_MODEL,
+    stop_reason: finalDelta?.stop_reason || message?.stop_reason || 'end_turn',
+    stop_sequence: finalDelta?.stop_sequence || message?.stop_sequence || null,
+    usage,
+  };
+}
+
+function parseInvocationBody(bodyText, headers = {}) {
+  const text = String(bodyText || '');
+  if (!text) return null;
+  const contentType = String(headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
+  if (contentType.includes('text/event-stream') || /^event:/m.test(text)) {
+    return parseAnthropicSseMessage(text);
+  }
+  try { return JSON.parse(text); } catch { return null; }
+}
+
 async function invokeAnthropicMessages(req, anthropicBody, responseAdapter) {
   return new Promise((resolve, reject) => {
     let statusCode = 200;
@@ -1394,9 +1447,29 @@ async function invokeAnthropicMessages(req, anthropicBody, responseAdapter) {
       }
       resolve(payload);
     }
-    const proxyRes = {
-      writableEnded: false,
-      headersSent: false,
+    const proxyRes = new Writable({
+      write(chunk, encoding, cb) {
+        proxyRes.headersSent = true;
+        chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+        cb();
+      },
+      final(cb) {
+        if (!proxyRes.writableEnded) finishResponse();
+        cb();
+      },
+    });
+    proxyRes.headersSent = false;
+    const finishResponse = (chunk) => {
+      if (chunk) proxyRes.write(chunk);
+      const bodyText = chunks.join('');
+      finish({
+        statusCode,
+        headers,
+        bodyText,
+        body: parseInvocationBody(bodyText, headers),
+      });
+    };
+    Object.assign(proxyRes, {
       status(code) {
         statusCode = code;
         return this;
@@ -1404,27 +1477,19 @@ async function invokeAnthropicMessages(req, anthropicBody, responseAdapter) {
       setHeader(name, value) {
         headers[String(name).toLowerCase()] = value;
       },
+      writeHead(code, outHeaders) {
+        statusCode = code || statusCode;
+        if (outHeaders && typeof outHeaders === 'object') {
+          for (const [k, v] of Object.entries(outHeaders)) headers[String(k).toLowerCase()] = v;
+        }
+        this.headersSent = true;
+        return this;
+      },
       flushHeaders() {
         this.headersSent = true;
       },
-      on(event, cb) {
-        if (event === 'close' && typeof cb === 'function') closeHandlers.push(cb);
-        return this;
-      },
-      write(chunk) {
-        this.headersSent = true;
-        chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
-        return true;
-      },
       end(chunk) {
-        if (chunk) this.write(chunk);
-        this.writableEnded = true;
-        finish({
-          statusCode,
-          headers,
-          bodyText: chunks.join(''),
-          body: null,
-        });
+        finishResponse(chunk);
       },
       json(obj) {
         this.headersSent = true;
@@ -1436,6 +1501,11 @@ async function invokeAnthropicMessages(req, anthropicBody, responseAdapter) {
           body: obj,
         });
       },
+    });
+    const originalOn = proxyRes.on.bind(proxyRes);
+    proxyRes.on = (event, cb) => {
+      if (event === 'close' && typeof cb === 'function') closeHandlers.push(cb);
+      return originalOn(event, cb);
     };
 
     const proxyReq = Object.create(req);
@@ -1460,6 +1530,7 @@ function buildTurnCallbacks(ctx) {
     convKey, bridgeKey, conversationId, sessionId,
     requestedModel, cursorModel, mcpTools,
     getBridge, requestId,
+    clientThinkingEnabled = false,
     // Optional — present for continuation turns. When set we update the
     // existing entry in place (preserving its bridgeKey alias set) instead
     // of creating a new one.
@@ -1511,9 +1582,17 @@ function buildTurnCallbacks(ctx) {
     }
     if (turnState.thinkingBlockOpen) {
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockStop(turnState.nextBlockIndex - 1));
+        const signature = turnState.thinkingAdapter
+          ? turnState.thinkingAdapter.signature({ blockIndex: turnState.thinkingBlockIndex })
+          : null;
+        if (signature) {
+          res.write(anthropicConverter.buildContentBlockDeltaSignature(turnState.thinkingBlockIndex, signature));
+        }
+        res.write(anthropicConverter.buildContentBlockStop(turnState.thinkingBlockIndex));
       }
       turnState.thinkingBlockOpen = false;
+      turnState.thinkingBlockIndex = null;
+      turnState.thinkingAdapter = null;
     }
   }
 
@@ -1585,6 +1664,9 @@ function buildTurnCallbacks(ctx) {
         try { return JSON.stringify(normalizedArgs); }
         catch { return '{}'; }
       })();
+      // The rescue path writes tool_use blocks directly, so close any open
+      // text/thinking block before allocating the synthetic block index.
+      closeOpenBlock();
       const synthExecId = '';
       const synthToolCallId = `toolu_synth_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
       const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, synthExecId, synthToolCallId, sessionId);
@@ -1649,10 +1731,12 @@ function buildTurnCallbacks(ctx) {
       sessionId,
       requestedModel,
       cursorModel,
+      clientThinkingEnabled,
     };
     entry.lastAccessMs = Date.now();
     entry.pendingExecs = turnState.pendingToolCalls.slice();
     entry.requestId = requestId;
+    entry.clientThinkingEnabled = !!clientThinkingEnabled;
     indexBridgeEntry(entry, bridgeKey);
 
     if (isStream) {
@@ -1742,27 +1826,37 @@ function buildTurnCallbacks(ctx) {
       // emitted inside the thinking block. This buffer is internal-only.
       turnState.emittedThinkingForDetection += text;
 
-      // Drop thinking content from the API response by default. Anthropic's
-      // thinking blocks require a server-issued signature we cannot
-      // produce; emitting them poisons sessions against direct-Anthropic
-      // resume (see `_emitThinkingBlocks` comment at the top of this file).
-      if (!_emitThinkingBlocks) return;
+      // Drop thinking content from the API response by default. When explicitly
+      // enabled, emit a proxy-local thinking block for Claude Code UI display.
+      if (!PROXY_THINKING_BLOCKS || !clientThinkingEnabled) return;
+      if (!turnState.thinkingBlockOpen && turnState.thinkingBlockStarted) return;
+      if (!turnState.thinkingBlockOpen && turnState.nextBlockIndex > 0) return;
 
       if (turnState.textBlockOpen) closeOpenBlock();
       if (!turnState.thinkingBlockOpen) {
         const idx = turnState.nextBlockIndex++;
+        turnState.thinkingBlockIndex = idx;
+        turnState.thinkingBlockStarted = true;
+        turnState.thinkingAdapter = new ProxyThinkingBlockAdapter({
+          source: 'server',
+          convKey,
+          requestId,
+          turnIndex: assistantTurnIdx,
+          blockIndex: idx,
+        });
         if (isStream && !res.writableEnded) {
           res.write(anthropicConverter.buildContentBlockStartThinking(idx));
         }
         turnState.thinkingBlockOpen = true;
       }
+      if (turnState.thinkingAdapter) turnState.thinkingAdapter.append(text);
       // Same rationale as onTextDelta: skip the in-memory accumulator when
       // we're streaming — it's not used for the response, only for diagnostics.
       if (!isStream) {
         turnState.accumulatedThinking += text;
       }
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.nextBlockIndex - 1, text));
+        res.write(anthropicConverter.buildContentBlockDeltaThinking(turnState.thinkingBlockIndex, text));
       }
     },
 
@@ -1772,6 +1866,10 @@ function buildTurnCallbacks(ctx) {
       closeOpenBlock();
       const blockIndex = turnState.nextBlockIndex++;
       const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
+      const registeredNames = new Set(
+        (mcpTools || []).flatMap(t => [t && t.name, t && t.toolName]).filter(Boolean)
+      );
+      toolName = anthropicTools.normalizeMcpWireToolNameForClient(toolName, registeredNames);
 
       turnState.pendingToolCalls.push({
         execMsgId: id, execId, toolCallId, toolName, args,
@@ -1878,10 +1976,12 @@ function buildTurnCallbacks(ctx) {
           sessionId,
           requestedModel,
           cursorModel,
+          clientThinkingEnabled,
         };
         entry.lastAccessMs = Date.now();
         entry.pendingExecs = turnState.pendingToolCalls.slice();
         entry.requestId = requestId;
+        entry.clientThinkingEnabled = !!clientThinkingEnabled;
         indexBridgeEntry(entry, bridgeKey);
       } else {
         // Either a clean end_turn OR a fully-synthetic-tools turn that we
@@ -2069,6 +2169,9 @@ function makeTurnState() {
   return {
     textBlockOpen: false,
     thinkingBlockOpen: false,
+    thinkingBlockStarted: false,
+    thinkingBlockIndex: null,
+    thinkingAdapter: null,
     // Buffer of every text delta we've forwarded this turn — kept regardless
     // of isStream because we need it at end_turn to detect hallucinated
     // tool calls (`[Tool call: NAME({...})]`) the model emitted as text
@@ -2139,6 +2242,7 @@ async function handleContinuation(req, res, cached, messages, requestedModel, cu
     mcpTools: cached.mcpTools,
     getBridge: () => cached.bridge,
     requestId: cached.requestId,
+    clientThinkingEnabled: !!cached.clientThinkingEnabled,
     // Pass the existing entry so finalize/onTurnEnded mutate it in place
     // (preserving the bridgeKeys alias set) instead of creating a new one.
     cachedEntry: cached,
@@ -2247,6 +2351,8 @@ async function handleFreshTurn(req, res, token, params) {
   }
 
   const turnState = makeTurnState();
+  const clientThinkingEnabled =
+    body && body.thinking && (body.thinking.type === 'enabled' || body.thinking === 'enabled');
 
   // sessionId is a per-bridge uuid baked into every tool_use_id we mint. It
   // lets continuations find this bridge across TCP socket reconnects (the
@@ -2269,6 +2375,7 @@ async function handleFreshTurn(req, res, token, params) {
     // The position this turn's assistant message will occupy in the
     // conversation history — used to key recorded thinking content.
     assistantTurnIdx: newAssistantTurnIdx,
+    clientThinkingEnabled,
   });
 
   bridge = cursorAgent.startConversation(token, {
@@ -2407,6 +2514,7 @@ async function handleAnthropicMessagesRequest(req, res) {
   // tool_result onto the wrong stream and hangs).
   const remoteAddr = (req.ip || req.socket?.remoteAddress || '').toString();
   const remotePort = req.socket?.remotePort;
+  req.body = body;
   const clientSessionId = anthropicTools.extractClientSessionId(req);
   const convKey = anthropicTools.deriveConversationKey(messages, cursorModel, system, tools, remoteAddr, remotePort, clientSessionId);
   const bridgeKey = anthropicTools.deriveBridgeKey(cursorModel, messages, system, tools, remoteAddr, remotePort, clientSessionId);
@@ -2418,7 +2526,8 @@ async function handleAnthropicMessagesRequest(req, res) {
   const reasonLabel = routingReason ? ` | ${routingReason}` : '';
   console.log(
     `  📨 [${new Date().toLocaleTimeString()}] (Anthropic) ${requestedModel} → ${cursorModel} | ` +
-    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey} | reqId=${requestId}${reasonLabel}`
+    `stream=${isStream} | continuation=${isContinuation} | convKey=${convKey} | ` +
+    `clientSessionId=${clientSessionId ? clientSessionId.slice(0, 8) + '…' : '(none)'} | reqId=${requestId}${reasonLabel}`
   );
 
   debugLog.logRequest(req, body, {
@@ -2752,7 +2861,6 @@ app.listen(PORT, HOST, () => {
   console.log('  ║       CursorIDE2API v2.0 (Lite)           ║');
   console.log('  ╠═══════════════════════════════════════════╣');
   console.log(`  ║  🌐 http://${HOST}:${PORT}                     ║`);
-  console.log(`  ║  🔌 /v1/chat/completions                  ║`);
   console.log(`  ║  🔌 /v1/messages (Anthropic)               ║`);
   console.log(`  ║  🔌 /v1/messages/count_tokens             ║`);
   console.log(`  ║  🔌 /v1/responses                         ║`);
@@ -2773,7 +2881,7 @@ app.listen(PORT, HOST, () => {
   if (debugLog.isEnabled()) {
     console.log(`  ║  📝 Debug: ${(debugLog.isVerbose() ? 'verbose' : 'on').padEnd(31)}║`);
   }
-  console.log(`  ║  💭 Thinking blocks: ${(_emitThinkingBlocks ? 'ON (non-portable)' : 'OFF (portable)').padEnd(21)}║`);
+  console.log(`  ║  💭 Proxy thinking: ${(PROXY_THINKING_BLOCKS ? 'ON (proxy-local)' : 'OFF').padEnd(24)}║`);
   console.log('  ╚═══════════════════════════════════════════╝');
   console.log('');
 });

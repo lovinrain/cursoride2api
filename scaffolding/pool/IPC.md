@@ -34,6 +34,30 @@ Three processes, two protocols.
 
 { "type": "send_user_message", "requestId": "req-abc", "text": "What is 2+2?" }
 
+// User message with optional image attachments. This is the default
+// /v1/messages path: the worker answers the currently parked bajie_yield by
+// sending content.items as the MCP tool-result payload. Reusing a ready
+// channel avoids opening a fresh Cursor Run for each image request.
+{ "type": "send_user_message", "requestId": "req-abc",
+  "text": "What is in this image?<image/>",
+  "content": { "items": [
+    { "kind": "text", "text": "What is in this image?" },
+    { "kind": "image", "mediaType": "image/png", "dataBase64": "..." }
+  ] }
+}
+
+// Optional/native image path. This opens a native Cursor image Run where
+// UserMessage.selectedContext.selectedImages carries the images. It is not
+// used by the default /v1/messages image route because it consumes upstream
+// Run admission capacity.
+{ "type": "send_native_image_message", "requestId": "req-abc",
+  "text": "What is in this image?",
+  "content": { "items": [
+    { "kind": "text", "text": "What is in this image?" },
+    { "kind": "image", "mediaType": "image/png", "dataBase64": "..." }
+  ] }
+}
+
 { "type": "send_tool_result", "requestId": "req-abc", "execId": "<from previous tool_use>", "content": "..." }
 
 { "type": "ping", "requestId": "ping-1234" }       // a no-op user message just for keepalive
@@ -92,6 +116,21 @@ Wire format: newline-delimited JSON. One line = one message.
   "model": "claude-haiku-4-5-fast"               // optional — names the target group;
                                                   // omitted/unknown → default group
 }
+
+// Same request shape as send_user_message, but with multimodal content.items.
+// This is the default Anthropic image route and is delivered as a bajie_yield
+// MCP tool result on an already-ready channel.
+{ "type": "request", "requestId": "req-abc",
+  "action": "send_user_message", "text": "...<image/>", "content": {"items":[...]},
+  "system": "<caller system>", "tools": [...],
+  "model": "claude-haiku-4-5-fast" }
+
+// Optional/native image route for explicit experiments. Opens a fresh Cursor
+// Run and carries images through native selectedImages instead of bajie_yield.
+{ "type": "request", "requestId": "req-abc",
+  "action": "send_native_image_message", "text": "...", "content": {"items":[...]},
+  "system": "<caller system>", "tools": [...],
+  "model": "claude-haiku-4-5-fast" }
 
 // For tool_result follow-up:
 { "type": "request", "requestId": "req-abc",

@@ -37,7 +37,7 @@
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4 } = require('./uuid');
 const config = require('./config');
 const { generateChecksum } = require('./cursor-client');
 const stallThresholds = require('./stall-thresholds');
@@ -53,6 +53,12 @@ const {
   sendExecClientMessageAndClose,
   sendKvResponse,
   frameConnectMessage,
+  buildNativeReadResult,
+  buildNativeWriteResult,
+  buildNativeDeleteResult,
+  buildNativeGrepResult,
+  sendForwardCompatibleSubagentResult,
+  buildSelectedContextForImages,
   resolveClientFingerprint,
 } = require('./cursor-agent');
 
@@ -171,6 +177,7 @@ function startConversation(token, options = {}) {
     sessionId = uuidv4(),
     onTextDelta,
     onThinkingDelta,
+    onThinkingCompleted,
     onMcpCall,
     onServerToolUse,
     onStepCompleted,
@@ -181,6 +188,7 @@ function startConversation(token, options = {}) {
   const currentCallbacks = {
     onTextDelta: onTextDelta || (() => {}),
     onThinkingDelta: onThinkingDelta || (() => {}),
+    onThinkingCompleted: onThinkingCompleted || (() => {}),
     onMcpCall: onMcpCall || (() => {}),
     onServerToolUse: onServerToolUse || (() => {}),
     onStepCompleted: onStepCompleted || (() => {}),
@@ -190,7 +198,7 @@ function startConversation(token, options = {}) {
 
   function setCallbacks(newCallbacks) {
     if (!newCallbacks || typeof newCallbacks !== 'object') return;
-    for (const k of ['onTextDelta', 'onThinkingDelta', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError']) {
+    for (const k of ['onTextDelta', 'onThinkingDelta', 'onThinkingCompleted', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError']) {
       if (typeof newCallbacks[k] === 'function') {
         currentCallbacks[k] = newCallbacks[k];
       }
@@ -405,13 +413,17 @@ function startConversation(token, options = {}) {
       const out = [];
       for (const it of items || []) {
         if (!it) continue;
-        if (it.kind === 'image' && it.data && it.data.length > 0) {
+        let imageData = it.data;
+        if ((!imageData || imageData.length === 0) && typeof it.dataBase64 === 'string' && it.dataBase64) {
+          try { imageData = Buffer.from(it.dataBase64, 'base64'); } catch { imageData = null; }
+        }
+        if (it.kind === 'image' && imageData && imageData.length > 0) {
           out.push(create(agent.McpToolResultContentItemSchema, {
             content: {
               case: 'image',
               value: create(agent.McpImageContentSchema, {
                 mimeType: it.mediaType || 'image/png',
-                data: it.data instanceof Uint8Array ? it.data : new Uint8Array(it.data),
+                data: imageData instanceof Uint8Array ? imageData : new Uint8Array(imageData),
               }),
             },
           }));
@@ -496,30 +508,18 @@ function startConversation(token, options = {}) {
         return;
       }
       if (nativeKind === 'read') {
-        const result = create(agent.ReadResultSchema, {
-          result: {
-            case: 'success',
-            value: create(agent.ReadSuccessSchema, {
-              path: nativePath, content: text,
-              totalLines: text.split('\n').length, fileSize: BigInt(Buffer.byteLength(text)),
-              truncated: false,
-            }),
-          },
-        });
+        const result = buildNativeReadResult(create, agent, nativePath, text);
         sendExecClientMessageAndClose(id, execId, 'readResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'write') {
-        const result = create(agent.WriteResultSchema, {
-          result: {
-            case: 'success',
-            value: create(agent.WriteSuccessSchema, {
-              path: nativePath, linesCreated: text.split('\n').length, fileSize: Buffer.byteLength(text),
-              fileContentAfterWrite: '',
-            }),
-          },
-        });
+        const result = buildNativeWriteResult(create, agent, nativeKindRaw, text);
         sendExecClientMessageAndClose(id, execId, 'writeResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'delete') {
+        const result = buildNativeDeleteResult(create, agent, nativeKindRaw, text);
+        sendExecClientMessageAndClose(id, execId, 'deleteResult', result, sendBinaryFrame);
         return;
       }
       if (nativeKind === 'fetch') {
@@ -536,10 +536,12 @@ function startConversation(token, options = {}) {
         return;
       }
       if (nativeKind === 'grep') {
-        const result = create(agent.GrepResultSchema, {
-          result: { case: 'error', value: create(agent.GrepErrorSchema, { error: text || '(no matches)' }) },
-        });
+        const result = buildNativeGrepResult(create, agent, nativeKindRaw, text);
         sendExecClientMessageAndClose(id, execId, 'grepResult', result, sendBinaryFrame);
+        return;
+      }
+      if (nativeKind === 'subagent') {
+        sendForwardCompatibleSubagentResult(id, execId, content, sendBinaryFrame);
         return;
       }
     }
@@ -583,6 +585,49 @@ function startConversation(token, options = {}) {
     sendExecClientMessageAndClose(id, execId, 'mcpResult', mcpResult, sendBinaryFrame);
   }
 
+  function buildUserMessage(create, agent, text, images) {
+    const fields = {
+      text: String(text || ''),
+      messageId: uuidv4(),
+    };
+    const selectedContext = buildSelectedContextForImages(create, agent, images);
+    if (selectedContext) fields.selectedContext = selectedContext;
+    return create(agent.UserMessageSchema, fields);
+  }
+
+  function resetTurnStateForClientMessage() {
+    turnEndedFired = false;
+    lastUsefulFrameAt = Date.now();
+    maxIdleMs = 0;
+    _turnRetries = 0;
+    _turnTransportErrors = 0;
+    _turnStalls = 0;
+    _turnCascadeDetected = false;
+    _turnTextDeltaCount = 0;
+    _turnThinkingDeltaCount = 0;
+    _bytesInAtLastUsefulFrame = streamBytesIn;
+  }
+
+  function sendUserMessage(text, images) {
+    if (closed) return;
+    resetTurnStateForClientMessage();
+    const { create, toBinary, agent } = _protoRequire();
+    const userMsg = buildUserMessage(create, agent, text, images);
+    const action = create(agent.ConversationActionSchema, {
+      action: {
+        case: 'userMessageAction',
+        value: create(agent.UserMessageActionSchema, { userMessage: userMsg }),
+      },
+    });
+    const wrapper = create(agent.AgentClientMessageSchema, {
+      message: { case: 'conversationAction', value: action },
+    });
+    const encoded = toBinary(agent.AgentClientMessageSchema, wrapper);
+    const imageCount = Array.isArray(images) ? images.length : 0;
+    console.log(`[cursor-agent-h1] sending native user message textBytes=${String(text || '').length} images=${imageCount}`);
+    sendBinaryFrame(encoded);
+  }
+
   // Top-level server message dispatch (mirrors cursor-agent.js)
   function handleServerMessage(msg) {
     const msgCase = msg.message?.case;
@@ -606,6 +651,9 @@ function startConversation(token, options = {}) {
       }, {
         passthroughNativeTools: !!options.passthroughNativeTools,
         nativeExecKinds: _nativeExecKinds,
+        onUnhandledExec: (info) => {
+          currentCallbacks.onError(info?.detail || 'unhandled Cursor exec message');
+        },
       });
       return;
     }
@@ -639,7 +687,10 @@ function startConversation(token, options = {}) {
         }
         return;
       }
-      if (iuCase === 'thinkingCompleted') return;
+      if (iuCase === 'thinkingCompleted') {
+        try { currentCallbacks.onThinkingCompleted(iuVal || {}); } catch { /* ignore */ }
+        return;
+      }
       if (iuCase === 'tokenDelta') {
         outputTokens += iuVal?.tokens || 0;
         return;
@@ -939,9 +990,7 @@ function startConversation(token, options = {}) {
       });
     }
 
-    const userMsg = create(agent.UserMessageSchema, {
-      text: prompt, messageId: uuidv4(),
-    });
+    const userMsg = buildUserMessage(create, agent, prompt, options.images);
     const action = create(agent.ConversationActionSchema, {
       action: {
         case: 'userMessageAction',
@@ -1072,6 +1121,7 @@ function startConversation(token, options = {}) {
   return {
     conversationId,
     sendToolResult,
+    sendUserMessage,
     setCallbacks,
     setTools,
     close,

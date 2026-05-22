@@ -2,7 +2,8 @@
 //  CursorIDE2API - Anthropic ↔ Cursor 格式转换
 // ═══════════════════════════════════════════════
 
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4 } = require('./uuid');
+const proxyThinking = require('./proxy-thinking-adapter');
 const anthropicToolsPolicy = require('./anthropic-tools');
 
 /**
@@ -164,7 +165,7 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
       `(for example Claude Code), not by the user's Cursor IDE configuration. ` +
       `When one of these tools is needed, call it normally; do not tell the user to configure it in Cursor. ` +
       `If Cursor shows an mcp_ prefix for a tool, it is the same client-declared tool with a collision-safe name. ` +
-      `Broad web search and public web lookup requests must be handled by Cursor's native WebSearch, not by client-declared MCP WebSearch, WebFetch, or Fetch. For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files. ` +
+      `Broad web search should use Cursor's native WebSearch. For an explicit URL fetch, WebFetch/Fetch may be used and is served by the proxy with public-URL safety checks; Bash/curl is allowed only when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files. ` +
       `Available client-declared tools for this request: ${shown}${more}.\n` +
       `</system>`
     );
@@ -172,7 +173,7 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
     parts.push(
       `<system>\n` +
       `Web search is provided by Cursor's native WebSearch in this bridge. ` +
-      `Do not look for or call client-declared MCP WebSearch, WebFetch, Fetch, or mcp_ variants. Do not use Bash, Shell, curl, wget, or local HTTP requests as a broad-search fallback. For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files.\n` +
+      `Do not look for or call client-declared MCP WebSearch or mcp_WebSearch variants as a broad-search fallback. For explicit URL fetches, WebFetch/Fetch may be used when available. Do not use Bash, Shell, curl, wget, or local HTTP requests as a broad-search fallback unless the user explicitly asks for a URL fetch/curl test and the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files.\n` +
       `</system>`
     );
   }
@@ -410,6 +411,16 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
             segments.push(b.text);
             if (role === 'user') userHasOriginalContent = true;
           }
+        } else if (b.type === 'thinking') {
+          // Proxy-local thinking blocks are emitted only for Claude Code UI
+          // display. They are not Anthropic-signed context and must not be
+          // rendered back into Cursor prompts unless CURSOR_REINJECT_THINKING
+          // explicitly stores a scrubbed copy through thinking-history.
+          if (!proxyThinking.isProxyLocalThinkingBlock(b) && b.thinking) {
+            segments.push(`<thinking>\n${b.thinking}\n</thinking>`);
+          }
+        } else if (b.type === 'redacted_thinking') {
+          // No useful text to render on the Cursor AgentService path.
         } else if (b.type === 'tool_use') {
           let argStr = '';
           try {
@@ -841,6 +852,9 @@ function buildAnthropicResponse(text, model, inputTokens, outputTokens, options 
       input: tu.input,
     });
   }
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
+  }
 
   return {
     id: `msg_${uuidv4()}`,
@@ -973,6 +987,17 @@ function buildContentBlockDeltaThinking(index, text) {
     type: 'content_block_delta',
     index: index,
     delta: { type: 'thinking_delta', thinking: text },
+  });
+}
+
+/**
+ * content_block_delta 事件 (thinking signature)
+ */
+function buildContentBlockDeltaSignature(index, signature) {
+  return formatSSE('content_block_delta', {
+    type: 'content_block_delta',
+    index: index,
+    delta: { type: 'signature_delta', signature: signature },
   });
 }
 
@@ -1113,6 +1138,7 @@ module.exports = {
   buildMessageStart, buildContentBlockStart, buildContentBlockDelta,
   buildContentBlockStartToolUse, buildContentBlockDeltaInputJson,
   buildContentBlockStartThinking, buildContentBlockDeltaThinking,
+  buildContentBlockDeltaSignature,
   buildContentBlockStop, buildMessageDelta, buildMessageStop, buildPing,
   buildModelsResponseWithAnthropicAliases,
   buildSseErrorEvent,

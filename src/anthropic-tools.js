@@ -16,6 +16,24 @@ function normalizeClientToolNameForPolicy(name) {
     .toLowerCase();
 }
 
+const MCP_WIRE_ALIAS_TOOL_NAMES = new Set([
+  'AskQuestion', 'Delete', 'Edit', 'EditNotebook', 'FetchMcpResource',
+  'GenerateImage', 'Glob', 'Grep', 'ListMcpResources', 'Read',
+  'ReadLints', 'Shell', 'StrReplace', 'SwitchMode', 'Task',
+  'TodoWrite', 'WebFetch', 'WebSearch', 'Write',
+]);
+
+function normalizeMcpWireToolNameForClient(name, registeredNames) {
+  const raw = String(name || '');
+  if (raw.startsWith('mcp_') && !raw.startsWith('mcp__')) {
+    const unprefixed = raw.slice(4);
+    if (!registeredNames || registeredNames.has(unprefixed) || MCP_WIRE_ALIAS_TOOL_NAMES.has(unprefixed)) {
+      return unprefixed;
+    }
+  }
+  return raw;
+}
+
 const CLIENT_WEB_SEARCH_TOOL_NAMES = new Set([
   'websearch',
   'websearchtool',
@@ -49,7 +67,7 @@ function shouldDropClientWebLookupToolName(name) {
     return !(
       _envFlag('CURSOR_ALLOW_CLIENT_WEB_TOOLS') ||
       _envFlag('CURSOR_ALLOW_CLIENT_WEBFETCH') ||
-      _envFlag('CURSOR_SERVER_WEBFETCH')
+      process.env.CURSOR_SERVER_WEBFETCH !== '0'
     );
   }
   return false;
@@ -99,7 +117,7 @@ function anthropicToolsToMcpTools(tools, providerIdentifier) {
   // behavior (WebFetch/curl/placeholder files). Explicit opt-ins:
   //   CURSOR_ALLOW_CLIENT_WEBSEARCH=1  — forward client WebSearch/Search
   //   CURSOR_ALLOW_CLIENT_WEBFETCH=1   — forward client WebFetch/Fetch
-  //   CURSOR_SERVER_WEBFETCH=1         — forward Fetch/WebFetch to server fetch
+  //   CURSOR_SERVER_WEBFETCH=0         — disable server-side Fetch/WebFetch
   //   CURSOR_ALLOW_CLIENT_WEB_TOOLS=1  — forward both categories
   tools = tools.filter(t => !(t && shouldDropClientWebLookupToolName(t.name)));
 
@@ -440,7 +458,13 @@ function _toolListHash(tools) {
 function extractClientSessionId(req) {
   if (!req) return null;
   try {
-    const hdr = req.headers && (req.headers['x-claude-code-session-id'] || req.headers['X-Claude-Code-Session-Id']);
+    const hdr = req.headers && (
+      req.headers['x-claude-code-session-id']
+      || req.headers['X-Claude-Code-Session-Id']
+      || req.headers['anthropic-session-id']
+      || req.headers['x-anthropic-session-id']
+      || req.headers['x-session-id']
+    );
     if (typeof hdr === 'string' && hdr.length > 0) return hdr;
   } catch { /* ignore */ }
   // Fallback: body.metadata.user_id. Some clients pass a JSON-encoded
@@ -517,7 +541,14 @@ function deriveConversationKey(messages, modelId, system, tools, remoteAddr, rem
  * Stable bridge cache key — used to find the open H2 stream when a tool_result
  * continuation request lands. Same salt shape as conversation key.
  */
-function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort) {
+function deriveBridgeKey(modelId, messages, system, tools, remoteAddr, remotePort, clientSessionId) {
+  if (clientSessionId) {
+    return crypto
+      .createHash('sha256')
+      .update('bridge-v2:' + (modelId || '') + ':' + clientSessionId)
+      .digest('hex')
+      .slice(0, 16);
+  }
   const first = extractFirstUserText(messages).slice(0, 200);
   const sys = _systemFingerprint(system);
   const addr = remoteAddr || '';
@@ -554,8 +585,14 @@ function hasToolResults(messages) {
 
 /**
  * Detect "hallucinated tool calls" — text content matching the pattern
- * `[Tool call: NAME]` or `[Tool call: NAME({...json...})]` that the model
- * sometimes emits as a *text block* instead of a structured tool_use.
+ * Textual tool-call markers that the model sometimes emits as a *text block*
+ * instead of a structured tool_use:
+ *
+ *   [Tool call: NAME]
+ *   [Tool call: NAME({...json...})]
+ *   [Tool call] NAME
+ *   [Tool call] NAME({...json...})
+ *
  * Cursor's model can fall out of "tool-use mode" (especially on long
  * contexts or when tool-name conflicts confuse it, e.g. the model wants
  * Cursor's native `AskQuestion` but we registered it as `mcp_AskUserQuestion`)
@@ -573,12 +610,24 @@ function hasToolResults(messages) {
 function parseHallucinatedToolCalls(text) {
   const results = [];
   if (!text || typeof text !== 'string') return results;
-  const TAG = '[Tool call: ';
+  const TAGS = [
+    { tag: '[Tool call: ', bracketAfterTag: false },
+    { tag: '[Tool call] ', bracketAfterTag: true },
+  ];
   let i = 0;
   while (i < text.length) {
-    const start = text.indexOf(TAG, i);
-    if (start === -1) break;
-    let p = start + TAG.length;
+    let match = null;
+    for (const candidate of TAGS) {
+      const idx = text.indexOf(candidate.tag, i);
+      if (idx === -1) continue;
+      if (!match || idx < match.start) {
+        match = { ...candidate, start: idx };
+      }
+    }
+    if (!match) break;
+
+    const start = match.start;
+    let p = start + match.tag.length;
     // Read tool name up to '(' or ']'.
     let nameEnd = p;
     while (nameEnd < text.length && text[nameEnd] !== '(' && text[nameEnd] !== ']') nameEnd++;
@@ -621,10 +670,16 @@ function parseHallucinatedToolCalls(text) {
       parseOk = false;
     }
     if (text[p] === ']') p++;
+    else if (match.bracketAfterTag) {
+      // `[Tool call] NAME({...})` has the closing bracket before the name, so
+      // the parsed span ends at the args close. Preserve the old bracketed
+      // form's behavior when no args were present by advancing to nameEnd.
+      p = Math.max(p, nameEnd);
+    }
 
     if (parseOk && name) results.push({ name, args, span: [start, p] });
     // Always advance past the start tag at minimum to avoid infinite loop.
-    i = Math.max(p, start + TAG.length);
+    i = Math.max(p, start + match.tag.length);
   }
   return results;
 }
@@ -643,6 +698,8 @@ const HALLUCINATED_NAME_ALIASES = {
 function canonicalizeHallucinatedToolName(name, registeredNames) {
   if (!name) return name;
   if (registeredNames && registeredNames.has(name)) return name;
+  const unprefixed = normalizeMcpWireToolNameForClient(name, registeredNames);
+  if (unprefixed !== name) return unprefixed;
   const aliased = HALLUCINATED_NAME_ALIASES[name];
   if (aliased && registeredNames && registeredNames.has(aliased)) return aliased;
   // Caller decides whether to forward as-is and let claude-code report
@@ -720,6 +777,7 @@ function normalizeHallucinatedToolArgs(toolName, args) {
 module.exports = {
   anthropicToolsToMcpTools,
   normalizeClientToolNameForPolicy,
+  normalizeMcpWireToolNameForClient,
   isClientWebSearchToolName, isClientWebFetchToolName,
   isClientWebLookupToolName, shouldDropClientWebLookupToolName,
   encodeToolUseId, decodeToolUseId,

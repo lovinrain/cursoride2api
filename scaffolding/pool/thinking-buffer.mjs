@@ -51,13 +51,16 @@ const MAX_TURNS = (() => {
 // 30-minute TTL — matches src/thinking-history.js and the bridge cache.
 const TTL_MS = 30 * 60_000;
 
-// Strip out `[Tool call: NAME({...})]` substrings — these are the model's
+// Strip out textual tool-call markers — these are the model's
 // hallucinated tool-call markers we suppress from the visible response.
 // Don't include them in re-injected thinking either; the model would see
 // noise. (Same scrub as src/thinking-history.js.)
 function _scrubThinking(text) {
   if (!text) return '';
-  return text.replace(/\[Tool call: [^\]]*\]/g, '').trim();
+  return text
+    .replace(/\[Tool call: [^\]]*\]/g, '')
+    .replace(/\[Tool call\]\s+[A-Za-z_][\w.-]*(?:\([^]*?\))?/g, '')
+    .trim();
 }
 
 // Per-conversation store. Map<convKey, {

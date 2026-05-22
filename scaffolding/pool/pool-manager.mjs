@@ -90,8 +90,8 @@ if (!['h1', 'h2'].includes(POOL_BRIDGE_PROTOCOL)) {
   process.exit(1);
 }
 const POOL_CONTEXT_MODE = (process.env.POOL_CONTEXT_MODE || 'last').toLowerCase();
-if (!['full', 'last'].includes(POOL_CONTEXT_MODE)) {
-  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last)`);
+if (!['full', 'last', 'hybrid'].includes(POOL_CONTEXT_MODE)) {
+  console.error(`invalid POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE} (must be full|last|hybrid)`);
   process.exit(1);
 }
 const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
@@ -104,6 +104,9 @@ const POOL_CONCURRENT_OPENS = Math.max(1, parseInt(process.env.POOL_CONCURRENT_O
 // when the target group exists but all its channels are opening / busy.
 // 0 = fall back immediately.
 const POOL_GROUP_WAIT_MS = Math.max(0, parseInt(process.env.POOL_GROUP_WAIT_MS || '5000', 10));
+const RATLC_QUEUE_TIMEOUT_MS = Math.max(0, parseInt(process.env.RATLC_QUEUE_TIMEOUT_MS || process.env.POOL_QUEUE_TIMEOUT_MS || '120000', 10));
+const RATLC_CONSUMED_TOOL_TTL_MS = Math.max(60_000, parseInt(process.env.RATLC_CONSUMED_TOOL_TTL_MS || '1800000', 10));
+const RATLC_SESSION_TTL_MS = Math.max(60_000, parseInt(process.env.RATLC_SESSION_TTL_MS || process.env.POOL_HYBRID_SESSION_TTL_MS || '1800000', 10));
 // Test hook: fork mock-worker.mjs instead of bridge-worker.mjs so the
 // multi-group test suite can exercise routing without paying Cursor's
 // retry lottery. NEVER set this outside tests.
@@ -120,6 +123,216 @@ const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}
 function normalizeModelForRouting(model) {
   return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
 }
+
+function rememberConsumedToolUse(id, entry) {
+  if (!id) return;
+  consumedToolUseIndex.set(id, {
+    consumedAt: Date.now(),
+    channelId: entry?.channelId || null,
+    execId: entry?.execId || null,
+  });
+}
+
+function getConsumedToolUse(id) {
+  if (!id) return null;
+  const entry = consumedToolUseIndex.get(id);
+  if (!entry) return null;
+  if (Date.now() - entry.consumedAt > RATLC_CONSUMED_TOOL_TTL_MS) {
+    consumedToolUseIndex.delete(id);
+    return null;
+  }
+  return entry;
+}
+
+function evictConsumedToolUses(now = Date.now()) {
+  for (const [id, entry] of consumedToolUseIndex) {
+    if (now - entry.consumedAt > RATLC_CONSUMED_TOOL_TTL_MS) consumedToolUseIndex.delete(id);
+  }
+}
+setInterval(evictConsumedToolUses, 5 * 60_000).unref();
+
+function getPendingToolUseIdsForChannel(channelId) {
+  if (!channelId) return [];
+  const ids = pendingToolUseIdsByChannel.get(channelId);
+  return ids ? [...ids] : [];
+}
+
+function rememberPendingToolUse(channelId, anthropicId) {
+  if (!channelId || !anthropicId) return;
+  let ids = pendingToolUseIdsByChannel.get(channelId);
+  if (!ids) {
+    ids = new Set();
+    pendingToolUseIdsByChannel.set(channelId, ids);
+  }
+  ids.add(anthropicId);
+}
+
+function forgetPendingToolUse(channelId, anthropicId) {
+  if (!channelId || !anthropicId) return;
+  const ids = pendingToolUseIdsByChannel.get(channelId);
+  if (!ids) return;
+  ids.delete(anthropicId);
+  if (ids.size === 0) pendingToolUseIdsByChannel.delete(channelId);
+}
+
+function clearPendingToolUsesForChannel(channelId) {
+  if (!channelId) return;
+  const ids = pendingToolUseIdsByChannel.get(channelId);
+  if (ids) {
+    for (const id of ids) toolUseIndex.delete(id);
+    pendingToolUseIdsByChannel.delete(channelId);
+  }
+  heldToolResultsByChannel.delete(channelId);
+}
+
+function getHeldToolResultsForChannel(channelId) {
+  if (!channelId) return null;
+  return heldToolResultsByChannel.get(channelId) || null;
+}
+
+function rememberHeldToolResults(channelId, requestId, providedById) {
+  if (!channelId || !providedById || providedById.size === 0) return;
+  heldToolResultsByChannel.set(channelId, {
+    requestId,
+    heldAt: Date.now(),
+    providedById: new Map(providedById),
+  });
+}
+
+function mergeHeldToolResults(channelId, requestId, providedById) {
+  const held = getHeldToolResultsForChannel(channelId);
+  if (!held) return providedById;
+  const merged = new Map(held.providedById);
+  for (const [id, value] of providedById) merged.set(id, value);
+  heldToolResultsByChannel.set(channelId, {
+    requestId,
+    heldAt: held.heldAt || Date.now(),
+    providedById: merged,
+  });
+  return merged;
+}
+
+function clearHeldToolResults(channelId) {
+  if (!channelId) return;
+  heldToolResultsByChannel.delete(channelId);
+}
+
+function buildResolvedToolResults(channelId, providedById) {
+  const pendingIds = getPendingToolUseIdsForChannel(channelId);
+  const pending = [];
+  const missing = [];
+  for (const id of pendingIds) {
+    const provided = providedById.get(id);
+    const entry = provided?.entry || toolUseIndex.get(id);
+    if (!entry) continue;
+    pending.push({
+      anthropic_tool_use_id: id,
+      execId: entry.execId,
+      toolUseKey: entry.toolUseKey,
+      content: provided?.content,
+      provided: providedById.has(id),
+    });
+    if (!providedById.has(id)) missing.push(id);
+  }
+  return { pendingIds, pending, missing };
+}
+
+function routeCompleteToolResults({ client, requestId, model, channelId, resolved }) {
+  const ch = channels.get(channelId);
+  if (!ch || ch.state === 'dead') {
+    log(`  ❌ channel ${channelId} no longer alive (state=${ch?.state})`);
+    writeToClient(client, { type: 'error', requestId, message: `channel ${channelId} no longer alive` });
+    return false;
+  }
+  for (const r of resolved) {
+    const entry = toolUseIndex.get(r.anthropic_tool_use_id);
+    toolUseIndex.delete(r.anthropic_tool_use_id);
+    forgetPendingToolUse(channelId, r.anthropic_tool_use_id);
+    rememberConsumedToolUse(r.anthropic_tool_use_id, entry);
+  }
+  clearHeldToolResults(channelId);
+  log(`  ✅ routing ${resolved.length} result(s) to ${channelId} (group=${ch.group}) execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
+  ch.currentRequestId = requestId;
+  ch.state = 'busy';
+  ch.busyAt = Date.now();
+  ch.lastActivityAt = Date.now();
+  requestClient.set(requestId, client);
+  writeToClient(client, {
+    type: 'route_decision', requestId, channelId: ch.id,
+    servedModel: ch.group, requestedModel: model || ch.group,
+    fallback: false, fallbackReason: null,
+  });
+  ch.proc.send({
+    type: 'send_tool_results', requestId,
+    results: resolved.map((r) => ({ execId: r.execId, toolUseKey: r.toolUseKey, content: r.content })),
+  });
+  return true;
+}
+
+function writeRouteDecisionForChannel(client, requestId, ch, model) {
+  if (!client || !ch) return;
+  writeToClient(client, {
+    type: 'route_decision', requestId, channelId: ch.id,
+    servedModel: ch.group, requestedModel: model || ch.group,
+    fallback: false, fallbackReason: null,
+  });
+}
+
+function holdPartialToolResults({ client, requestId, model, channelId, providedById, pendingIds, missing }) {
+  rememberHeldToolResults(channelId, requestId, providedById);
+  const ch = channels.get(channelId);
+  if (!ch || ch.state === 'dead') {
+    log(`  ❌ channel ${channelId} no longer alive while holding partial tool results (state=${ch?.state})`);
+    writeToClient(client, { type: 'error', requestId, message: `channel ${channelId} no longer alive` });
+    return false;
+  }
+  log(`  ⏳ hold partial tool_result batch for ${channelId}; provided=[${[...providedById.keys()].join(', ')}] pending=[${pendingIds.join(', ')}] missing=[${missing.join(', ')}]`);
+  requestClient.set(requestId, client);
+  ch.currentRequestId = requestId;
+  ch.lastActivityAt = Date.now();
+  writeRouteDecisionForChannel(client, requestId, ch, model);
+  for (const missingId of missing) {
+    const missingEntry = toolUseIndex.get(missingId);
+    if (!missingEntry) continue;
+    writeToClient(client, {
+      type: 'tool_use',
+      requestId,
+      anthropic_id: missingId,
+      name: missingEntry.toolName,
+      args: missingEntry.args || {},
+      late: true,
+    });
+  }
+  return true;
+}
+
+function getSessionAffinity(sessionKey) {
+  if (!sessionKey) return null;
+  const entry = sessionAffinity.get(sessionKey);
+  if (!entry) return null;
+  if (Date.now() - entry.lastAccessMs > RATLC_SESSION_TTL_MS) {
+    sessionAffinity.delete(sessionKey);
+    return null;
+  }
+  return entry;
+}
+
+function rememberSessionAffinity(sessionKey, ch, model) {
+  if (!sessionKey || !ch) return;
+  sessionAffinity.set(sessionKey, {
+    channelId: ch.id,
+    group: ch.group,
+    model: model || ch.group,
+    lastAccessMs: Date.now(),
+  });
+}
+
+function evictSessionAffinity(now = Date.now()) {
+  for (const [key, entry] of sessionAffinity) {
+    if (now - entry.lastAccessMs > RATLC_SESSION_TTL_MS) sessionAffinity.delete(key);
+  }
+}
+setInterval(evictSessionAffinity, 5 * 60_000).unref();
 
 // ── Groups ───────────────────────────────────────────────────────────────
 // A Group is a named partition of the pool keyed by `model`. Channels in
@@ -247,7 +460,11 @@ function killTokenImmediately(idx, errorKind, errMsg) {
 
 const requestQueue = [];
 const toolUseIndex = new Map();
+const consumedToolUseIndex = new Map();
+const sessionAffinity = new Map();
 const requestClient = new Map();
+const pendingToolUseIdsByChannel = new Map();
+const heldToolResultsByChannel = new Map();
 
 // Empirical: Cursor only reads tools from requestContextResult ONCE per
 // stream. Tools are pinned at worker open. The contract is GLOBAL across
@@ -407,7 +624,9 @@ function handleWorkerMessage(ch, msg) {
 
     case 'text_delta':
     case 'thinking_delta':
+    case 'thinking_completed':
     case 'server_tool_use':
+    case 'progress':
     case 'tool_use':
     case 'yield':
     case 'step_completed':
@@ -442,6 +661,7 @@ function handleWorkerExit(ch, code, signal) {
     }
   }
   channels.delete(ch.id);
+  clearPendingToolUsesForChannel(ch.id);
   const g = groups.get(ch.group);
   if (g) g.channels.delete(ch.id);
   if (ch.currentRequestId) {
@@ -493,20 +713,46 @@ function forwardToClient(ch, msg) {
 
   if (msg.type === 'tool_use') {
     const anthropic_id = 'toolu_' + randomUUID().replace(/-/g, '').slice(0, 16);
-    toolUseIndex.set(anthropic_id, { channelId: ch.id, execId: msg.execId });
-    ch.pendingExecId = msg.execId;
-    ch.pendingAnthropicId = anthropic_id;
+    toolUseIndex.set(anthropic_id, {
+      channelId: ch.id,
+      execId: msg.execId,
+      toolUseKey: anthropic_id,
+      toolName: msg.name,
+      args: msg.args,
+    });
+    rememberPendingToolUse(ch.id, anthropic_id);
+    try {
+      ch.proc.send({
+        type: 'remember_tool_use',
+        toolUseKey: anthropic_id,
+        info: {
+          id: msg.id,
+          execId: msg.execId,
+          toolCallId: msg.toolCallId,
+          toolName: msg.name,
+          args: msg.args,
+          ...(msg.origin ? { origin: msg.origin } : {}),
+          ...(msg.originKey ? { originKey: msg.originKey } : {}),
+        },
+      });
+    } catch { /* worker may have exited */ }
+      if (!msg.origin) {
+        ch.pendingExecId = msg.execId;
+        ch.pendingAnthropicId = anthropic_id;
+      }
     writeToClient(client, {
       type: 'tool_use',
       requestId: reqId,
       anthropic_id,
-      name: msg.name,
-      args: msg.args,
-    });
+        name: msg.name,
+        args: msg.args,
+        late: ch.currentRequestId !== reqId,
+      });
     return;
   }
 
   if (msg.type === 'yield') {
+    clearPendingToolUsesForChannel(ch.id);
     ch.currentRequestId = null;
     ch.roundsServed = (ch.roundsServed || 0) + 1;
     requestClient.delete(reqId);
@@ -521,6 +767,7 @@ function forwardToClient(ch, msg) {
   }
 
   if (msg.type === 'error') {
+    clearPendingToolUsesForChannel(ch.id);
     requestClient.delete(reqId);
     ch.currentRequestId = null;
     writeToClient(client, { type: 'error', requestId: reqId, message: msg.message });
@@ -541,6 +788,15 @@ function pickReadyChannelInGroup(g) {
   return best;
 }
 
+function pickStickyReadyChannel(job, g) {
+  const sticky = getSessionAffinity(job.sessionKey);
+  if (!sticky || sticky.group !== g.model) return null;
+  const ch = channels.get(sticky.channelId);
+  if (!ch || ch.state !== 'ready' || ch.group !== g.model) return null;
+  sticky.lastAccessMs = Date.now();
+  return ch;
+}
+
 function tryPickForJob(job) {
   const dflt = getDefaultGroup();
   if (!dflt) return null;
@@ -548,7 +804,7 @@ function tryPickForJob(job) {
   if (requestedModel) {
     const g = groups.get(requestedModel);
     if (g && !g.draining) {
-      const ch = pickReadyChannelInGroup(g);
+      const ch = pickStickyReadyChannel(job, g) || pickReadyChannelInGroup(g);
       if (ch) {
         return { channel: ch, servedModel: g.model, fallback: false, fallbackReason: null };
       }
@@ -561,7 +817,7 @@ function tryPickForJob(job) {
       job.fallbackReason = g ? 'group-draining' : 'unknown-model';
     }
   }
-  const ch = pickReadyChannelInGroup(dflt);
+  const ch = pickStickyReadyChannel(job, dflt) || pickReadyChannelInGroup(dflt);
   if (ch) {
     const fallback = !!requestedModel && requestedModel !== dflt.model;
     return {
@@ -589,8 +845,54 @@ function armFallbackTimer(job) {
   }, POOL_GROUP_WAIT_MS);
 }
 
+function armQueueTimeoutTimer(job) {
+  if (job.queueTimer || RATLC_QUEUE_TIMEOUT_MS <= 0) return;
+  job.queueTimer = setTimeout(() => {
+    job.queueTimer = null;
+    const idx = requestQueue.indexOf(job);
+    if (idx === -1) return;
+    requestQueue.splice(idx, 1);
+    clearJobTimers(job);
+    const waitedMs = Date.now() - (job.queuedAt || Date.now());
+    const target = job.routeModel || job.model || POOL_MODEL;
+    log(`req ${job.requestId}: queue timeout after ${waitedMs}ms target=${target}`);
+    writeToClient(job.client, {
+      type: 'error',
+      requestId: job.requestId,
+      code: 'no_ready_timeout',
+      targetModel: target,
+      waitedMs,
+      message: `no ready RATLC channel for ${target} within ${RATLC_QUEUE_TIMEOUT_MS}ms`,
+    });
+  }, RATLC_QUEUE_TIMEOUT_MS);
+}
+
 function clearJobTimers(job) {
   if (job.waitTimer) { clearTimeout(job.waitTimer); job.waitTimer = null; }
+  if (job.queueTimer) { clearTimeout(job.queueTimer); job.queueTimer = null; }
+}
+
+function cancelRequest(requestId, reason = 'cancelled') {
+  if (!requestId) return false;
+  for (let i = 0; i < requestQueue.length; i++) {
+    const job = requestQueue[i];
+    if (job.requestId !== requestId) continue;
+    requestQueue.splice(i, 1);
+    clearJobTimers(job);
+    requestClient.delete(requestId);
+    log(`req ${requestId}: cancelled while queued (${reason})`);
+    return true;
+  }
+  for (const ch of channels.values()) {
+    if (ch.currentRequestId !== requestId) continue;
+    requestClient.delete(requestId);
+    clearPendingToolUsesForChannel(ch.id);
+    log(`req ${requestId}: cancelling active channel ${ch.id} (${reason})`);
+    try { ch.proc.kill('SIGTERM'); } catch { /* ignore */ }
+    return true;
+  }
+  requestClient.delete(requestId);
+  return false;
 }
 
 function drainQueue() {
@@ -621,6 +923,7 @@ function drainQueue() {
 
 function routeRequest(job, pick) {
   const ch = pick.channel;
+  rememberSessionAffinity(job.sessionKey, ch, pick.servedModel);
   ch.currentRequestId = job.requestId;
   ch.state = 'busy';
   ch.busyAt = Date.now();
@@ -636,15 +939,20 @@ function routeRequest(job, pick) {
     fallbackReason: pick.fallbackReason || null,
   });
   if (pick.fallback) {
-    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel}, FALLBACK from ${job.requestedModel || job.model}, reason=${pick.fallbackReason})`);
+    log(`req ${job.requestId}: routed action=${job.action} to ${ch.id} (group=${pick.servedModel}, FALLBACK from ${job.requestedModel || job.model}, reason=${pick.fallbackReason})`);
   } else if (job.routeModel || job.model) {
-    log(`req ${job.requestId}: routed to ${ch.id} (group=${pick.servedModel})`);
+    log(`req ${job.requestId}: routed action=${job.action} to ${ch.id} (group=${pick.servedModel}${job.sessionKey ? `, sticky=${job.sessionKey.slice(0, 48)}` : ''}${job.contextMode ? `, ctx=${job.contextMode}` : ''}${job.hybridReason ? `, reason=${job.hybridReason}` : ''})`);
   }
-  if (job.action === 'send_user_message') {
+  if (job.action === 'send_user_message' || job.action === 'send_native_image_message') {
     ch.proc.send({
-      type: 'send_user_message',
+      type: job.action,
       requestId: job.requestId,
       text: job.payload.text,
+      content: job.payload.content,
+      model: job.routeModel || job.model || null,
+      requestedModel: job.requestedModel || job.model || null,
+      system: job.payload.system || '',
+      tools: job.payload.tools || [],
     });
   } else if (job.action === 'send_tool_result') {
     ch.proc.send({
@@ -732,9 +1040,9 @@ function writeToClient(client, obj) {
 
 function handleClientMessage(client, msg) {
   if (msg.type === 'request') {
-    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model, requestedModel } = msg;
+    const { requestId, action, text, content, anthropic_tool_use_id, system, tools, results, model, requestedModel, sessionKey, contextMode, hybridReason } = msg;
 
-    if (action === 'send_user_message') {
+    if (action === 'send_user_message' || action === 'send_native_image_message') {
       if (POOL_TOOL_MODE === 'contract') {
         const incomingTools = tools || [];
         const isEmptyToolsProbe = incomingTools.length === 0;
@@ -762,18 +1070,23 @@ function handleClientMessage(client, msg) {
 
       const job = {
         requestId, action,
-        payload: { text },
+        payload: { text, content: content || null, system: system || '', tools: tools || [] },
         client,
         model: model || null,
         routeModel: normalizeModelForRouting(model),
         requestedModel: requestedModel || model || null,
+        sessionKey: sessionKey || null,
+        contextMode: contextMode || null,
+        hybridReason: hybridReason || null,
         queuedAt: Date.now(),
         waitTimer: null,
+        queueTimer: null,
         fallbackArmed: false,
         fallbackReason: null,
       };
       requestQueue.push(job);
       armFallbackTimer(job);
+      armQueueTimeoutTimer(job);
       drainQueue();
       const stillQueued = requestQueue.includes(job);
       if (stillQueued) {
@@ -786,29 +1099,38 @@ function handleClientMessage(client, msg) {
       const entry = toolUseIndex.get(anthropic_tool_use_id);
       log(`route send_tool_result requestId=${requestId} anthropic_tool_use_id=${anthropic_tool_use_id} found=${!!entry} indexSize=${toolUseIndex.size}`);
       if (!entry) {
+        const consumed = getConsumedToolUse(anthropic_tool_use_id);
+        if (consumed) {
+          log(`  ↪ duplicate consumed anthropic_tool_use_id=${anthropic_tool_use_id} consumedAgoMs=${Date.now() - consumed.consumedAt}`);
+          writeToClient(client, {
+            type: 'error',
+            requestId,
+            message: `already consumed anthropic_tool_use_id: ${anthropic_tool_use_id}`,
+          });
+          return;
+        }
         log(`  ❌ unknown anthropic_tool_use_id — known ids: [${[...toolUseIndex.keys()].slice(0, 5).join(', ')}${toolUseIndex.size > 5 ? '…' : ''}]`);
         writeToClient(client, { type: 'error', requestId, message: `unknown anthropic_tool_use_id: ${anthropic_tool_use_id}` });
         return;
       }
-      toolUseIndex.delete(anthropic_tool_use_id);
-      const ch = channels.get(entry.channelId);
-      if (!ch || ch.state === 'dead') {
-        log(`  ❌ channel ${entry.channelId} no longer alive (state=${ch?.state})`);
-        writeToClient(client, { type: 'error', requestId, message: `channel ${entry.channelId} no longer alive` });
+      const channelId = entry.channelId;
+      const providedById = mergeHeldToolResults(channelId, requestId, new Map([
+        [anthropic_tool_use_id, { entry, content }],
+      ]));
+      const { pendingIds, pending, missing } = buildResolvedToolResults(channelId, providedById);
+      if (missing.length > 0) {
+        holdPartialToolResults({ client, requestId, model, channelId, providedById, pendingIds, missing });
         return;
       }
-      log(`  ✅ routing to ${entry.channelId} (group=${ch.group}) execId=${entry.execId} (state was ${ch.state})`);
-      ch.currentRequestId = requestId;
-      ch.state = 'busy';
-      ch.busyAt = Date.now();
-      ch.lastActivityAt = Date.now();
-      requestClient.set(requestId, client);
-      writeToClient(client, {
-        type: 'route_decision', requestId, channelId: ch.id,
-        servedModel: ch.group, requestedModel: model || ch.group,
-        fallback: false, fallbackReason: null,
+      routeCompleteToolResults({
+        client, requestId, model, channelId,
+        resolved: pending.map((r) => ({
+          anthropic_tool_use_id: r.anthropic_tool_use_id,
+          execId: r.execId,
+          toolUseKey: r.toolUseKey,
+          content: r.content,
+        })),
       });
-      ch.proc.send({ type: 'send_tool_result', requestId, execId: entry.execId, content });
       return;
     }
 
@@ -819,11 +1141,20 @@ function handleClientMessage(client, msg) {
         return;
       }
       log(`route send_tool_results requestId=${requestId} count=${rs.length} ids=[${rs.map(r => r.anthropic_tool_use_id).join(', ')}] indexSize=${toolUseIndex.size}`);
-      const resolved = [];
+      let providedById = new Map();
       let channelId = null;
       for (const r of rs) {
         const entry = toolUseIndex.get(r.anthropic_tool_use_id);
         if (!entry) {
+          const consumed = getConsumedToolUse(r.anthropic_tool_use_id);
+          if (consumed) {
+            log(`  ↪ duplicate consumed anthropic_tool_use_id=${r.anthropic_tool_use_id} consumedAgoMs=${Date.now() - consumed.consumedAt}`);
+            writeToClient(client, {
+              type: 'error', requestId,
+              message: `already consumed anthropic_tool_use_id: ${r.anthropic_tool_use_id}`,
+            });
+            return;
+          }
           log(`  ❌ unknown anthropic_tool_use_id=${r.anthropic_tool_use_id} — known ids: [${[...toolUseIndex.keys()].slice(0, 5).join(', ')}${toolUseIndex.size > 5 ? '…' : ''}]`);
           writeToClient(client, { type: 'error', requestId, message: `unknown anthropic_tool_use_id: ${r.anthropic_tool_use_id}` });
           return;
@@ -837,29 +1168,22 @@ function handleClientMessage(client, msg) {
           });
           return;
         }
-        resolved.push({ anthropic_tool_use_id: r.anthropic_tool_use_id, execId: entry.execId, content: r.content });
+        providedById.set(r.anthropic_tool_use_id, { entry, content: r.content });
       }
-      const ch = channels.get(channelId);
-      if (!ch || ch.state === 'dead') {
-        log(`  ❌ channel ${channelId} no longer alive (state=${ch?.state})`);
-        writeToClient(client, { type: 'error', requestId, message: `channel ${channelId} no longer alive` });
+      providedById = mergeHeldToolResults(channelId, requestId, providedById);
+      const { pendingIds, pending, missing } = buildResolvedToolResults(channelId, providedById);
+      if (missing.length > 0) {
+        holdPartialToolResults({ client, requestId, model, channelId, providedById, pendingIds, missing });
         return;
       }
-      for (const r of resolved) toolUseIndex.delete(r.anthropic_tool_use_id);
-      log(`  ✅ routing ${resolved.length} result(s) to ${channelId} (group=${ch.group}) execIds=[${resolved.map(r => r.execId).join(', ')}] (state was ${ch.state})`);
-      ch.currentRequestId = requestId;
-      ch.state = 'busy';
-      ch.busyAt = Date.now();
-      ch.lastActivityAt = Date.now();
-      requestClient.set(requestId, client);
-      writeToClient(client, {
-        type: 'route_decision', requestId, channelId: ch.id,
-        servedModel: ch.group, requestedModel: model || ch.group,
-        fallback: false, fallbackReason: null,
-      });
-      ch.proc.send({
-        type: 'send_tool_results', requestId,
-        results: resolved.map((r) => ({ execId: r.execId, content: r.content })),
+      routeCompleteToolResults({
+        client, requestId, model, channelId,
+        resolved: pending.map((r) => ({
+          anthropic_tool_use_id: r.anthropic_tool_use_id,
+          execId: r.execId,
+          toolUseKey: r.toolUseKey,
+          content: r.content,
+        })),
       });
       return;
     }
@@ -868,12 +1192,17 @@ function handleClientMessage(client, msg) {
     return;
   }
 
-  if (msg.type === 'status') {
-    writeToClient(client, statusSnapshot());
-    return;
-  }
+	  if (msg.type === 'status') {
+	    writeToClient(client, statusSnapshot());
+	    return;
+	  }
 
-  if (msg.type === 'list_groups') {
+	  if (msg.type === 'cancel_request') {
+	    cancelRequest(msg.requestId, msg.reason || 'cancel_request');
+	    return;
+	  }
+
+	  if (msg.type === 'list_groups') {
     writeToClient(client, { type: 'groups', groups: groupsSnapshot() });
     return;
   }
@@ -1046,6 +1375,7 @@ function statusSnapshot() {
       busyForMs: ch.state === 'busy' && ch.busyAt ? now - ch.busyAt : null,
       roundsServed: ch.roundsServed,
       currentRequestId: ch.currentRequestId,
+      pendingToolUseIds: getPendingToolUseIdsForChannel(ch.id),
       error: ch.error,
     });
     if (ch.state === 'ready') readyCount++;
@@ -1082,6 +1412,9 @@ function statusSnapshot() {
       readyCount, busyCount, openingCount, deadCount,
       pendingRequests: requestQueue.length,
       toolUseIndex: toolUseIndex.size,
+      pendingToolUseChannels: pendingToolUseIdsByChannel.size,
+      consumedToolUseIndex: consumedToolUseIndex.size,
+      sessionAffinity: sessionAffinity.size,
     },
     config: {
       model: POOL_MODEL,
@@ -1091,6 +1424,9 @@ function statusSnapshot() {
       reinjectThinking: POOL_REINJECT_THINKING ? 1 : 0,
       concurrentOpens: POOL_CONCURRENT_OPENS,
       groupWaitMs: POOL_GROUP_WAIT_MS,
+      queueTimeoutMs: RATLC_QUEUE_TIMEOUT_MS,
+      consumedToolTtlMs: RATLC_CONSUMED_TOOL_TTL_MS,
+      sessionTtlMs: RATLC_SESSION_TTL_MS,
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,
@@ -1119,11 +1455,17 @@ const server = net.createServer((socket) => {
     }
   });
   socket.on('error', () => {});
-  socket.on('close', () => {
-    for (const [reqId, c] of requestClient.entries()) {
-      if (c === socket) requestClient.delete(reqId);
-    }
-  });
+	  socket.on('close', () => {
+	    for (const [reqId, c] of requestClient.entries()) {
+	      if (c !== socket) continue;
+	      const ch = Array.from(channels.values()).find((x) => x.currentRequestId === reqId);
+	      if (ch && getPendingToolUseIdsForChannel(ch.id).length > 0) {
+	        requestClient.delete(reqId);
+	      } else {
+	        cancelRequest(reqId, 'client_socket_closed');
+	      }
+	    }
+	  });
 });
 server.listen(POOL_SOCK, () => {
   const groupSummary = Array.from(groups.values()).map((g) => `${g.model}:${g.targetSize}${g.isDefault ? '(default)' : ''}`).join(', ');

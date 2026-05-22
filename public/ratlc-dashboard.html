@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RATLC 连接池监控</title>
+  <style>
+    :root {
+      --bg: #f4f6f9; --surface: #ffffff; --surface-2: #f8fafc; --bg-elevated: #f8fafc;
+      --panel: #ffffff; --panel-hover: #f1f5f9; --line: #e2e8f0; --line-soft: #f1f5f9;
+      --text: #0f172a; --muted: #64748b;
+      --green: #16a34a; --green-dim: #f0fdf4; --yellow: #ca8a04; --yellow-dim: #fefce8;
+      --red: #dc2626; --red-dim: #fef2f2; --blue: #2563eb; --blue-dim: #eff6ff;
+      --cyan: #0891b2; --cyan-dim: #ecfeff; --purple: #7c3aed; --purple-dim: #f5f3ff;
+      --shadow: 0 1px 3px rgba(15,23,42,.06), 0 4px 16px rgba(15,23,42,.04);
+      --radius: 12px; --radius-sm: 8px;
+      font-family: "SF Pro Text", ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); min-height: 100vh; font-size: 14px; line-height: 1.55; }
+    button, input, select { font: inherit; color: inherit; }
+    a { text-decoration: none; color: inherit; }
+    .shell { display: flex; flex-direction: column; min-height: 100vh; }
+    .topbar { position: sticky; top: 0; z-index: 100; background: var(--surface); border-bottom: 1px solid var(--line); box-shadow: var(--shadow); }
+    .topbar-inner { max-width: 1440px; margin: 0 auto; padding: 0 24px; display: flex; align-items: center; gap: 20px; height: 60px; }
+    .brand { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    .brand-mark { width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(145deg, #3b82f6, #06b6d4); color: #fff; font-weight: 700; font-size: 14px; display: grid; place-items: center; }
+    .brand h1 { font-size: 15px; font-weight: 700; }
+    .brand span { font-size: 11px; color: var(--muted); display: block; margin-top: 1px; }
+    .tabs { display: flex; gap: 4px; flex: 1; overflow-x: auto; }
+    .tab { display: flex; align-items: center; gap: 7px; padding: 8px 14px; border-radius: var(--radius-sm); font-size: 13px; color: var(--muted); border: 1px solid transparent; cursor: pointer; white-space: nowrap; }
+    .tab:hover { background: var(--surface-2); color: var(--text); }
+    .tab.active { background: var(--blue-dim); color: var(--blue); border-color: #bfdbfe; font-weight: 600; }
+    .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: #cbd5e1; flex-shrink: 0; }
+    .tab-dot.ok { background: var(--green); } .tab-dot.warn { background: var(--yellow); } .tab-dot.err { background: var(--red); }
+    .topbar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .subbar { background: var(--surface-2); border-bottom: 1px solid var(--line); }
+    .subbar-inner { max-width: 1440px; margin: 0 auto; padding: 10px 24px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+    .subbar-meta { font-size: 12px; color: var(--muted); flex: 1; min-width: 200px; }
+    .content { max-width: 1440px; margin: 0 auto; padding: 20px 24px 32px; flex: 1; width: 100%; }
+    .auth-strip { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+    .field { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 200px; }
+    .field label { font-size: 12px; font-weight: 600; color: var(--muted); }
+    .field input { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 9px 12px; outline: none; }
+    .field input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+    .field-hint { font-size: 11px; color: var(--muted); min-height: 14px; }
+    .endpoint-chip { font-family: ui-monospace, monospace; font-size: 12px; color: var(--blue); background: var(--blue-dim); padding: 8px 12px; border-radius: var(--radius-sm); border: 1px solid #bfdbfe; align-self: center; }
+    .layout, .sidebar, .logo, .logo-icon, .nav, .nav-item, .card, .card-label, .key-row, .endpoint { display: none; }
+    .btn { border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius-sm); padding: 7px 14px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+    .btn:hover { background: var(--panel-hover); border-color: #cbd5e1; }
+    .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+    .btn.primary:hover { background: #1d4ed8; }
+    .btn.icon { width: 36px; height: 36px; padding: 0; display: grid; place-items: center; }
+    .btn.sm { padding: 4px 10px; font-size: 12px; height: 28px; }
+    .btn.sm.active { background: var(--blue); border-color: var(--blue); color: #fff; }
+    .select { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 7px 10px; height: 36px; font-size: 13px; }
+    .pills { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line-soft); background: var(--panel); }
+    .pill .dot { width: 6px; height: 6px; border-radius: 50%; }
+    .pill.ok { border-color: #bbf7d0; background: var(--green-dim); color: #166534; } .pill.ok .dot { background: var(--green); }
+    .pill.warn { border-color: #fef08a; background: var(--yellow-dim); color: #854d0e; } .pill.warn .dot { background: var(--yellow); }
+    .pill.err { border-color: #fecaca; background: var(--red-dim); color: #991b1b; } .pill.err .dot { background: var(--red); }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }
+    .metric-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .metric-badge { width: 8px; height: 8px; border-radius: 50%; background: #94a3b8; }
+    .metric.good .metric-badge { background: var(--green); } .metric.warn .metric-badge { background: var(--yellow); }
+    .metric.bad .metric-badge { background: var(--red); } .metric.info .metric-badge { background: var(--blue); }
+    .metric.neutral .metric-badge { background: var(--cyan); }
+    .metric-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .metric-value { font-size: 28px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+    .metric.good .metric-value { color: var(--green); } .metric.warn .metric-value { color: var(--yellow); }
+    .metric.bad .metric-value { color: var(--red); } .metric.info .metric-value { color: var(--blue); }
+    .metric-hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+    .workspace { display: grid; grid-template-columns: 1fr 340px; gap: 16px; margin-bottom: 16px; align-items: start; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); margin-bottom: 16px; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line-soft); gap: 12px; }
+    .panel-title { font-size: 13px; font-weight: 650; }
+    .panel-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .panel-actions { display: flex; gap: 4px; align-items: center; }
+    .tag { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); background: var(--bg-elevated); }
+    .tag.ready, .tag.completed { color: #166534; border-color: #bbf7d0; background: var(--green-dim); }
+    .tag.busy, .tag.waiting_tool_result, .tag.tool_use { color: #854d0e; border-color: #fef08a; background: var(--yellow-dim); }
+    .tag.opening, .tag.spawning, .tag.queued, .tag.forwarded, .tag.streaming, .tag.thinking, .tag.routed, .tag.forwarded_tool_result { color: #0e7490; border-color: #a5f3fc; background: var(--cyan-dim); }
+    .tag.dead, .tag.error, .tag.no_ready_timeout, .tag.channel_died, .tag.channel_timeout, .tag.stale_tool_result { color: #991b1b; border-color: #fecaca; background: var(--red-dim); }
+    .groups-grid { padding: 12px 16px; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; border-bottom: 1px solid var(--line); }
+    .group-card { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+    .group-card-head { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 12px; }
+    .group-card-head strong { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%; }
+    .group-legend { display: flex; gap: 8px; margin-top: 6px; font-size: 10px; color: var(--muted); flex-wrap: wrap; }
+    .stack-bar { height: 8px; background: #e2e8f0; border-radius: 999px; overflow: hidden; display: flex; }
+    .stack-bar span { height: 100%; } .stack-bar .s-ready { background: var(--green); } .stack-bar .s-busy { background: var(--yellow); }
+    .stack-bar .s-opening { background: var(--cyan); } .stack-bar .s-dead { background: var(--red); }
+    .filters { display: flex; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+    .filters input, .filters select { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 7px 11px; font-size: 12px; outline: none; }
+    .filters input { flex: 1; min-width: 140px; }
+    .scroll { max-height: 380px; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+    th { color: var(--muted); font-weight: 600; background: var(--bg-elevated); position: sticky; top: 0; z-index: 1; }
+    tr:hover td { background: #f1f5f9; } tr.selected td { background: var(--blue-dim); } tr.clickable { cursor: pointer; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .detail-card { position: sticky; top: 88px; }
+    .detail-body { padding: 12px 14px; display: grid; gap: 14px; max-height: calc(100vh - 120px); overflow: auto; }
+    .detail-section { display: grid; gap: 8px; }
+    .detail-section h4 { font-size: 11px; color: var(--muted); letter-spacing: .05em; padding-bottom: 4px; border-bottom: 1px solid var(--line-soft); }
+    .kv { display: grid; grid-template-columns: 100px 1fr; gap: 6px 10px; font-size: 12px; align-items: start; }
+    .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+    .empty { color: var(--muted); padding: 24px 14px; text-align: center; font-size: 13px; }
+    .footer { color: var(--muted); font-size: 11px; margin-top: 12px; }
+    .section-title { font-size: 14px; font-weight: 650; margin: 20px 0 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+    .section-title:first-child { margin-top: 0; border-top: none; padding-top: 0; }
+    .ring-container { display: flex; gap: 16px; flex-wrap: wrap; padding: 12px 16px; }
+    .ring-card { display: flex; align-items: center; gap: 12px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 16px; flex: 1; min-width: 200px; }
+    .ring { width: 56px; height: 56px; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0; }
+    .ring-inner { font-size: 14px; font-weight: 700; font-variant-numeric: tabular-nums; background: var(--panel); width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; }
+    .ring-meta { display: flex; flex-direction: column; gap: 2px; }
+    .ring-title { font-size: 12px; color: var(--muted); } .ring-detail { font-size: 11px; color: var(--muted); }
+    .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; padding: 12px 16px; }
+    .stat-item { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+    .stat-item .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .stat-item .stat-val { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .pct-bar-group { padding: 12px 16px; display: grid; gap: 12px; }
+    .pct-row { display: grid; grid-template-columns: 100px 1fr 60px; gap: 8px; align-items: center; font-size: 12px; }
+    .pct-label { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pct-track { height: 20px; background: var(--surface-2); border-radius: 4px; display: flex; gap: 1px; overflow: hidden; }
+    .pct-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; font-weight: 600; min-width: 2px; transition: width .3s ease; }
+    .pct-seg.p50 { background: var(--green); } .pct-seg.p95 { background: var(--yellow); } .pct-seg.p99 { background: var(--red); }
+    .pct-val { font-variant-numeric: tabular-nums; text-align: right; color: var(--muted); }
+    .hbar-group { padding: 12px 16px; display: grid; gap: 8px; }
+    .hbar-row { display: grid; grid-template-columns: 90px 1fr 50px; gap: 8px; align-items: center; font-size: 12px; }
+    .hbar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hbar-track { height: 16px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+    .hbar-fill { height: 100%; border-radius: 3px; transition: width .3s ease; }
+    .hbar-val { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+    .event-list { padding: 0 16px 12px; max-height: 300px; overflow: auto; }
+    .event-item { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line-soft); font-size: 12px; align-items: center; }
+    .event-time { color: var(--muted); white-space: nowrap; min-width: 70px; }
+    .event-badge { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .event-badge.open { background: var(--green); } .event-badge.close { background: var(--red); }
+    .event-detail { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .inflight-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; padding: 12px 16px; }
+    .inflight-card { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+    .inflight-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    .inflight-model { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+    .inflight-kv { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; font-size: 11px; }
+    .inflight-kv dt { color: var(--muted); } .inflight-kv dd { margin: 0; font-variant-numeric: tabular-nums; text-align: right; }
+    .stall-bar { height: 4px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+    .stall-fill { height: 100%; border-radius: 2px; transition: width .3s; }
+    .model-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; padding: 12px 16px; }
+    .model-card { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; }
+    .model-card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .model-card-name { font-size: 13px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 65%; }
+    .model-card-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12px; }
+    .model-card-stats dt { color: var(--muted); } .model-card-stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .latency-mini { margin-top: 8px; display: grid; gap: 4px; }
+    .latency-mini-row { display: grid; grid-template-columns: 70px 1fr; gap: 6px; align-items: center; font-size: 11px; }
+    .latency-mini-label { color: var(--muted); }
+    .latency-mini-bar { height: 12px; background: var(--line-soft); border-radius: 3px; display: flex; gap: 1px; overflow: hidden; }
+    .latency-mini-bar span { height: 100%; min-width: 1px; }
+    html { scroll-behavior: smooth; }
+    section[id] { scroll-margin-top: 100px; }
+    .content > section { display: none; }
+    .content > section.active { display: block; }
+    .auth-strip.compact { padding: 8px 16px; }
+    .auth-strip.compact .field { min-width: 120px; }
+    .auth-strip.compact .field-hint { display: none; }
+    .conn-duo { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+    .conn-duo > div { border-right: 1px solid var(--line); }
+    .conn-duo > div:last-child { border-right: none; }
+    @media (max-width: 1200px) { .workspace { grid-template-columns: 1fr; } .detail-card { position: static; } .conn-duo { grid-template-columns: 1fr; } .conn-duo > div { border-right: none; border-bottom: 1px solid var(--line); } }
+    @media (max-width: 768px) { .topbar-inner { flex-wrap: wrap; height: auto; padding: 12px 16px; } .tabs { width: 100%; } .content { padding: 16px; } .metrics { grid-template-columns: repeat(2, 1fr); } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand"><div class="brand-mark">R</div><div><h1>RATLC 连接池</h1><span>Cursor 通道运维</span></div></div>
+        <nav class="tabs">
+          <a class="tab active" href="#overview"><span class="tab-dot ok" id="navDotOverview"></span>总览</a>
+          <a class="tab" href="#performance"><span class="tab-dot" id="navDotPerf"></span>性能</a>
+          <a class="tab" href="#channels"><span class="tab-dot warn" id="navDotChannels"></span>连接通道</a>
+          <a class="tab" href="#connections"><span class="tab-dot" id="navDotConn"></span>连接</a>
+          <a class="tab" href="#requests"><span class="tab-dot" id="navDotRequests"></span>请求日志</a>
+        </nav>
+        <div class="topbar-actions">
+          <select id="refreshRate" class="select" title="自动刷新"><option value="1000">1 秒</option><option value="3000" selected>3 秒</option><option value="5000">5 秒</option><option value="0">暂停</option></select>
+          <button class="btn icon" id="refreshNow" title="立即刷新">&#x27F3;</button>
+        </div>
+      </div>
+      <div class="subbar"><div class="subbar-inner"><div class="subbar-meta" id="poolConfig">加载中…</div><div class="pills" id="statusBar"></div><span class="tag" id="lastUpdated">未刷新</span></div></div>
+    </header>
+    <div class="content">
+      <div class="auth-strip">
+        <div class="field"><label for="apiKey">API 密钥</label><input id="apiKey" type="password" autocomplete="off" placeholder="Bearer Token"><div class="field-hint" id="keyStatus">输入 API Key 后点击查询</div></div>
+        <button class="btn primary" id="queryWithKey" type="button">查询</button>
+        <button class="btn" id="clearKey" type="button">清除</button>
+        <div class="endpoint-chip" id="endpoint">/ratlc</div>
+      </div>
+      <section id="overview" class="active"><div class="metrics" id="overviewMetrics"></div>
+        <div class="panel" id="inflightPanel" style="display:none"><div class="panel-head"><div><div class="panel-title">实时桥接</div><div class="panel-sub" id="inflightSub">-</div></div></div><div class="inflight-grid" id="inflightGrid"></div></div>
+      </section>
+      <section id="performance"><h2 class="section-title">性能统计</h2>
+        <div class="panel"><div class="panel-head"><div><div class="panel-title">运行时性能</div><div class="panel-sub" id="perfSub">-</div></div>
+          <div class="panel-actions"><button class="btn sm active" data-window="last1h" onclick="setPerfWindow(this)">1 小时</button><button class="btn sm" data-window="last24h" onclick="setPerfWindow(this)">24 小时</button><button class="btn sm" data-window="lifetime" onclick="setPerfWindow(this)">全部</button></div></div>
+          <div class="ring-container" id="perfRings"></div><div class="stat-grid" id="perfCounters"></div>
+          <div class="panel-head" style="border-top:1px solid var(--line)"><div><div class="panel-title">延迟百分位</div><div class="panel-sub">p50 / p95 / p99</div></div></div>
+          <div class="pct-bar-group" id="perfLatency"></div>
+          <div class="panel-head" style="border-top:1px solid var(--line)"><div><div class="panel-title">按模型分组</div></div></div>
+          <div class="model-cards" id="perfModels"></div></div>
+      </section>
+      <section id="channels"><h2 class="section-title">连接通道</h2>
+        <div class="panel"><div class="panel-head"><div><div class="panel-title">模型组与连接通道</div><div class="panel-sub" id="channelSub">-</div></div></div>
+          <div class="groups-grid" id="groupBars"></div>
+          <div class="filters"><input id="channelFilter" type="search" placeholder="搜索通道 ID / 模型组…"><select id="channelStateFilter"><option value="">全部状态</option><option value="ready">就绪</option><option value="busy">忙碌</option><option value="opening">启动中</option><option value="dead">异常</option></select></div>
+          <div class="scroll"><table><thead><tr><th style="width:80px">通道</th><th style="width:88px">状态</th><th>模型组</th><th style="width:64px">进程</th><th style="width:72px">开池次数</th><th style="width:64px">服务轮次</th><th style="width:88px">空闲时长</th><th style="width:120px">当前请求</th></tr></thead><tbody id="channelsBody"></tbody></table></div></div>
+      </section>
+      <section id="connections"><h2 class="section-title">连接生命周期</h2>
+        <div class="panel"><div class="panel-head"><div><div class="panel-title">连接概览</div><div class="panel-sub" id="connSub">-</div></div></div>
+          <div class="conn-duo"><div><div class="stat-grid" id="connMetrics"></div></div><div><div class="panel-head"><div><div class="panel-title">关闭原因分布</div></div></div><div class="hbar-group" id="connReasons"></div></div></div>
+          <div class="panel-head" style="border-top:1px solid var(--line)"><div><div class="panel-title">每槽位状态</div></div></div>
+          <div class="scroll" style="max-height:240px"><table><thead><tr><th style="width:60px">槽位</th><th style="width:72px">打开</th><th style="width:72px">关闭</th><th style="width:72px">流转</th><th>当前存活</th></tr></thead><tbody id="connSlotsBody"></tbody></table></div>
+          <div class="panel-head" style="border-top:1px solid var(--line)"><div><div class="panel-title">最近事件</div></div></div><div class="event-list" id="connEvents"></div></div>
+      </section>
+      <section id="requests"><h2 class="section-title">请求日志</h2>
+        <div class="workspace">
+          <div class="panel" style="margin-bottom:0"><div class="panel-head"><div><div class="panel-title">最近请求</div><div class="panel-sub" id="requestSub">-</div></div><span class="tag" id="requestCount">0</span></div>
+            <div class="filters"><input id="requestFilter" type="search" placeholder="搜索请求 ID / 模型 / IP…"><select id="requestStatusFilter"><option value="">全部状态</option><option value="completed">已完成</option><option value="busy">进行中</option><option value="error">错误</option><option value="waiting_tool_result">等待工具</option></select></div>
+            <div class="scroll" style="max-height:420px"><table><thead><tr><th style="width:150px">请求 ID</th><th style="width:100px">状态</th><th style="width:96px">类型</th><th style="width:120px">来源 IP</th><th>模型</th><th style="width:72px">通道</th><th style="width:80px">首字延迟</th><th style="width:80px">总耗时</th><th style="width:72px">输入 Token</th><th style="width:72px">输出 Token</th><th style="width:88px">上下文模式</th></tr></thead><tbody id="requestsBody"></tbody></table></div></div>
+          <aside class="panel detail-card" style="margin-bottom:0"><div class="panel-head"><div><div class="panel-title">请求详情</div><div class="panel-sub">在请求表中选择一行</div></div></div><div class="detail-body" id="requestDetail"><div class="empty">尚未选中请求</div></div></aside>
+        </div>
+      </section>
+      <div class="footer">数据来源：/health · /ratlc/requests · /stats · /stats/connections · /stats/inflight</div>
+    </div>
+  </div>
+<script>
+const $=id=>document.getElementById(id);
+const state={health:null,requests:[],selectedId:null,timer:null,stats:null,connStats:null,inflight:[],perfWindow:'last1h'};
+const STATUS_ZH={ready:'就绪',busy:'忙碌',opening:'启动中',spawning:'孵化中',dead:'异常',completed:'已完成',queued:'排队中',forwarded:'已转发',streaming:'流传输中',thinking:'思考中',waiting_tool_result:'等待工具结果',tool_use:'工具调用',error:'错误',no_ready_timeout:'无可用连接超时',channel_died:'连接已断开',channel_timeout:'连接超时',stale_tool_result:'过期工具结果',routed:'已路由',forwarded_tool_result:'已转发工具结果'};
+const KIND_ZH={user_message:'用户消息',tool_result:'工具结果'};
+const CLOSE_ZH={goaway:'GOAWAY',error:'错误',closed:'正常关闭','idle-recycle':'空闲回收',poison:'中毒',shutdown:'停机',unknown:'未知'};
+const LATENCY_ZH={durationMs:'总耗时',firstFrameMs:'首帧延迟',firstTextMs:'首文本',firstToolMs:'首工具',maxIdleMs:'最大空闲',inputTokens:'输入Token',outputTokens:'输出Token'};
+function statusZh(s){return STATUS_ZH[s]||s||'-'}
+function kindZh(k){return KIND_ZH[k]||k||'-'}
+function getKey(){return localStorage.getItem('ratlc_api_key')||''}
+function setKey(v){localStorage.setItem('ratlc_api_key',v||'')}
+function loadKeyFromUrl(){const p=new URLSearchParams(window.location.search);const k=p.get('key')||p.get('api_key')||p.get('token');if(!k)return false;setKey(k.trim());window.history.replaceState({},'',window.location.pathname+window.location.hash);return true}
+function headers(){const k=getKey();return k?{Authorization:'Bearer '+k}:{}}
+function setKeyStatus(t,tone){const el=$('keyStatus');el.textContent=t;el.style.color=tone==='bad'?'var(--red)':tone==='good'?'var(--green)':'var(--muted)'}
+function fmtMs(v){if(v==null||Number.isNaN(Number(v)))return'-';const n=Number(v);if(n<1000)return Math.round(n)+' ms';return(n/1000).toFixed(n<10000?1:0)+' s'}
+function fmtAge(ts){return ts?fmtMs(Date.now()-ts)+'前':'-'}
+function fmtPct(v){return v!=null?(v*100).toFixed(1)+'%':'-'}
+function fmtNum(v){return v!=null?v.toLocaleString('zh-CN'):'-'}
+function clsStatus(s){if(s==='ready'||s==='completed')return'ready';if(s==='busy'||s==='waiting_tool_result'||s==='tool_use')return'busy';if(['opening','spawning','queued','forwarded','streaming','thinking','routed','forwarded_tool_result'].includes(s))return'opening';if(['dead','error','no_ready_timeout','channel_died','channel_timeout','stale_tool_result'].includes(s))return'dead';return''}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function median(vals){const a=vals.filter(v=>Number.isFinite(v)).sort((a,b)=>a-b);return a.length?a[Math.floor(a.length/2)]:null}
+async function fetchJson(url){const r=await fetch(url,{headers:headers(),cache:'no-store'});if(!r.ok)throw new Error(url+' HTTP '+r.status);return r.json()}
+async function refresh(){try{if(!getKey()){setKeyStatus('请输入 API Key 后查询','bad');return}const[health,requests,stats,connStats,inflight]=await Promise.all([fetchJson('/health'),fetchJson('/ratlc/requests?limit=120'),fetchJson('/stats?window='+state.perfWindow).catch(()=>null),fetchJson('/stats/connections?recent=30').catch(()=>null),fetchJson('/stats/inflight').catch(()=>null)]);state.health=health;state.requests=requests.items||[];state.stats=stats;state.connStats=connStats;state.inflight=(inflight&&inflight.bridges)||(Array.isArray(inflight)?inflight:[]);setKeyStatus('查询成功 · '+new Date().toLocaleTimeString('zh-CN'),'good');render()}catch(err){$('lastUpdated').textContent=err.message;$('lastUpdated').className='tag dead';setKeyStatus(/401|403|auth/i.test(err.message)?'鉴权失败，请检查 API Key':err.message,'bad')}}
+function setPerfWindow(btn){document.querySelectorAll('[data-window]').forEach(b=>b.classList.remove('active'));btn.classList.add('active');state.perfWindow=btn.dataset.window;fetchJson('/stats?window='+state.perfWindow).then(s=>{state.stats=s;renderPerformance()}).catch(()=>{})}
+function render(){const ratlc=state.health?.ratlc||{};$('lastUpdated').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');$('lastUpdated').className='tag ready';const cfg=ratlc.config||{};$('poolConfig').textContent=[ratlc.poolUrl||'未配置连接池',(state.health?.upstreamTransport||'-')+' 上游',(state.health?.downstreamProtocol||'-')+' 下游',cfg.contextMode?'上下文 '+cfg.contextMode:''].filter(Boolean).join(' · ');renderStatusBar();renderOverview();renderInflight();renderPerformance();renderGroups(ratlc.groups||[]);renderChannels(ratlc.channels||[]);$('channelSub').textContent=(ratlc.actualSize||0)+' 个活跃通道 / 目标 '+(ratlc.configuredSize||0);renderConnections();renderRequests(filterRequests());renderDetail()}
+function renderStatusBar(){const ratlc=state.health?.ratlc||{};const pills=[];pills.push(ratlc.enabled?'<span class="pill ok"><span class="dot"></span>RATLC 已启用</span>':'<span class="pill warn"><span class="dot"></span>RATLC 未启用</span>');pills.push(ratlc.reachable!==false?'<span class="pill ok"><span class="dot"></span>连接池可达</span>':'<span class="pill err"><span class="dot"></span>连接池不可达'+(ratlc.error?'：'+esc(ratlc.error):'')+'</span>');pills.push('<span class="pill"><span class="dot"></span>通道 '+(ratlc.actualSize||0)+'/'+(ratlc.configuredSize||0)+'</span>');const completed=state.requests.filter(r=>r.status==='completed').length;const errors=state.requests.filter(r=>clsStatus(r.status)==='dead').length;if(state.requests.length){const rate=Math.round(completed/state.requests.length*100);pills.push('<span class="pill '+(rate>=90?'ok':rate>=70?'warn':'err')+'"><span class="dot"></span>成功率 '+rate+'%</span>');if(errors)pills.push('<span class="pill err"><span class="dot"></span>'+errors+' 条异常</span>')}$('statusBar').innerHTML=pills.join('');$('navDotOverview').className='tab-dot '+(ratlc.reachable!==false?'ok':'err');$('navDotChannels').className='tab-dot '+((ratlc.dead||0)>0?'warn':'ok');$('navDotRequests').className='tab-dot '+(errors>0?'err':'ok');const rt=state.health?.runtime;$('navDotPerf').className='tab-dot '+(rt&&rt.successRate!=null?(rt.successRate>=0.9?'ok':rt.successRate>=0.7?'warn':'err'):'');$('navDotConn').className='tab-dot '+(state.connStats?'ok':'')}
+function renderOverview(){const ratlc=state.health?.ratlc||{};const rt=state.health?.runtime||{};const ttft=median(state.requests.map(r=>r.firstByteMs));const cards=[{label:'就绪',val:ratlc.ready||0,cls:'good',hint:'可立即接收请求'},{label:'忙碌',val:ratlc.busy||0,cls:'warn',hint:'正在处理请求'},{label:'启动中',val:ratlc.opening||0,cls:'info',hint:'开池或重试连接'},{label:'异常',val:ratlc.dead||0,cls:'bad',hint:'已退出或失败'},{label:'排队',val:ratlc.pendingRequests||0,cls:'neutral',hint:'等待可用通道'},{label:'首字延迟 P50',val:fmtMs(ttft),cls:'',hint:'最近请求 TTFT 中位数'},{label:'成功率 (1h)',val:fmtPct(rt.successRate),cls:rt.successRate>=0.9?'good':rt.successRate>=0.7?'warn':rt.total>0?'bad':'',hint:'近 1 小时成功率'},{label:'首次成功率',val:fmtPct(rt.firstTryRate),cls:rt.firstTryRate>=0.8?'good':rt.firstTryRate>=0.6?'warn':rt.total>0?'bad':'',hint:'无需重试即成功'}];$('overviewMetrics').innerHTML=cards.map(c=>'<div class="metric '+c.cls+'"><div class="metric-head"><span class="metric-label">'+esc(c.label)+'</span><span class="metric-badge"></span></div><div class="metric-value">'+esc(c.val)+'</div><div class="metric-hint">'+esc(c.hint)+'</div></div>').join('')}
+function renderInflight(){const bridges=state.inflight.filter(b=>b.inFlight);if(!bridges.length){$('inflightPanel').style.display='none';return}$('inflightPanel').style.display='';$('inflightSub').textContent=bridges.length+' 个活跃桥接';$('inflightGrid').innerHTML=bridges.map(b=>{const stallPct=(b.currentThresholdMs&&b.willTripStallInMs!=null)?Math.max(0,Math.min(100,100-(b.willTripStallInMs/b.currentThresholdMs*100))):0;const stallColor=stallPct>80?'var(--red)':stallPct>50?'var(--yellow)':'var(--green)';return'<div class="inflight-card"><div class="inflight-head"><span class="inflight-model" title="'+esc(b.model)+'">'+esc(b.model)+'</span><span class="tag '+(b.hasEmittedContent?'opening':'busy')+'">'+(b.hasEmittedContent?'生成中':'等待')+'</span></div><dl class="inflight-kv"><dt>空闲</dt><dd>'+fmtMs(b.idleMsSinceLastUsefulFrame)+'</dd><dt>停滞预算</dt><dd>'+fmtMs(b.willTripStallInMs)+'</dd><dt>文本 delta</dt><dd>'+(b.textDeltaCount||0)+'</dd><dt>思考 delta</dt><dd>'+(b.thinkingDeltaCount||0)+'</dd><dt>接收字节</dt><dd>'+fmtNum(b.bytesInTotal)+'</dd><dt>重试</dt><dd>'+(b.retryAttempts||0)+'</dd></dl><div class="stall-bar"><div class="stall-fill" style="width:'+stallPct+'%;background:'+stallColor+'"></div></div></div>'}).join('')}
+function renderPerformance(){const s=state.stats;if(!s||!s.totals){$('perfRings').innerHTML=$('perfCounters').innerHTML=$('perfLatency').innerHTML=$('perfModels').innerHTML='';$('perfSub').textContent='暂无数据';return}const t=s.totals;$('perfSub').textContent='总请求 '+fmtNum(t.total)+' · 时间窗口 '+({last1h:'近 1 小时',last24h:'近 24 小时',lifetime:'全部时间'}[s.window]||s.window);const ringHtml=(rate,color,title,detail)=>{const pct=rate!=null?rate*100:0;const bg=rate!=null?'conic-gradient('+color+' '+pct+'%, var(--line) '+pct+'%)':'var(--line)';return'<div class="ring-card"><div class="ring" style="background:'+bg+'"><div class="ring-inner">'+fmtPct(rate)+'</div></div><div class="ring-meta"><div class="ring-title">'+esc(title)+'</div><div class="ring-detail">'+esc(detail)+'</div></div></div>'};$('perfRings').innerHTML=ringHtml(t.successRate,'var(--green)','成功率',t.success+' / '+t.total)+ringHtml(t.firstTryRate,'var(--blue)','首次成功率',(t.success-(t.recovered||0))+' / '+t.total);$('perfCounters').innerHTML=[['总请求',fmtNum(t.total)],['成功',fmtNum(t.success)],['失败',fmtNum(t.fail)],['重试次数',fmtNum(t.totalRetries)],['停滞',fmtNum(t.totalStalls)],['传输错误',fmtNum(t.totalTransportErrors)],['级联检测',fmtNum(t.totalCascades)],['工具调用',fmtNum(t.totalToolCalls)]].map(([l,v])=>'<div class="stat-item"><div class="stat-label">'+l+'</div><div class="stat-val">'+v+'</div></div>').join('');const groups=s.groups||{};const allModels=Object.keys(groups);const firstModel=allModels[0];const latencyKeys=firstModel?Object.keys(groups[firstModel]).filter(k=>k.endsWith('Ms')||k==='inputTokens'||k==='outputTokens'):[];const merged={};for(const k of latencyKeys){const vals=allModels.map(m=>groups[m][k]).filter(v=>v&&v.n>0);if(!vals.length)continue;merged[k]={p50:vals[0].p50,p95:vals[0].p95,p99:vals[0].p99,n:vals.reduce((s,v)=>s+v.n,0)}}const maxLatency=Math.max(1,...Object.values(merged).map(v=>v.p99||0));$('perfLatency').innerHTML=Object.entries(merged).map(([k,v])=>{const label=LATENCY_ZH[k]||k;const w50=Math.max(1,(v.p50||0)/maxLatency*100);const w95=Math.max(1,((v.p95||0)-(v.p50||0))/maxLatency*100);const w99=Math.max(1,((v.p99||0)-(v.p95||0))/maxLatency*100);const isMs=k.endsWith('Ms');const fmt=isMs?fmtMs:fmtNum;return'<div class="pct-row"><span class="pct-label" title="'+esc(label)+'">'+esc(label)+'</span><div class="pct-track"><div class="pct-seg p50" style="width:'+w50+'%" title="p50: '+fmt(v.p50)+'">'+(w50>8?fmt(v.p50):'')+'</div><div class="pct-seg p95" style="width:'+w95+'%" title="p95: '+fmt(v.p95)+'">'+(w95>8?fmt(v.p95):'')+'</div><div class="pct-seg p99" style="width:'+w99+'%" title="p99: '+fmt(v.p99)+'">'+(w99>8?fmt(v.p99):'')+'</div></div><span class="pct-val">n='+v.n+'</span></div>'}).join('')||'<div class="empty">暂无延迟数据</div>';$('perfModels').innerHTML=allModels.map(m=>{const g=groups[m];const maxLat=Math.max(1,...Object.entries(g).filter(([k])=>k.endsWith('Ms')).map(([,v])=>v?.p99||0));return'<div class="model-card"><div class="model-card-head"><span class="model-card-name" title="'+esc(m)+'">'+esc(m)+'</span><span class="tag '+(g.successRate>=0.9?'ready':g.successRate>=0.7?'busy':'dead')+'">'+fmtPct(g.successRate)+'</span></div><dl class="model-card-stats"><dt>总请求</dt><dd>'+fmtNum(g.total)+'</dd><dt>首次成功</dt><dd>'+fmtPct(g.firstTryRate)+'</dd><dt>重试</dt><dd>'+fmtNum(g.totalRetries)+'</dd><dt>停滞</dt><dd>'+fmtNum(g.totalStalls)+'</dd></dl><div class="latency-mini">'+Object.entries(g).filter(([k,v])=>k.endsWith('Ms')&&v&&v.n>0).map(([k,v])=>{const w50=Math.max(1,(v.p50||0)/maxLat*100);const w95=Math.max(0,((v.p95||0)-(v.p50||0))/maxLat*100);const w99=Math.max(0,((v.p99||0)-(v.p95||0))/maxLat*100);return'<div class="latency-mini-row"><span class="latency-mini-label">'+(LATENCY_ZH[k]||k)+'</span><div class="latency-mini-bar" title="p50='+fmtMs(v.p50)+' p95='+fmtMs(v.p95)+' p99='+fmtMs(v.p99)+'"><span class="p50" style="width:'+w50+'%;background:var(--green)"></span><span class="p95" style="width:'+w95+'%;background:var(--yellow)"></span><span class="p99" style="width:'+w99+'%;background:var(--red)"></span></div></div>'}).join('')+'</div></div>'}).join('')||'<div class="empty" style="grid-column:1/-1">暂无模型数据</div>'}
+function renderConnections(){const c=state.connStats;if(!c){$('connMetrics').innerHTML=$('connReasons').innerHTML=$('connSlotsBody').innerHTML=$('connEvents').innerHTML='';$('connSub').textContent='暂无数据';return}$('connSub').textContent='当前 '+(c.currentlyOpen||0)+' 个活跃连接';$('connMetrics').innerHTML=[['当前活跃',c.currentlyOpen||0],['总打开',fmtNum(c.totalOpens)],['总关闭',fmtNum(c.totalCloses)],['存活 p50',fmtMs(c.lifetimeMs?.p50)],['存活 p95',fmtMs(c.lifetimeMs?.p95)],['存活 p99',fmtMs(c.lifetimeMs?.p99)],['流/连接 p50',c.streamsPerConnection?.p50??'-'],['流/连接 p95',c.streamsPerConnection?.p95??'-']].map(([l,v])=>'<div class="stat-item"><div class="stat-label">'+l+'</div><div class="stat-val">'+v+'</div></div>').join('');const reasons=c.closeReasonCounts||{};const maxCount=Math.max(1,...Object.values(reasons));const colors={goaway:'var(--yellow)',error:'var(--red)',closed:'var(--green)','idle-recycle':'var(--cyan)',poison:'var(--red)',shutdown:'var(--blue)'};$('connReasons').innerHTML=Object.entries(reasons).sort((a,b)=>b[1]-a[1]).map(([k,v])=>'<div class="hbar-row"><span class="hbar-label">'+(CLOSE_ZH[k]||k)+'</span><div class="hbar-track"><div class="hbar-fill" style="width:'+(v/maxCount*100)+'%;background:'+(colors[k]||'var(--muted)')+'"></div></div><span class="hbar-val">'+v+'</span></div>').join('')||'<div class="empty">暂无关闭记录</div>';const slots=c.perSlot||{};$('connSlotsBody').innerHTML=Object.entries(slots).map(([k,s])=>'<tr><td class="mono">'+esc(k)+'</td><td>'+s.opens+'</td><td>'+s.closes+'</td><td>'+s.churn+'</td><td>'+(s.currentAgeMs!=null?fmtMs(s.currentAgeMs):'<span style="color:var(--muted)">-</span>')+'</td></tr>').join('')||'<tr><td colspan="5" class="empty">暂无槽位</td></tr>';const events=c.recentEvents||[];$('connEvents').innerHTML=events.slice().reverse().map(e=>{const time=new Date(e.ts).toLocaleTimeString('zh-CN');const isOpen=e.event==='open';let detail='槽位 '+e.slot+' '+(isOpen?'打开':'关闭');if(!isOpen&&e.closeReason)detail+=' · '+(CLOSE_ZH[e.closeReason]||e.closeReason);if(!isOpen&&e.ageMs!=null)detail+=' · 存活 '+fmtMs(e.ageMs);if(!isOpen&&e.streamsServed!=null)detail+=' · '+e.streamsServed+' 流';return'<div class="event-item"><span class="event-time">'+time+'</span><span class="event-badge '+(isOpen?'open':'close')+'"></span><span class="event-detail">'+esc(detail)+'</span></div>'}).join('')||'<div class="empty">暂无事件</div>'}
+function renderGroups(groups){if(!groups.length){$('groupBars').innerHTML='<div class="empty" style="grid-column:1/-1">暂无模型组</div>';return}$('groupBars').innerHTML=groups.map(g=>{const total=Math.max(g.target||g.actual||1,1);const pct=n=>Math.round((n||0)/total*100);const label=g.isDefault?' · 默认':(g.draining?' · 排空中':'');return'<div class="group-card"><div class="group-card-head"><strong title="'+esc(g.model)+'">'+esc(g.model)+label+'</strong><span>'+(g.ready||0)+'/'+(g.target||0)+'</span></div><div class="stack-bar" title="就绪 '+(g.ready||0)+' · 忙碌 '+(g.busy||0)+' · 启动 '+(g.opening||0)+' · 异常 '+(g.dead||0)+'"><span class="s-ready" style="width:'+pct(g.ready)+'%"></span><span class="s-busy" style="width:'+pct(g.busy)+'%"></span><span class="s-opening" style="width:'+pct(g.opening)+'%"></span><span class="s-dead" style="width:'+pct(g.dead)+'%"></span></div><div class="group-legend"><span>就绪 '+(g.ready||0)+'</span><span>忙碌 '+(g.busy||0)+'</span><span>启动 '+(g.opening||0)+'</span><span>异常 '+(g.dead||0)+'</span></div></div>'}).join('')}
+function filterChannels(channels){const q=($('channelFilter').value||'').trim().toLowerCase();const st=$('channelStateFilter').value;return channels.filter(ch=>{if(st&&clsStatus(ch.state)!==st&&ch.state!==st)return false;if(!q)return true;return[ch.id,ch.group,ch.currentRequestId].some(v=>String(v||'').toLowerCase().includes(q))})}
+function renderChannels(channels){const filtered=filterChannels(channels);if(!filtered.length){$('channelsBody').innerHTML='<tr><td colspan="8" class="empty">'+(channels.length?'无匹配通道':'暂无通道数据')+'</td></tr>';return}$('channelsBody').innerHTML=filtered.map(ch=>'<tr><td class="mono">'+esc(ch.id)+'</td><td><span class="tag '+clsStatus(ch.state)+'" title="'+esc(ch.state)+'">'+esc(statusZh(ch.state))+'</span></td><td title="'+esc(ch.group||'')+'">'+esc(ch.group||'-')+'</td><td class="mono">'+esc(ch.pid||'-')+'</td><td>'+esc(ch.openAttempts||0)+'</td><td>'+esc(ch.roundsServed||0)+'</td><td>'+fmtMs(ch.idleMs)+'</td><td class="mono" title="'+esc(ch.currentRequestId||'')+'">'+esc(ch.currentRequestId||'-')+'</td></tr>').join('')}
+function filterRequests(){const q=($('requestFilter').value||'').trim().toLowerCase();const st=$('requestStatusFilter').value;return state.requests.filter(r=>{if(st==='busy'){if(!['busy','streaming','thinking','queued','forwarded','routed','forwarded_tool_result','opening'].includes(r.status))return false}else if(st==='error'){if(clsStatus(r.status)!=='dead')return false}else if(st&&r.status!==st)return false;if(!q)return true;return[r.requestId,r.model,r.servedModel,r.routeModel,r.requestIp,r.channelId].some(v=>String(v||'').toLowerCase().includes(q))})}
+function renderRequests(requests){$('requestCount').textContent=String(requests.length);$('requestSub').textContent=requests.length?'显示 '+requests.length+' / '+state.requests.length+' 条':'暂无请求记录';if(!requests.length){$('requestsBody').innerHTML='<tr><td colspan="11" class="empty">'+(state.requests.length?'无匹配请求':'暂无请求')+'</td></tr>';return}$('requestsBody').innerHTML=requests.map(r=>'<tr class="clickable req-row'+(state.selectedId===r.requestId?' selected':'')+'" data-id="'+esc(r.requestId)+'"><td class="mono" title="'+esc(r.requestId)+'">'+esc(r.requestId)+'</td><td><span class="tag '+clsStatus(r.status)+'">'+esc(statusZh(r.status))+'</span></td><td>'+esc(kindZh(r.kind))+'</td><td class="mono">'+esc(r.requestIp||'-')+'</td><td title="'+esc(r.servedModel||r.routeModel||r.model||'')+'">'+esc(r.servedModel||r.routeModel||r.model||'-')+'</td><td class="mono">'+esc(r.channelId||'-')+'</td><td>'+fmtMs(r.firstByteMs)+'</td><td>'+fmtMs(r.durationMs)+'</td><td>'+esc(r.inputTokensEstimate??'-')+'</td><td>'+esc(r.outputTokens??'-')+'</td><td>'+esc(r.effectiveContextMode||r.contextMode||'-')+'</td></tr>').join('');document.querySelectorAll('.req-row').forEach(row=>{row.addEventListener('click',()=>{state.selectedId=row.dataset.id;renderRequests(filterRequests());renderDetail();document.querySelector('.detail-card')?.scrollIntoView({behavior:'smooth',block:'nearest'})})});if(!state.selectedId&&requests[0])state.selectedId=requests[0].requestId}
+function renderDetail(){const r=state.requests.find(x=>x.requestId===state.selectedId);if(!r){$('requestDetail').innerHTML='<div class="empty">尚未选中请求</div>';return}const sections=[{title:'基本信息',fields:[['请求 ID',r.requestId,true],['状态',statusZh(r.status)],['类型',kindZh(r.kind)],['来源 IP',r.requestIp],['转发来源',r.forwardedFor],['开始时间',r.startedAt?new Date(r.startedAt).toLocaleString('zh-CN'):'-'],['距今',fmtAge(r.startedAt)]]},{title:'路由与模型',fields:[['请求模型',r.model],['路由模型',r.routeModel],['实际模型',r.servedModel],['通道 ID',r.channelId,true],['是否降级',r.fallback?(r.fallbackReason||'是'):'否'],['会话标识',r.sessionKey||r.clientSessionId,true]]},{title:'性能指标',fields:[['首字延迟',fmtMs(r.firstByteMs)],['总耗时',fmtMs(r.durationMs)],['输入 Token',r.inputTokensEstimate],['输出 Token',r.outputTokens],['消息数',r.messageCount],['工具数',r.toolCount],['工具结果数',r.toolResultCount],['Web 搜索',r.serverWebSearchRequests]]},{title:'上下文',fields:[['上下文模式',r.contextMode],['实际模式',r.effectiveContextMode],['混合原因',r.hybridReason],['错误信息',r.error]]}];$('requestDetail').innerHTML=sections.map(sec=>'<div class="detail-section"><h4>'+esc(sec.title)+'</h4><dl class="kv">'+sec.fields.map(([k,v,mono])=>'<dt>'+esc(k)+'</dt><dd class="'+(mono?'mono':'')+'">'+esc(v==null||v===''?'-':v)+'</dd>').join('')+'</dl></div>').join('')}
+function resetTimer(){if(state.timer)clearInterval(state.timer);const ms=Number($('refreshRate').value);if(ms>0)state.timer=setInterval(refresh,ms)}
+const loadedFromUrl=loadKeyFromUrl();$('apiKey').value=getKey();if(loadedFromUrl)setKeyStatus('已从 URL 读取 API Key','good');
+$('apiKey').addEventListener('input',e=>setKey(e.target.value.trim()));
+$('apiKey').addEventListener('keydown',e=>{if(e.key==='Enter')refresh()});
+$('queryWithKey').addEventListener('click',refresh);
+$('clearKey').addEventListener('click',()=>{$('apiKey').value='';setKey('');state.health=null;state.requests=[];state.selectedId=null;state.stats=null;state.connStats=null;state.inflight=[];setKeyStatus('已清除 API Key','muted');render()});
+$('refreshRate').addEventListener('change',resetTimer);
+$('refreshNow').addEventListener('click',refresh);
+['channelFilter','channelStateFilter'].forEach(id=>{$(id).addEventListener('input',()=>renderChannels(state.health?.ratlc?.channels||[]));$(id).addEventListener('change',()=>renderChannels(state.health?.ratlc?.channels||[]))});
+['requestFilter','requestStatusFilter'].forEach(id=>{$(id).addEventListener('input',()=>renderRequests(filterRequests()));$(id).addEventListener('change',()=>renderRequests(filterRequests()))});
+
+function switchTab(hash){const id=hash.replace('#','');document.querySelectorAll('.content > section').forEach(s=>s.classList.toggle('active',s.id===id));document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.getAttribute('href')==='#'+id))}
+document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',e=>{e.preventDefault();const h=t.getAttribute('href');switchTab(h);history.replaceState(null,'',h)}));
+if(location.hash)switchTab(location.hash);
+resetTimer();refresh();
+</script>
+</body>
+</html>

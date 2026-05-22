@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════
 
 const http2 = require('http2');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4 } = require('./uuid');
 const config = require('./config');
 
 // ── Checksum 生成 ──

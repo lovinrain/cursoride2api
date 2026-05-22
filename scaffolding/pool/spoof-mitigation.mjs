@@ -243,7 +243,7 @@ export function formatSearchResults(query, results, opts = {}) {
   }
   lines.push(
     'You may quote these results directly. If you need the full page contents, ' +
-      'use Cursor-native WebSearch again with a more specific query, or Bash/curl for a user-explicit URL when the environment permits it. Do NOT use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch. Do NOT ' +
+      'use Cursor-native WebSearch again with a more specific query, or WebFetch/Fetch for a user-explicit URL. Do NOT use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch. Do NOT ' +
       'fabricate facts beyond what these results contain.'
   );
   return lines.join('\n');
@@ -263,8 +263,8 @@ export function fallbackNoticeBody(reason) {
     'client side does NOT perform a web fetch.\n\n' +
     'WHAT TO DO INSTEAD:\n' +
     '  - To search or look up public web information: use Cursor-native WebSearch.\n' +
-    '  - For a user-explicit URL fetch or curl test, Bash/curl is allowed when the environment permits it.\n' +
-    '  - Do NOT use client-declared WebFetch/Fetch as a substitute for Cursor-native WebSearch.\n' +
+    '  - For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it.\n' +
+    '  - Do NOT use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.\n' +
     '  - If you cannot fulfill the user request without web access, tell the user ' +
     'that and call `bajie_yield`.\n\n' +
     'DO NOT narrate web content as if you had fetched it. DO NOT quote this ' +

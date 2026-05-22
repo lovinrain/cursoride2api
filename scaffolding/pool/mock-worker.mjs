@@ -6,7 +6,7 @@
 //   spawning → ready (after ~50ms) → busy → ready → ...
 //
 // Behavior on each request:
-//   send_user_message  → emits one text_delta + yield within ~25ms.
+//   send_user_message / send_native_image_message → emits one text_delta + yield within ~25ms.
 //   send_tool_result   → emits one text_delta + yield within ~25ms.
 //   send_tool_results  → same.
 //   ping               → emits yield within ~10ms.
@@ -73,9 +73,36 @@ process.on('message', (msg) => {
     }, 10);
     return;
   }
-  if (msg.type === 'send_user_message' || msg.type === 'send_tool_result' || msg.type === 'send_tool_results') {
+  if (msg.type === 'send_user_message' || msg.type === 'send_native_image_message' || msg.type === 'send_tool_result' || msg.type === 'send_tool_results') {
     setState('busy');
     setTimeout(() => {
+      if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_TOOL_USE__')) {
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}`,
+          name: 'MockTool',
+          args: { ok: true },
+        });
+        return;
+      }
+      if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_TWO_TOOL_USES__')) {
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}-a`,
+          name: 'MockTool',
+          args: { n: 1 },
+        });
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}-b`,
+          name: 'MockTool',
+          args: { n: 2 },
+        });
+        return;
+      }
       send({ type: 'text_delta', requestId: msg.requestId, text: `[mock ${CHANNEL_ID}/${MODEL}] ack` });
       send({ type: 'yield', requestId: msg.requestId });
       setState('ready');
