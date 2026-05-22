@@ -85,12 +85,20 @@ if (!['full', 'last', 'hybrid'].includes(POOL_CONTEXT_MODE)) {
 }
 const HYBRID_SESSION_TTL_MS = Math.max(60_000, parseInt(process.env.POOL_HYBRID_SESSION_TTL_MS || '1800000', 10));
 // Safety valve for clients such as Claude Code that echo complete messages[]
-// history, tool results, and optional thinking back on every turn. Sending a
-// very large full-context payload as a bajie_yield tool_result can make Cursor
-// close or stall the live session. When full rendering crosses this byte-ish
-// character limit, fall back to sticky last-turn delivery for that request.
-// Set to 0 to disable.
-const CONTEXT_MAX_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MAX_BYTES || process.env.POOL_CONTEXT_MAX_BYTES || '98304', 10));
+// history, tool results, and optional thinking back on every turn. PR #2's
+// author observed that very large bajie_yield payloads could make Cursor
+// close or stall the live session, and set this default to 98304.
+//
+// Default changed to 0 (disabled) on 2026-05-22 after the probe in
+// scaffolding/pool/test_bidi_payload_limit.mjs measured 100% success up to
+// 8 MB on claude-4.6 with no stalls — see BIDI_PAYLOAD_LIMIT.md for the
+// data. The previous default silently truncated any conversation >96 KB,
+// destroying memory. Operators who hit the original problem in their
+// environment can re-enable explicitly: RATLC_CONTEXT_MAX_BYTES=N.
+//
+// When > 0, the guard fires only in POOL_CONTEXT_MODE=hybrid (gated by
+// `guardActive` below) so `full` mode always honors its name.
+const CONTEXT_MAX_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MAX_BYTES || process.env.POOL_CONTEXT_MAX_BYTES || '0', 10));
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
 log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}`);

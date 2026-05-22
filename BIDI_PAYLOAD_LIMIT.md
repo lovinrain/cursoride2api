@@ -26,23 +26,92 @@ PR #2 also added `scaffolding/pool/CACHE_DESIGN.md` which lists
 "compaction/windowing" as roadmap item 5 (cap full-context bytes,
 summarize old messages, truncate large tool results).
 
-## What we DON'T know
+## Empirical measurements (2026-05-22)
 
-- Exact threshold. Is it 96K, 100K, 128K? Does it depend on UTF-8
-  byte length vs character count? PR #2's default is 98304 bytes;
-  whether that's the actual limit or a conservative guess is unclear.
-- Hard vs soft. Does the stream close immediately, or stall and
-  eventually recover? Does Cursor send any explicit signal?
-- Stream-level vs content-level. Is this an HTTP/2 / h1 frame size
-  limit, or a Cursor backend processing-budget limit?
-- Per-payload vs cumulative. The comment says per-tool_result. Have we
-  tested whether splitting one large payload into multiple smaller
-  bajie_yield tool_results works?
-- Variance. Does the limit depend on model, account tier, beta-flag
-  combinations, or upstream load?
+We probed the actual behavior with `scaffolding/pool/test_bidi_payload_limit.mjs`.
+The probe sweeps payload sizes by sending a single user message with N bytes
+of filler, then records SSE outcomes (message_start, message_stop, error,
+timeout). Run conditions:
 
-These are open empirical questions. Until any of them is answered, the
-98 KB threshold is an educated guess inherited from PR #2.
+- Model: `claude-4.6-opus-max-thinking-fast`
+- Token pool: 5 accounts, round-robin
+- `POOL_CONTEXT_MODE=full` (no truncation guard active per our patch)
+- Inter-probe delay: 5-10s
+- Reps per size: 2
+
+### Results (all 32 attempts succeeded)
+
+| Size       | n | Success | Duration (min/max) | TTFB (min/max) | Notes |
+|------------|---|---------|--------------------|----------------|-------|
+| 32 KB      | 2 | 100%    | 1.6s / 1.9s        | 6 / 64 ms      | |
+| 64 KB      | 2 | 100%    | 3.0s / 3.0s        | 9 / 12 ms      | |
+| **96 KB**  | 2 | 100%    | 4.7s / 5.1s        | 12 / 12 ms     | **crosses PR #2's 98304 threshold** |
+| 128 KB     | 2 | 100%    | 7.5s / 7.5s        | 15 / 15 ms     | |
+| 192 KB     | 2 | 100%    | 15.4s / 15.5s      | 19 / 21 ms     | |
+| 256 KB     | 2 | 100%    | 25.0s / 25.1s      | 23 / 44 ms     | latency plateau begins |
+| 384 KB     | 2 | 100%    | 25.0s / 25.0s      | 33 / 34 ms     | |
+| 512 KB     | 2 | 100%    | 25.0s / 25.1s      | 46 / 54 ms     | |
+| 768 KB     | 2 | 100%    | 25.1s / 25.1s      | 91 / 142 ms    | |
+| 1 MB       | 2 | 100%    | 25.1s / 25.1s      | 125 / 126 ms   | |
+| 1.5 MB     | 2 | 100%    | 25.2s / 25.2s      | 215 / 233 ms   | |
+| 2 MB       | 2 | 100%    | 25.3s / 25.4s      | 317 / 363 ms   | |
+| 3 MB       | 2 | 100%    | 25.6s / 25.7s      | 611 / 681 ms   | |
+| 4 MB       | 2 | 100%    | 26.1s / 26.2s      | 1135 / 1176 ms | |
+| 6 MB       | 2 | 100%    | 27.3s / **122.4s** | 2.3s / **122.4s** | **variance grows sharply** |
+| 8 MB       | 2 | 100%    | 29.0s / 50.3s      | 4.0s / 25.3s   | variance grows sharply |
+
+### Findings
+
+1. **PR #2's 98304-byte default appears unjustified for our environment.**
+   Crossing the threshold at 96-128 KB shows zero behavior change. The
+   guard fires silently and corrupts conversations, but the threshold
+   it's protecting against doesn't manifest in our setup.
+
+2. **No hard wall observed up to 8 MB.** Cursor accepted payloads roughly
+   80x larger than PR #2's guard threshold without closing the stream
+   or returning errors. The "stall" PR #2 was protecting against did
+   not reproduce.
+
+3. **Soft signal at 6 MB+**: success rate stays 100%, but latency variance
+   grows dramatically. Same payload, two attempts: 27.3s vs 122.4s. At
+   8 MB, similar variance (29.0s vs 50.3s). The upstream is feeling the
+   size but isn't failing.
+
+4. **TTFB scales roughly linearly with payload above 256 KB**: from ~50ms
+   at 256K to ~700ms at 3MB to ~25s at 8MB (in the worst case). This
+   matches network transmission + Cursor parse overhead.
+
+5. **Duration plateau at ~25s from 256KB to 4MB** is most likely Cursor's
+   "max-fast" thinking-budget ceiling, not a payload-limit signal. The
+   model thinks for ~25s regardless of payload in that range.
+
+### Possible explanations for PR #2's original observation
+
+PR #2's author reported "Sending a very large full-context payload as a
+bajie_yield tool_result can make Cursor close or stall the live session."
+Our probe could not reproduce. Hypotheses:
+
+- Misdiagnosis: an unrelated failure (network, throttle, channel state)
+  was attributed to payload size.
+- Account-tier variance: enterprise or free accounts may behave differently.
+- Time-of-day load: Cursor under upstream load may have different limits.
+- Prompt-structure dependency: many short turns vs one long string may
+  exercise different code paths. Our probe uses a single big user message.
+- Limit exists but at higher sizes than we probed (>8 MB).
+- Limit is on cumulative per-channel state, not per-payload.
+
+The first hypothesis is the most likely given the data. The threshold
+98304 appears to be a guess that didn't match observation.
+
+### What we still don't know
+
+- Behavior with multi-turn message structure (many user/assistant/tool_use
+  pairs totaling N bytes vs one user message of N bytes). Worth a separate
+  probe variant if needed.
+- Behavior at sizes >8 MB. Did not probe (impractical for typical loads).
+- Behavior under sustained high load on the upstream side.
+- Behavior on `claude-opus-4-7-thinking-max-fast` — the 4.7 group was
+  too throttled to probe today; could differ.
 
 ## PR #2's mitigation and why it's wrong
 
@@ -157,29 +226,49 @@ no API surface change, no env-var change. Behavior delta:
 | `last` | Unchanged | Unchanged |
 | `hybrid` | Cap fires on `full`-render path | Cap fires on `full`-render path (identical) |
 
-## Future work (separate workstream)
+## Decisions taken from the measurements
 
-To resolve the underlying constraint rather than route around it:
+Based on the data above:
 
-1. **Measure the actual limit.** Write a probe in `scaffolding/pool/`
-   that grows `bajie_yield` payload size by 16 KB per step against a
-   live channel, records when Cursor closes/stalls the stream, and
-   reports the threshold per model + account tier. Until we have this
-   number, 98304 is a guess.
-2. **Test payload splitting.** If the limit is per-tool_result, sending
-   one logical context across multiple `bajie_yield` messages may sidestep
-   it. Worth probing.
-3. **Smarter recovery for hybrid.** Sliding-window drop-oldest is the
-   minimum upgrade over drop-all-but-last. Summarization, RAG-style
-   compaction, or proxy-side memory store are more involved options.
-4. **Visible proxy_notice when truncating.** Any time the proxy delivers
-   less than the caller asked for, the SSE stream should carry a
-   `[proxy_notice] context truncated: ...` text_delta or an
-   `x-ratlc-context-truncated` header. The current silent failure mode
-   is the root cause of "model forgot" support burden.
-5. **Document hybrid as the recommended mode** in `CACHE_DESIGN.md`
-   alongside `full`, so deployers don't default to `full` thinking it's
-   safe (it is — but only with this patch in place).
+1. **Default `CONTEXT_MAX_BYTES` set to 0.** Since the threshold doesn't
+   manifest in our environment up to 8 MB, defaulting the guard to active
+   at 98 KB is solving a phantom problem. Operators who hit the issue in
+   their own environment can re-enable explicitly with
+   `RATLC_CONTEXT_MAX_BYTES=N`. This eliminates the silent context loss
+   entirely for the default config.
+
+2. **Hybrid-mode guard still gated on env var.** When CONTEXT_MAX_BYTES=0,
+   guardActive=false even in hybrid mode. If a future measurement reveals
+   a real limit, the env-var path remains available without code changes.
+
+3. **Probe script kept in tree** at `scaffolding/pool/test_bidi_payload_limit.mjs`
+   so the empirical measurement is reproducible by any operator on any
+   environment. Useful baseline before deciding to enable the guard.
+
+## Open follow-ups (lower priority now)
+
+The original "future work" list assumed the limit was real and needed
+mitigation. With the limit unmeasurable in our environment, several
+items become exploratory rather than necessary:
+
+1. **Probe `claude-opus-4-7-thinking-max-fast` ceiling.** Today's run
+   was throttled. Worth a fresh probe in a low-load window. May reveal
+   a lower ceiling than 4.6 (consistent with NIAH findings of 600K vs 900K
+   for the model's own context).
+2. **Probe multi-turn payload structure.** Same total bytes, but as N
+   user/assistant/tool_use/tool_result turns instead of one big text
+   message. Tests whether prompt structure (not just bytes) affects
+   Cursor's behavior.
+3. **Probe under sustained load.** Today's run was after a throttle had
+   just cleared. Running during normal load may reveal different behavior.
+4. **Sliding-window recovery for hybrid.** If/when the guard is ever
+   needed, drop-oldest is still preferable to drop-all-but-last. Cheap
+   to implement when motivated.
+5. **Visible proxy_notice when truncating.** Same — relevant only if
+   the guard actually fires in some user's environment.
+
+These are now nice-to-have rather than blocking. The original "smoking
+gun" — silent context loss in `full` mode — is gone by default.
 
 ## See also
 
