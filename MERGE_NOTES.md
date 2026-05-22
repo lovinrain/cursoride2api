@@ -67,6 +67,15 @@ the 2026-05-22 merge for future-merge-friction reasons. If a future
 upstream version evolves convKey further, re-evaluate whether to keep
 following or revert to our simpler v1.
 
+Special note on PR #2's context byte-cap guard (from huaerye23,
+commit `0139d20`): when merging PR #2, the guard MUST be gated on
+`POOL_CONTEXT_MODE === 'hybrid'` so that `full` mode honors its name.
+PR #2 ships the guard active in all modes, which silently violates
+the `full` contract — see `BIDI_PAYLOAD_LIMIT.md` for the full design
+rationale and the exact patch to apply during merge resolution. The
+patch is two find-replaces against PR #2's `api-server.mjs`; do not
+take PR #2's version verbatim.
+
 ### 4. Files that only OUR branch has → no conflict
 
 The entire `scaffolding/pool/` tree, `src/cursor-agent-h1.js`,
