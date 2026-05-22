@@ -158,3 +158,30 @@ Files upstream added or substantially modified that auto-merged
 cleanly: `src/proto/agent_pb.mjs` (regen with WebFetch Value support),
 `REFERENCES.md` (new), `server.js`, `HANDOVER_LOCAL_MODE.md`,
 `README.md`. None required intervention.
+
+---
+
+PR #2 cherry-pick from huaerye23 (`0139d20`): `60fc2aa` (2026-05-22).
+
+Resolved conflicts:
+- `server.js` — simple additive: took upstream's `req.body = body;`
+  (rule 2)
+- `src/cursor-agent.js` near `decodeMcpArgs` — took upstream's new
+  forward-compatible protobuf wire helpers (subagent_args=28,
+  execute_hook_args=27, etc.) AND kept our richer `decodeMcpArgs`
+  comment (rule 2, additive merge of comment + helpers)
+- `src/cursor-agent.js` `module.exports` block — kept both sides:
+  upstream's native result builders (`buildNativeReadResult`,
+  `buildNativeWriteResult`, `buildNativeDeleteResult`,
+  `buildNativeGrepResult`, `buildListMcpResourcesResult`,
+  `buildSelectedContextForImages`, `describeUnknownFields`) AND our
+  `_handleExecMessage` test alias. Deduplicated `resolveClientFingerprint`
+  which appeared on both sides (rule 2)
+- `scaffolding/pool/api-server.mjs` context guard — APPLIED THE
+  BIDI_PAYLOAD_LIMIT.md PATCH: added `guardActive` const gated on
+  `POOL_CONTEXT_MODE === 'hybrid'`, replaced both `CONTEXT_MAX_BYTES > 0`
+  checks at guard sites with `guardActive`. Rationale: PR #2's guard
+  silently violated the `full`-mode contract. See
+  `BIDI_PAYLOAD_LIMIT.md` for the full design rationale. (Rule 3,
+  defending-against-bug-irrelevant-to-our-mode category — we modified
+  upstream rather than took it verbatim.)

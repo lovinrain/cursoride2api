@@ -110,11 +110,18 @@ payload reaches a fresh-context channel and the model sees only the
 latest turn. These are separate issues to address (visible proxy_notice
 on guard fires, session-state persistence, tighter affinity guarantees).
 
-## Patch to apply on top of PR #2
+## Status: PATCH APPLIED
 
-When merging PR #2 (commit `0139d20` on `huaerye23/feat/ratlc-mvp`),
-apply this change to `scaffolding/pool/api-server.mjs` in the
-`handleMessagesRequest` rendering block (around line 1796):
+The patch described below was applied as part of the cherry-pick of
+PR #2 (commit `60fc2aa`) into `feat/ratlc-mvp` on 2026-05-22. The
+guard-only-in-hybrid behavior is live in our branch. This section is
+kept as documentation of WHAT was changed and WHY, for the next time
+upstream evolves this region.
+
+## The patch (applied during cherry-pick conflict resolution)
+
+In `scaffolding/pool/api-server.mjs`, inside the `handleMessagesRequest`
+rendering block (around line 1796), the change was:
 
 ```js
 // Bidi-stream payload guard. Cursor's live agent stream has an
