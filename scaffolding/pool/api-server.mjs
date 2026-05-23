@@ -1507,16 +1507,24 @@ async function handleMessagesRequest(req, res) {
         //
         // See AGENT_TOOLS_SPOOF_OBSERVATION.md for the spoof pattern
         // diagnosis and DEVLOG.md for the iteration history.
+        //
+        // NOTE (2026-05-23): in POOL_TOOL_MODE=translate (the default config)
+        // this Write-spoof block is DEAD CODE for agent-tools/<uuid>.txt
+        // paths — the virtual-store handler above (line ~1404) intercepts
+        // those Writes and returns before execution reaches here. This block
+        // remains as a fallback for `contract` mode operators who don't get
+        // the virtual store. The Bing-RSS injection here was the primary
+        // protection before we ported the colleague's webFetch + virtual
+        // store; with both of those in place, this is belt-and-suspenders.
         if (msg.name === 'Write') {
           const fp = msg.args?.file_path || '';
           const content = msg.args?.content || '';
           const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
-          // Gap-3 fix (WEB_RESEARCH_GAPS.md): trigger the mitigation on ANY
-          // write to agent-tools/<uuid>.txt regardless of content. The path
-          // is Cursor's backend staging convention; a client-side Write to
-          // it is always a confabulation pattern. Pre-filled writes used to
-          // skip the mitigation (content === '' check) and the hallucinated
-          // body reached disk as a "successful" Write.
+          // Gap-3 broadening (WEB_RESEARCH_GAPS.md): trigger the mitigation
+          // on ANY write to agent-tools/<uuid>.txt regardless of content —
+          // empty placeholder OR pre-filled hallucinated content. Kept here
+          // for contract mode; translate mode gets the cleaner virtual store
+          // path that fires earlier.
           if (uuidV4Path.test(fp)) {
             const isPreFilled = String(content).trim().length > 0
               && String(content).trim() !== '(No content)';
