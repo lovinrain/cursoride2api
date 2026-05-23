@@ -263,7 +263,7 @@ export function fallbackNoticeBody(reason) {
     'client side does NOT perform a web fetch.\n\n' +
     'WHAT TO DO INSTEAD:\n' +
     '  - To search or look up public web information: use Cursor-native WebSearch.\n' +
-    '  - For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it.\n' +
+    '  - For a user-explicit URL fetch, use WebFetch/Fetch when available; do not use Bash/curl unless the user specifically asks for a shell command.\n' +
     '  - Do NOT use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.\n' +
     '  - If you cannot fulfill the user request without web access, tell the user ' +
     'that and call `bajie_yield`.\n\n' +

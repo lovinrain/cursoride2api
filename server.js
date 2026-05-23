@@ -32,6 +32,8 @@ const runtimeStats = require('./src/runtime-stats');
 const { StreamingHallucinationFilter } = require('./src/streaming-hallucination-filter');
 const { getCursorToolMatrix } = require('./src/cursor-tool-matrix');
 const { ProxyThinkingBlockAdapter } = require('./src/proxy-thinking-adapter');
+const agentToolsStore = require('./src/agent-tools-virtual-store');
+const serverLocalTools = require('./src/server-local-tool-adapter');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -48,9 +50,9 @@ function looksLikeAgentToolPlaceholderWrite(toolName, args) {
   const normalizedTool = anthropicTools.normalizeClientToolNameForPolicy(toolName);
   if (normalizedTool !== 'write') return false;
   const a = args && typeof args === 'object' ? args : {};
-  const p = String(a.file_path || a.path || a.filename || '').replace(/\\/g, '/');
+  const p = agentToolsStore.getPathFromArgs(a);
   const c = String(a.content ?? a.file_text ?? a.text ?? a.body ?? a.data ?? '').trim();
-  return /^agent-tools\/[^/]+\.txt$/i.test(p) && (c === '' || c === '(No content)');
+  return agentToolsStore.isAgentToolsArtifactPath(p) && (c === '' || c === '(No content)');
 }
 
 // Configurable "small model" used for warmup pings, compaction summarization,
@@ -1863,23 +1865,78 @@ function buildTurnCallbacks(ctx) {
     onMcpCall: ({ id, execId, toolCallId, toolName, args }) => {
       stamp('firstFrame');
       stamp('firstTool');
-      closeOpenBlock();
-      const blockIndex = turnState.nextBlockIndex++;
-      const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
       const registeredNames = new Set(
         (mcpTools || []).flatMap(t => [t && t.name, t && t.toolName]).filter(Boolean)
       );
-      toolName = anthropicTools.normalizeMcpWireToolNameForClient(toolName, registeredNames);
+      const wireToolName = anthropicTools.normalizeMcpWireToolNameForClient(toolName, registeredNames);
+      const normalizedToolName = anthropicTools.canonicalizeHallucinatedToolName(wireToolName, registeredNames);
+      const normalizedArgs = anthropicTools.normalizeHallucinatedToolArgs(normalizedToolName, { ...(args || {}) });
+      const artifactPath = agentToolsStore.getPathFromArgs(normalizedArgs || {});
+      if (normalizedToolName === 'Write' && agentToolsStore.isAgentToolsArtifactPath(artifactPath)) {
+        const content = agentToolsStore.contentForAgentToolsWrite(
+          agentToolsStore.getContentFromArgs(normalizedArgs || {})
+        );
+        const entry = agentToolsStore.putAgentToolsArtifact(artifactPath, content, { source: 'server-write' });
+        console.log(`  virtual agent-tools Write captured: ${artifactPath} (${entry?.bytes || 0} bytes)`);
+        const bridge = getBridge();
+        if (bridge && typeof bridge.sendToolResult === 'function') {
+          bridge.sendToolResult(id, execId, agentToolsStore.makeVirtualWriteResultText(entry));
+          return;
+        }
+      }
+      if (normalizedToolName === 'Read' && agentToolsStore.isAgentToolsArtifactPath(artifactPath)) {
+        const entry = agentToolsStore.getAgentToolsArtifact(artifactPath);
+        const content = entry ? entry.content : agentToolsStore.makeVirtualReadMissingText(artifactPath);
+        console.log(`  virtual agent-tools Read served: ${artifactPath} (${Buffer.byteLength(content)} bytes, found=${entry ? 1 : 0})`);
+        const bridge = getBridge();
+        if (bridge && typeof bridge.sendToolResult === 'function') {
+          bridge.sendToolResult(id, execId, content);
+          return;
+        }
+      }
+      if (serverLocalTools.isServerLocalToolName(normalizedToolName)) {
+        const localToolName = serverLocalTools.normalizeServerLocalToolName(normalizedToolName);
+        const bridge = getBridge();
+        if (bridge && typeof bridge.sendToolResult === 'function') {
+          const localDecision = serverLocalTools.getServerLocalToolDecision(localToolName, normalizedArgs || {});
+          if (!localDecision.canRun && localDecision.retryOnClient) {
+            console.log(`  local tool adapter skip: ${localToolName}: ${localDecision.reason || 'not runnable locally'}; forwarding to client`);
+          } else {
+            let argsPreview = '';
+            try { argsPreview = JSON.stringify(normalizedArgs || {}).slice(0, 160); } catch { argsPreview = '{...}'; }
+            console.log(`  local tool adapter: ${localToolName}(${argsPreview})`);
+            serverLocalTools.runServerLocalTool(localToolName, normalizedArgs || {})
+              .then((result) => {
+                const content = result && result.content != null ? String(result.content) : '';
+                if (!result || !result.ok) {
+                  console.log(`  local tool adapter error: ${localToolName}: ${content.slice(0, 200)}`);
+                } else {
+                  console.log(`  local tool adapter ok: ${localToolName} bytes=${Buffer.byteLength(content)}`);
+                }
+                bridge.sendToolResult(id, execId, content);
+              })
+              .catch((err) => {
+                const message = err && err.message ? err.message : String(err);
+                console.log(`  local tool adapter threw: ${localToolName}: ${message}`);
+                bridge.sendToolResult(id, execId, `[proxy_error] ${message}`);
+              });
+            return;
+          }
+        }
+      }
+      closeOpenBlock();
+      const blockIndex = turnState.nextBlockIndex++;
+      const anthropicToolUseId = anthropicTools.encodeToolUseId(convKey, execId, toolCallId, sessionId);
 
       turnState.pendingToolCalls.push({
-        execMsgId: id, execId, toolCallId, toolName, args,
+        execMsgId: id, execId, toolCallId, toolName: normalizedToolName, args: normalizedArgs,
         anthropicToolUseId, blockIndex,
       });
 
       if (isStream && !res.writableEnded) {
-        res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, toolName));
+        res.write(anthropicConverter.buildContentBlockStartToolUse(blockIndex, anthropicToolUseId, normalizedToolName));
         try {
-          res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, JSON.stringify(args || {})));
+          res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, JSON.stringify(normalizedArgs || {})));
         } catch {
           res.write(anthropicConverter.buildContentBlockDeltaInputJson(blockIndex, '{}'));
         }
@@ -1887,11 +1944,11 @@ function buildTurnCallbacks(ctx) {
       }
 
       let argsPreview = '';
-      try { argsPreview = JSON.stringify(args || {}).slice(0, 80); } catch { argsPreview = '{...}'; }
-      console.log(`  🔧 tool call: ${toolName}(${argsPreview}) → ${anthropicToolUseId}`);
+      try { argsPreview = JSON.stringify(normalizedArgs || {}).slice(0, 80); } catch { argsPreview = '{...}'; }
+      console.log(`  🔧 tool call: ${normalizedToolName}(${argsPreview}) → ${anthropicToolUseId}`);
       debugLog.logToolCall(
         { request_id: requestId, conv_key: convKey, model_cursor: cursorModel },
-        toolName, args
+        normalizedToolName, normalizedArgs
       );
 
       // The Cursor stream is now paused waiting for our mcpResult — Cursor
@@ -2302,6 +2359,7 @@ async function handleFreshTurn(req, res, token, params) {
     messages, system, requestedModel, cursorModel, isStream,
     convKey, bridgeKey, conversationId, tools,
   } = params;
+  const requestBody = params.body || req.body || {};
 
   const timings = { t0: Date.now() };
   // Pull any prior-turn thinking we've stored for this conversation, so
@@ -2352,7 +2410,8 @@ async function handleFreshTurn(req, res, token, params) {
 
   const turnState = makeTurnState();
   const clientThinkingEnabled =
-    body && body.thinking && (body.thinking.type === 'enabled' || body.thinking === 'enabled');
+    requestBody && requestBody.thinking &&
+    (requestBody.thinking.type === 'enabled' || requestBody.thinking === 'enabled');
 
   // sessionId is a per-bridge uuid baked into every tool_use_id we mint. It
   // lets continuations find this bridge across TCP socket reconnects (the
@@ -2607,7 +2666,7 @@ async function handleAnthropicMessagesRequest(req, res) {
   res.on('close', () => tokenPool.release(token, { success: true }));
   return handleFreshTurn(req, res, token, {
     messages, system, requestedModel, cursorModel, isStream,
-    convKey, bridgeKey, conversationId, tools, requestId,
+    convKey, bridgeKey, conversationId, tools, requestId, body,
   });
 }
 

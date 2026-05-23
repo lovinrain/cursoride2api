@@ -10,7 +10,7 @@ import net from 'node:net';
 import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
-import { isPoolLocalToolName, runPoolLocalTool } from './local-tool-executor.mjs';
+import { getPoolLocalToolDecision, isPoolLocalToolName, runPoolLocalTool } from './local-tool-executor.mjs';
 import {
   consumeClientToolResult,
   getConsumedClientToolResult,
@@ -41,6 +41,7 @@ import {
 // them. The helpers depend on Node `crypto` only — no ESM coupling.
 const _require = createRequire(import.meta.url);
 const anthropicTools = _require('../../src/anthropic-tools.js');
+const agentToolsStore = _require('../../src/agent-tools-virtual-store.js');
 const { StreamingHallucinationFilter } = _require('../../src/streaming-hallucination-filter.js');
 const {
   ProxyThinkingBlockAdapter,
@@ -538,17 +539,19 @@ function renderThinkingPreamble(thinkingTurns) {
 }
 
 function looksLikeAgentToolPlaceholderWrite(toolName, args) {
-  // Gap-3 fix (WEB_RESEARCH_GAPS.md): any Write to agent-tools/<uuid>.txt
-  // is a confabulation pattern — empty placeholders are the model's
-  // older fallback; pre-filled writes with hallucinated content are the
-  // newer pattern. Both should be intercepted. (Previous check was
-  // `c === '' || c === '(No content)'` which only caught empties and
-  // let hallucinated content reach disk as "successful" Write.)
+  // Used only by the hallucinated-tool-call rescue path (where a model
+  // writes a Write tool call as TEXT and we parse it out). The general
+  // intercept for agent-tools/<uuid>.txt is now handled by the virtual
+  // store (see handleMessagesRequest's Write/Read handlers below). Here
+  // we only suppress the legacy "model wrote empty placeholder as text"
+  // rescue — non-empty agent-tools writes go through the virtual store
+  // path which always intercepts.
   const normalizedTool = anthropicTools.normalizeClientToolNameForPolicy(toolName);
   if (normalizedTool !== 'write') return false;
   const a = args && typeof args === 'object' ? args : {};
-  const p = String(a.file_path || a.path || a.filename || '').replace(/\\/g, '/');
-  return /^agent-tools\/[^/]+\.txt$/i.test(p);
+  const p = agentToolsStore.getPathFromArgs(a);
+  const c = String(a.content ?? a.file_text ?? a.text ?? a.body ?? a.data ?? '').trim();
+  return agentToolsStore.isAgentToolsArtifactPath(p) && (c === '' || c === '(No content)');
 }
 
 async function handleMessagesRequest(req, res) {
@@ -713,12 +716,17 @@ async function handleMessagesRequest(req, res) {
   const hallucinationFilter = new StreamingHallucinationFilter();
   const serverToolBlocks = new Map();
   const openServerTools = new Set();
+  // Maps toolId to the server tool name ('web_search' or 'web_fetch') so
+  // completion-path code (completeOpenServerTools) can pick the right
+  // result_error type.
+  const openServerToolNames = new Map();
   const visibleServerToolTraces = new Set();
   // Gap-1 fix (WEB_RESEARCH_GAPS.md): cache the query at started phase so
   // the completed phase has it available for the Bing-RSS fallback when
   // extraction fails.
   const serverToolQueries = new Map();  // toolId -> query string
   let serverWebSearchRequestCount = 0;
+  let serverWebFetchRequestCount = 0;
   // `messageStarted` gates startMsg() so it can only fire once per request.
   // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
   // blockIdx — so the route_decision branch AND the error branch would
@@ -820,8 +828,8 @@ async function handleMessagesRequest(req, res) {
           output_tokens: 0,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
-          server_tool_use: serverWebSearchRequestCount > 0
-            ? { web_search_requests: serverWebSearchRequestCount }
+          server_tool_use: serverWebSearchRequestCount > 0 || serverWebFetchRequestCount > 0
+            ? { web_search_requests: serverWebSearchRequestCount, web_fetch_requests: serverWebFetchRequestCount }
             : null,
           service_tier: 'standard',
         },
@@ -982,37 +990,40 @@ async function handleMessagesRequest(req, res) {
 
   async function emitServerToolUseEvent(event) {
     if (done) return;
-    if (!event || event.name !== 'web_search') return;
+    if (!event || (event.name !== 'web_search' && event.name !== 'web_fetch')) return;
     startMsg();
     stopThinkingBlock();
     emitPlaceholderThinkingBlock();
     stopTextBlock();
     const toolId = normalizeServerToolId(event.id);
+    const isWebFetch = event.name === 'web_fetch';
+    const blockName = isWebFetch ? 'web_fetch' : 'web_search';
 
     if (event.phase === 'started') {
       if (serverToolBlocks.has(toolId)) return;
-      // Gap-1 fix (WEB_RESEARCH_GAPS.md): remember the query for this
-      // toolId so if the completed phase arrives with empty/unparseable
-      // content, the fallback path can re-run the search on the proxy
-      // and substitute real results.
-      const queryForFallback = String(event.input?.query || '').replace(/\s+/g, ' ').trim();
-      if (queryForFallback) serverToolQueries.set(toolId, queryForFallback);
+      // Gap-1 (WebSearch only): remember the query so the completed phase
+      // can fall back to Bing-RSS if Cursor's content extraction fails.
+      const traceValue = String(isWebFetch ? event.input?.url || '' : event.input?.query || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!isWebFetch && traceValue) serverToolQueries.set(toolId, traceValue);
       if (RENDER_SERVER_TOOL_TEXT && !visibleServerToolTraces.has(toolId)) {
         visibleServerToolTraces.add(toolId);
-        emitTextDelta(`[Cursor WebSearch] ${queryForFallback || '(query unavailable)'}\n`);
+        emitTextDelta(`[Cursor ${isWebFetch ? 'WebFetch' : 'WebSearch'}] ${traceValue || '(input unavailable)'}\n`);
         stopTextBlock();
       }
       blockIdx++;
       const idx = blockIdx;
       serverToolBlocks.set(toolId, idx);
       openServerTools.add(toolId);
+      openServerToolNames.set(toolId, blockName);
       sseWrite(res, 'content_block_start', {
         type: 'content_block_start',
         index: idx,
         content_block: {
           type: 'server_tool_use',
           id: toolId,
-          name: 'web_search',
+          name: blockName,
         },
       });
       sseWrite(res, 'content_block_delta', {
@@ -1024,8 +1035,10 @@ async function handleMessagesRequest(req, res) {
         },
       });
       sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
-      serverWebSearchRequestCount++;
-      log(`→ server_tool_use to client: name=web_search query=${JSON.stringify(event.input?.query || '').slice(0, 160)} id=${toolId}`);
+      if (isWebFetch) serverWebFetchRequestCount++;
+      else serverWebSearchRequestCount++;
+      const logInput = isWebFetch ? event.input?.url || '' : event.input?.query || '';
+      log(`→ server_tool_use to client: name=${blockName} input=${JSON.stringify(logInput).slice(0, 160)} id=${toolId}`);
       return;
     }
 
@@ -1034,20 +1047,18 @@ async function handleMessagesRequest(req, res) {
         await emitServerToolUseEvent({ ...event, phase: 'started' });
       }
       openServerTools.delete(toolId);
-      // Capture blockIdx BEFORE any await — emitServerToolUseEvent now
-      // awaits Bing-RSS in the fallback path, and concurrent emits could
+      openServerToolNames.delete(toolId);
+      // Capture blockIdx BEFORE any await — emitServerToolUseEvent awaits
+      // Bing-RSS in the WebSearch fallback path, and concurrent emits could
       // bump blockIdx out from under us if we held it as a closure ref.
       blockIdx++;
       const idx = blockIdx;
       let content = Array.isArray(event.content) ? event.content : (event.content || null);
       let resultSource = 'cursor';
-      // Gap-1 fix (WEB_RESEARCH_GAPS.md): when Cursor's backend completed
-      // the WebSearch but the proxy couldn't extract result metadata,
-      // re-run the search via Bing RSS on the proxy host and surface those
-      // as a real web_search_tool_result content array (not an error). The
-      // model gets usable results instead of falling into the Write-spoof
-      // confabulation pattern.
-      if (!Array.isArray(content)) {
+      // Gap-1 fix: Bing-RSS fallback only applies to WebSearch (not WebFetch
+      // — for fetches, if extraction fails the URL-specific response is what
+      // the model wanted; a search wouldn't substitute meaningfully).
+      if (!isWebFetch && !Array.isArray(content)) {
         const cachedQuery = serverToolQueries.get(toolId) || '';
         if (cachedQuery && WEBSEARCH_FALLBACK_ENABLED) {
           try {
@@ -1074,10 +1085,10 @@ async function handleMessagesRequest(req, res) {
         }
       }
       // Final fallback: if we still don't have a content array, emit the
-      // original error block.
+      // original error block (separate types for web_search vs web_fetch).
       if (!Array.isArray(content)) {
         content = {
-          type: 'web_search_tool_result_error',
+          type: isWebFetch ? 'web_fetch_tool_result_error' : 'web_search_tool_result_error',
           error_code: 'unavailable',
         };
       }
@@ -1085,13 +1096,13 @@ async function handleMessagesRequest(req, res) {
         type: 'content_block_start',
         index: idx,
         content_block: {
-          type: 'web_search_tool_result',
+          type: isWebFetch ? 'web_fetch_tool_result' : 'web_search_tool_result',
           tool_use_id: toolId,
           content,
         },
       });
       sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
-      log(`→ web_search_tool_result to client: id=${toolId} results=${Array.isArray(content) ? content.length : 'error'} source=${resultSource}`);
+      log(`→ ${blockName}_tool_result to client: id=${toolId} results=${Array.isArray(content) ? content.length : 'error'} source=${resultSource}`);
       serverToolQueries.delete(toolId);
     }
   }
@@ -1099,15 +1110,16 @@ async function handleMessagesRequest(req, res) {
   function completeOpenServerTools(reason) {
     if (done || openServerTools.size === 0) return;
     for (const toolId of [...openServerTools]) {
+      const name = openServerToolNames.get(toolId) || 'web_search';
       emitServerToolUseEvent({
         phase: 'completed',
-        name: 'web_search',
+        name,
         id: toolId,
         content: {
-          type: 'web_search_tool_result_error',
+          type: name === 'web_fetch' ? 'web_fetch_tool_result_error' : 'web_search_tool_result_error',
           error_code: 'unavailable',
         },
-        error: reason || 'Cursor backend WebSearch completed without exposing result metadata to the proxy.',
+        error: reason || `Cursor backend ${name === 'web_fetch' ? 'WebFetch' : 'WebSearch'} completed without exposing result metadata to the proxy.`,
       });
     }
   }
@@ -1244,6 +1256,7 @@ async function handleMessagesRequest(req, res) {
       stopReason,
       outputTokens,
       serverWebSearchRequests: serverWebSearchRequestCount,
+      serverWebFetchRequests: serverWebFetchRequestCount,
       thinkingCompletedCount,
       thinkingDurationMs,
       channelId: routedChannel,
@@ -1260,8 +1273,8 @@ async function handleMessagesRequest(req, res) {
         output_tokens: outputTokens,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
-        server_tool_use: serverWebSearchRequestCount > 0
-          ? { web_search_requests: serverWebSearchRequestCount }
+        server_tool_use: serverWebSearchRequestCount > 0 || serverWebFetchRequestCount > 0
+          ? { web_search_requests: serverWebSearchRequestCount, web_fetch_requests: serverWebFetchRequestCount }
           : null,
       },
     });
@@ -1387,6 +1400,52 @@ async function handleMessagesRequest(req, res) {
           log(`⚠ ignoring tool_use after SSE finalize: name=${msg.name} anthropic_id=${msg.anthropic_id} reqId=${requestId} late=${msg.late ? 1 : 0}`);
           return;
         }
+
+        if (POOL_TOOL_MODE === 'translate' && msg.name === 'Write') {
+          const fp = agentToolsStore.getPathFromArgs(msg.args || {});
+          if (agentToolsStore.isAgentToolsArtifactPath(fp)) {
+            markVisibleUpstreamEvent();
+            const content = agentToolsStore.contentForAgentToolsWrite(
+              agentToolsStore.getContentFromArgs(msg.args || {}),
+            );
+            const entry = agentToolsStore.putAgentToolsArtifact(fp, content, { source: 'ratlc-write' });
+            log(`→ virtual agent-tools Write captured: path=${fp} bytes=${entry?.bytes || 0} id=${msg.anthropic_id}`);
+            poolWrite({
+              type: 'request',
+              requestId,
+              action: 'send_tool_results',
+              model: routingModel || null,
+              requestedModel: model || null,
+              results: [{
+                anthropic_tool_use_id: msg.anthropic_id,
+                content: agentToolsStore.makeVirtualWriteResultText(entry),
+              }],
+            });
+            return;
+          }
+        }
+
+        if (POOL_TOOL_MODE === 'translate' && msg.name === 'Read') {
+          const fp = agentToolsStore.getPathFromArgs(msg.args || {});
+          if (agentToolsStore.isAgentToolsArtifactPath(fp)) {
+            markVisibleUpstreamEvent();
+            const entry = agentToolsStore.getAgentToolsArtifact(fp);
+            const content = entry ? entry.content : agentToolsStore.makeVirtualReadMissingText(fp);
+            log(`→ virtual agent-tools Read served: path=${fp} bytes=${Buffer.byteLength(content)} found=${entry ? 1 : 0} id=${msg.anthropic_id}`);
+            poolWrite({
+              type: 'request',
+              requestId,
+              action: 'send_tool_results',
+              model: routingModel || null,
+              requestedModel: model || null,
+              results: [{
+                anthropic_tool_use_id: msg.anthropic_id,
+                content,
+              }],
+            });
+            return;
+          }
+        }
         // Parallel-tool-calls fix: emit the tool_use block but DO NOT finish
         // the message here. The model may emit several tool_uses in a single
         // assistant turn — each must get its own content_block_start with a
@@ -1473,7 +1532,7 @@ async function handleMessagesRequest(req, res) {
               'content as if you had fetched it, you will be fabricating facts.\n\n' +
               'WHAT TO DO INSTEAD:\n' +
               '  - To search or look up public web information: use Cursor-native WebSearch.\n' +
-              '  - For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it.\n' +
+              '  - For a user-explicit URL fetch, use WebFetch/Fetch when available; do not use Bash/curl unless the user specifically asks for a shell command.\n' +
               '  - Do NOT use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.\n' +
               '  - If you cannot fulfill the user request without web access, tell the ' +
               'user that and call `bajie_yield`.\n\n' +
@@ -1547,44 +1606,49 @@ async function handleMessagesRequest(req, res) {
             return;
           }
           if (isPoolLocalToolName(xlated.name)) {
-            log(`→ local tool adapter: name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)} id=${msg.anthropic_id}`);
-            reqLog.status = 'local_tool';
-            reqLog.lastToolName = xlated.name;
-            runPoolLocalTool(xlated.name, xlated.input || {})
-              .then((result) => {
-                if (!result.ok) {
-                  log(`  ↪ local tool adapter error: name=${result.name || xlated.name} id=${msg.anthropic_id} ${String(result.content || '').slice(0, 200)}`);
-                } else {
-                  log(`  ↪ local tool adapter ok: name=${result.name || xlated.name} id=${msg.anthropic_id} bytes=${Buffer.byteLength(String(result.content || ''))}`);
-                }
-                poolWrite({
-                  type: 'request',
-                  requestId,
-                  action: 'send_tool_results',
-                  model: routingModel || null,
-                  requestedModel: model || null,
-                  results: [{
-                    anthropic_tool_use_id: msg.anthropic_id,
-                    content: result.content || '',
-                  }],
+            const localDecision = getPoolLocalToolDecision(xlated.name, xlated.input || {});
+            if (!localDecision.canRun && localDecision.retryOnClient) {
+              log(`→ local tool adapter skip: name=${xlated.name} reason=${localDecision.reason || 'not runnable locally'}; forwarding to client id=${msg.anthropic_id}`);
+            } else {
+              log(`→ local tool adapter: name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)} id=${msg.anthropic_id}`);
+              reqLog.status = 'local_tool';
+              reqLog.lastToolName = xlated.name;
+              runPoolLocalTool(xlated.name, xlated.input || {})
+                .then((result) => {
+                  if (!result.ok) {
+                    log(`  ↪ local tool adapter error: name=${result.name || xlated.name} id=${msg.anthropic_id} ${String(result.content || '').slice(0, 200)}`);
+                  } else {
+                    log(`  ↪ local tool adapter ok: name=${result.name || xlated.name} id=${msg.anthropic_id} bytes=${Buffer.byteLength(String(result.content || ''))}`);
+                  }
+                  poolWrite({
+                    type: 'request',
+                    requestId,
+                    action: 'send_tool_results',
+                    model: routingModel || null,
+                    requestedModel: model || null,
+                    results: [{
+                      anthropic_tool_use_id: msg.anthropic_id,
+                      content: result.content || '',
+                    }],
+                  });
+                })
+                .catch((e) => {
+                  const message = e && e.message ? e.message : String(e);
+                  log(`  ↪ local tool adapter threw: name=${xlated.name} id=${msg.anthropic_id} ${message}`);
+                  poolWrite({
+                    type: 'request',
+                    requestId,
+                    action: 'send_tool_results',
+                    model: routingModel || null,
+                    requestedModel: model || null,
+                    results: [{
+                      anthropic_tool_use_id: msg.anthropic_id,
+                      content: `[proxy_error] ${message}`,
+                    }],
+                  });
                 });
-              })
-              .catch((e) => {
-                const message = e && e.message ? e.message : String(e);
-                log(`  ↪ local tool adapter threw: name=${xlated.name} id=${msg.anthropic_id} ${message}`);
-                poolWrite({
-                  type: 'request',
-                  requestId,
-                  action: 'send_tool_results',
-                  model: routingModel || null,
-                  requestedModel: model || null,
-                  results: [{
-                    anthropic_tool_use_id: msg.anthropic_id,
-                    content: `[proxy_error] ${message}`,
-                  }],
-                });
-              });
-            return;
+              return;
+            }
           }
           const clientBridge = resolveClientBridgeToolUse(tools, xlated.name, xlated.input || {});
           if (clientBridge.handled && !clientBridge.ok) {

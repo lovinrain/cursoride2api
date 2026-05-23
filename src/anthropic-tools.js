@@ -693,6 +693,7 @@ const HALLUCINATED_NAME_ALIASES = {
   'Shell': 'Bash',
   'Ls': 'LS',
   'Fetch': 'WebFetch',
+  'StrReplace': 'Edit',
 };
 
 function canonicalizeHallucinatedToolName(name, registeredNames) {
@@ -744,8 +745,24 @@ const TOOL_ARG_NORMALIZERS = {
   Edit(args) {
     if (!args || typeof args !== 'object') return args;
     if (args.old != null && args.old_string == null) { args.old_string = args.old; delete args.old; }
+    if (args.oldString != null && args.old_string == null) { args.old_string = args.oldString; delete args.oldString; }
+    if (args.old_str != null && args.old_string == null) { args.old_string = args.old_str; delete args.old_str; }
+    if (args.find != null && args.old_string == null) { args.old_string = args.find; delete args.find; }
+    if (args.target != null && args.old_string == null) { args.old_string = args.target; delete args.target; }
     if (args.new != null && args.new_string == null) { args.new_string = args.new; delete args.new; }
+    if (args.newString != null && args.new_string == null) { args.new_string = args.newString; delete args.newString; }
+    if (args.new_str != null && args.new_string == null) { args.new_string = args.new_str; delete args.new_str; }
+    if (args.replace != null && args.new_string == null) { args.new_string = args.replace; delete args.replace; }
+    if (args.replacement != null && args.new_string == null) { args.new_string = args.replacement; delete args.replacement; }
     if (args.path != null && args.file_path == null) { args.file_path = args.path; delete args.path; }
+    if (args.replaceAll != null && args.replace_all == null) { args.replace_all = args.replaceAll; delete args.replaceAll; }
+    return args;
+  },
+  Grep(args) {
+    if (!args || typeof args !== 'object') return args;
+    if (args.outputMode != null && args.output_mode == null) { args.output_mode = args.outputMode; delete args.outputMode; }
+    if (!args.output_mode) args.output_mode = 'files_with_matches';
+    if (args.output_mode === 'files') args.output_mode = 'files_with_matches';
     return args;
   },
   MultiEdit(args) {

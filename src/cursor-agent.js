@@ -562,30 +562,6 @@ function getUnknownLengthDelimited(execMsg, fieldNo) {
   return unknown.find((u) => u && u.no === fieldNo && u.wireType === WIRE_LENGTH_DELIMITED) || null;
 }
 
-// Scan a serialized proto message for a top-level length-delimited field
-// with the given field number, return its body bytes (or null). Used to
-// detect post-vendoring oneof cases like webFetchRequestQuery without
-// relying on $unknown population (which is unreliable for nested oneofs).
-function _findUnknownLengthDelimitedField(messageBytes, targetFieldNo) {
-  const data = _asUint8Array(messageBytes);
-  let off = 0;
-  while (off < data.length) {
-    const tag = readProtoVarint(data, off);
-    if (tag.error || tag.offset <= off) break;
-    off = tag.offset;
-    const no = Math.floor(tag.value / 8);
-    const wireType = tag.value & 7;
-    if (wireType === WIRE_LENGTH_DELIMITED) {
-      const value = readProtoLengthDelimited(data, off);
-      if (no === targetFieldNo) return value.bytes;
-      off = value.offset;
-    } else {
-      off = skipProtoField(data, wireType, off);
-    }
-  }
-  return null;
-}
-
 function getUnknownLengthDelimitedPayload(execMsg, fieldNo) {
   const unknown = getUnknownLengthDelimited(execMsg, fieldNo);
   if (!unknown) return null;
@@ -697,6 +673,60 @@ function buildSubagentSuccessResultPayload({ agentId, finalMessage, toolCallCoun
   ]);
   // SubagentResult.result.success = 1
   return protoFieldBytes(1, success);
+}
+
+function decodeWebFetchArgsPayload(bytes) {
+  const args = {};
+  for (const f of parseLengthDelimitedFields(bytes)) {
+    if (f.no === 1) args.url = decodeUtf8(f.data);
+    else if (f.no === 2) args.toolCallId = decodeUtf8(f.data);
+  }
+  return args;
+}
+
+function decodeForwardCompatibleWebFetchRequestQuery(iq) {
+  const payload = getUnknownLengthDelimitedPayload(iq, 9);
+  if (!payload) return null;
+  const out = { url: '', toolCallId: '', skipApproval: false };
+  for (const f of parseLengthDelimitedFields(payload)) {
+    if (f.no === 1 && f.wireType === WIRE_LENGTH_DELIMITED) {
+      const args = decodeWebFetchArgsPayload(f.data);
+      out.url = args.url || '';
+      out.toolCallId = args.toolCallId || '';
+    } else if (f.no === 2 && f.wireType === WIRE_VARINT) {
+      out.skipApproval = readProtoVarint(f.data, 0).value !== 0;
+    }
+  }
+  return out.url || out.toolCallId ? out : null;
+}
+
+function getWebFetchRequestInfo(iq, forwardCompatible) {
+  if (forwardCompatible) return forwardCompatible;
+  const args = iq?.query?.value?.args || {};
+  return {
+    url: args.url || '',
+    toolCallId: args.toolCallId || args.tool_call_id || '',
+    skipApproval: !!(iq?.query?.value?.skipApproval || iq?.query?.value?.skip_approval),
+  };
+}
+
+function buildWebFetchRequestResponsePayload(approved, reason) {
+  if (approved) {
+    // WebFetchRequestResponse.result.approved = 1, Approved is empty.
+    return protoFieldBytes(1, new Uint8Array(0));
+  }
+  const rejected = protoFieldString(1, reason || 'Tool not available; use MCP tools.');
+  // WebFetchRequestResponse.result.rejected = 2.
+  return protoFieldBytes(2, rejected);
+}
+
+function sendRawInteractionResponse(id, resultFieldNo, resultPayload, sendBinaryFrame) {
+  const interactionPayload = protoMessage([
+    protoFieldUInt32(1, id || 0),
+    resultFieldNo ? protoFieldBytes(resultFieldNo, resultPayload || new Uint8Array(0)) : null,
+  ]);
+  // AgentClientMessage.message.interaction_response = 6.
+  sendRawAgentClientMessage(protoFieldBytes(6, interactionPayload), sendBinaryFrame);
 }
 
 function summarizeSubagentToolResult(content) {
@@ -1076,10 +1106,10 @@ function getProtoField(obj, camelName, snakeName, fallback = '') {
 
 function normalizeCursorGrepOutputMode(mode) {
   const raw = String(mode || '').trim();
-  if (!raw || raw === 'files_with_matches' || raw === 'files') return 'files';
+  if (!raw || raw === 'files_with_matches' || raw === 'files') return 'files_with_matches';
   if (raw === 'content') return 'content';
   if (raw === 'count') return 'count';
-  return 'files';
+  return 'files_with_matches';
 }
 
 function normalizeClientGrepOutputMode(mode) {
@@ -1247,9 +1277,10 @@ function buildNativeGrepResult(create, A, meta, text) {
   const outputMode = normalizeCursorGrepOutputMode(
     typeof meta === 'object' && meta ? meta.outputMode || meta.output_mode || '' : ''
   );
+  const resultMode = outputMode === 'files_with_matches' ? 'files' : outputMode;
   const lines = _splitToolResultLines(text);
   let union;
-  if (outputMode === 'content') {
+  if (resultMode === 'content') {
     const byFile = new Map();
     for (const line of lines) {
       const m = /^(.*?):(\d+):(.*)$/.exec(line);
@@ -1278,7 +1309,7 @@ function buildNativeGrepResult(create, A, meta, text) {
     union = create(A.GrepUnionResultSchema, {
       result: { case: 'content', value: contentResult },
     });
-  } else if (outputMode === 'count') {
+  } else if (resultMode === 'count') {
     const counts = lines.map((line) => {
       const m = /^(.*?):(\d+)$/.exec(line);
       return create(A.GrepFileCountSchema, {
@@ -1674,7 +1705,7 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
           pattern: msgValue?.pattern || '',
           ...(msgValue?.path ? { path: msgValue.path } : {}),
           ...(msgValue?.glob ? { glob: msgValue.glob } : {}),
-          ...(cursorOutputMode ? { output_mode: clientOutputMode } : {}),
+          output_mode: clientOutputMode,
         },
       });
       return 'grep-passthrough';
@@ -2043,6 +2074,8 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
   const A = agent;
   const id = iq.id;
   const queryCase = iq.query?.case;
+  const forwardCompatibleWebFetch = !queryCase ? decodeForwardCompatibleWebFetchRequestQuery(iq) : null;
+  const effectiveQueryCase = forwardCompatibleWebFetch ? 'webFetchRequestQuery' : queryCase;
   const passthroughNative = opts && opts.passthroughNativeTools === true;
   const onServerToolUse = opts && typeof opts.onServerToolUse === 'function'
     ? opts.onServerToolUse
@@ -2059,7 +2092,7 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
     if (process.env.CURSOR_LOG_INTERACTION === '1') {
       const idShort = typeof id === 'string' ? id.slice(0, 8) : id;
       const x = extra ? ` ${extra}` : '';
-      console.log(`[cursor-agent] interactionQuery case=${queryCase} id=${idShort} passthrough=${passthroughNative} action=${action}${x}`);
+      console.log(`[cursor-agent] interactionQuery case=${effectiveQueryCase} id=${idShort} passthrough=${passthroughNative} action=${action}${x}`);
     }
   }
 
@@ -2067,7 +2100,7 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
   // some have a flat oneof, others wrap it in a *Result. Only WebSearch
   // currently has an "approve" path; everything else rejects.
   let resultCase, resultValue;
-  switch (queryCase) {
+  switch (effectiveQueryCase) {
     case 'webSearchRequestQuery':
       resultCase = 'webSearchRequestResponse';
       if (passthroughNative) {
@@ -2098,9 +2131,55 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
         traceInteraction('reject', `reason="${REJECT_REASON}"`);
       }
       break;
-    // There is no webFetchRequestQuery in the vendored proto. If Cursor adds
-    // one later, do not route public URL lookup to the proxy host by default;
-    // keep it Cursor-backend-native or require an explicit local-fetch opt-in.
+    case 'webFetchRequestQuery': {
+      const fetchInfo = getWebFetchRequestInfo(iq, forwardCompatibleWebFetch);
+      if (passthroughNative) {
+        if (onServerToolUse) {
+          try {
+            onServerToolUse({
+              phase: 'started',
+              name: 'web_fetch',
+              serverTool: 'web_fetch',
+              id: fetchInfo.toolCallId || `cursor-webfetch-${id}`,
+              input: { url: fetchInfo.url },
+              source: forwardCompatibleWebFetch
+                ? 'interaction_query_wire_approve'
+                : 'interaction_query_approve',
+            });
+          } catch { /* observability hook only */ }
+        }
+        traceInteraction('approve', `url="${fetchInfo.url.slice(0, 160)}"`);
+        if (forwardCompatibleWebFetch) {
+          sendRawInteractionResponse(
+            id,
+            9,
+            buildWebFetchRequestResponsePayload(true),
+            sendBinaryFrame
+          );
+          return;
+        }
+        resultCase = 'webFetchRequestResponse';
+        resultValue = create(A.WebFetchRequestResponseSchema, {
+          result: { case: 'approved', value: create(A.WebFetchRequestResponse_ApprovedSchema, {}) },
+        });
+      } else {
+        traceInteraction('reject', `reason="${REJECT_REASON}"`);
+        if (forwardCompatibleWebFetch) {
+          sendRawInteractionResponse(
+            id,
+            9,
+            buildWebFetchRequestResponsePayload(false, REJECT_REASON),
+            sendBinaryFrame
+          );
+          return;
+        }
+        resultCase = 'webFetchRequestResponse';
+        resultValue = create(A.WebFetchRequestResponseSchema, {
+          result: { case: 'rejected', value: create(A.WebFetchRequestResponse_RejectedSchema, { reason: REJECT_REASON }) },
+        });
+      }
+      break;
+    }
     case 'exaSearchRequestQuery':
       resultCase = 'exaSearchRequestResponse';
       resultValue = create(A.ExaSearchRequestResponseSchema, {
@@ -2152,70 +2231,16 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
       traceInteraction('empty-success');
       break;
     default: {
-      // Gap-2 fix (WEB_RESEARCH_GAPS.md): detect webFetchRequestQuery
-      // BEFORE the diagnostic dump. Cursor's webFetchRequestQuery is a
-      // post-vendoring oneof case (field 9) — when the inner model asks
-      // its backend to fetch a URL as a research follow-up. Without a
-      // handler, our previous code abandoned the interaction; Cursor
-      // then attached an "error" to the parent WebSearch result, the
-      // model lost confidence in real tools, and fell back to writing
-      // hallucinated content into agent-tools/<uuid>.txt.
-      //
-      // Wire format (decoded from production hex dumps):
-      //   InteractionQuery field 9 (length-delimited) {
-      //     field 1 (length-delimited): URL string
-      //     field 2 (length-delimited): tool_use_id string
-      //   }
-      //
-      // Default behavior: send a clean structured rejection with a clear
-      // reason, so the model gets a definite NO and decides whether to
-      // tell the user or retry differently — instead of silent timeout.
-      //
-      // Opt-in (RATLC_NATIVE_WEBFETCH_HANDLER=1): actually run the fetch
-      // on the proxy host and synthesize a "success" response. Not yet
-      // implemented because the success-response field layout is unknown;
-      // sending an empty approved {} is the closest analog.
-      try {
-        const iqBytes = toBinary(A.InteractionQuerySchema, iq);
-        const webFetchFieldBytes = _findUnknownLengthDelimitedField(iqBytes, 9);
-        if (webFetchFieldBytes) {
-          let url = '';
-          let toolUseId = '';
-          try {
-            const inner = parseLengthDelimitedFields(webFetchFieldBytes);
-            for (const f of inner) {
-              if (f.no === 1 && f.wireType === 2) url = decodeUtf8(f.data);
-              else if (f.no === 2 && f.wireType === 2) toolUseId = decodeUtf8(f.data);
-            }
-          } catch { /* decode failures fall through to abandon */ }
-          if (url) {
-            console.log(`[cursor-agent] webFetchRequestQuery detected: url="${url.slice(0, 120)}" toolUseId="${toolUseId}"`);
-            // Build WebFetchRequestResponse { rejected = field 2 { reason = field 1 } }
-            // Field numbers mirror WebSearchRequestResponse: approved=1, rejected=2
-            const rejectReason =
-              'WebFetch is not available through this proxy bridge. The model is asked to either ' +
-              '(a) tell the user this URL cannot be fetched, or (b) summarize/answer from existing context if possible. ' +
-              'Do NOT fabricate URL content from training data.';
-            const rejectedInner = protoMessage([protoFieldString(1, rejectReason)]);
-            const webFetchResponseBytes = protoFieldBytes(2, rejectedInner);
-            // Build raw InteractionResponse bytes: field 1 = id (varint), field 9 = response
-            const baseBytes = toBinary(A.InteractionResponseSchema, create(A.InteractionResponseSchema, { id }));
-            const combinedBytes = Buffer.concat([Buffer.from(baseBytes), protoFieldBytes(9, webFetchResponseBytes)]);
-            // Re-parse into InteractionResponse so the unknown field 9 goes into
-            // $unknown; the schema's toBinary will preserve it when wrapped.
-            const { fromBinary: fb } = _requireProto();
-            const interactionResponseWithUnknown = fb(A.InteractionResponseSchema, combinedBytes);
-            const wrapper2 = create(A.AgentClientMessageSchema, {
-              message: { case: 'interactionResponse', value: interactionResponseWithUnknown },
-            });
-            sendBinaryFrame(toBinary(A.AgentClientMessageSchema, wrapper2));
-            traceInteraction('webfetch-rejected', `url="${url.slice(0, 80)}"`);
-            return;
-          }
-        }
-      } catch (e) {
-        console.log(`[cursor-agent] webFetchRequestQuery detection failed: ${e.message} — falling through to abandon`);
-      }
+      // Our previous Gap-2 webFetchRequestQuery rejection lived here, but the
+      // PR-#2 work (decodeForwardCompatibleWebFetchRequestQuery +
+      // effectiveQueryCase remapping at the top of this function + the full
+      // 'webFetchRequestQuery' case above) now handles it with an APPROVAL
+      // path so Cursor's backend actually fetches the URL and returns real
+      // content. The webFetchRequestQuery wire bytes are detected and
+      // transformed into effectiveQueryCase === 'webFetchRequestQuery'
+      // before this switch, so we never reach default for that case anymore.
+      // This default branch remains the catch-all diagnostic dump for any
+      // OTHER future post-vendoring oneof cases Cursor adds.
 
       // Unknown / not in our vendored proto. Send a bare InteractionResponse
       // with just `id` set.
@@ -2325,6 +2350,69 @@ function _webSearchResultsFromSuccess(success) {
   return out;
 }
 
+function _unknownOneofPayload(message, fieldNo) {
+  const raw = getUnknownLengthDelimited(message, fieldNo);
+  if (!raw) return null;
+  return readProtoLengthDelimited(_asUint8Array(raw.data), 0).bytes;
+}
+
+function _decodeKnownOrUnknownWebFetchToolCall(tc) {
+  if (_oneofCase(tc) === 'webFetchToolCall') {
+    const inner = _oneofValue(tc) || {};
+    const args = inner.args || {};
+    const result = inner.result;
+    const resultCase = _oneofCase(result);
+    const resultValue = _oneofValue(result) || {};
+    return {
+      args: {
+        url: _asString(args.url).trim(),
+        toolCallId: _asString(args.toolCallId || args.tool_call_id).trim(),
+      },
+      resultCase,
+      resultValue: {
+        markdown: _asString(resultValue.markdown || resultValue.content || resultValue.error || resultValue.reason),
+        error: _asString(resultValue.error || resultValue.reason),
+      },
+    };
+  }
+
+  const webFetchToolCall = _unknownOneofPayload(tc, 37);
+  if (!webFetchToolCall) return null;
+  const decoded = { args: { url: '', toolCallId: '' }, resultCase: undefined, resultValue: {} };
+  for (const f of parseLengthDelimitedFields(webFetchToolCall)) {
+    if (f.no === 1 && f.wireType === WIRE_LENGTH_DELIMITED) {
+      decoded.args = decodeWebFetchArgsPayload(f.data);
+    } else if (f.no === 2 && f.wireType === WIRE_LENGTH_DELIMITED) {
+      for (const rf of parseLengthDelimitedFields(f.data)) {
+        if (rf.no === 1) {
+          decoded.resultCase = 'success';
+          let markdown = '';
+          let url = decoded.args.url || '';
+          for (const sf of parseLengthDelimitedFields(rf.data)) {
+            if (sf.no === 1) url = decodeUtf8(sf.data) || url;
+            else if (sf.no === 2) markdown = decodeUtf8(sf.data);
+          }
+          decoded.resultValue = { url, markdown };
+        } else if (rf.no === 2) {
+          decoded.resultCase = 'error';
+          let url = decoded.args.url || '';
+          let error = '';
+          for (const ef of parseLengthDelimitedFields(rf.data)) {
+            if (ef.no === 1) url = decodeUtf8(ef.data) || url;
+            else if (ef.no === 2) error = decodeUtf8(ef.data);
+          }
+          decoded.resultValue = { url, error };
+        } else if (rf.no === 3) {
+          decoded.resultCase = 'rejected';
+          const reasonField = parseLengthDelimitedFields(rf.data).find((x) => x.no === 1);
+          decoded.resultValue = { error: reasonField ? decodeUtf8(reasonField.data) : 'rejected' };
+        }
+      }
+    }
+  }
+  return decoded.args.url || decoded.args.toolCallId || decoded.resultCase ? decoded : null;
+}
+
 function extractWebSearchServerToolEvent(iuCase, iuVal) {
   if (iuCase !== 'toolCallStarted' && iuCase !== 'toolCallCompleted') return null;
   const tc = iuVal?.toolCall;
@@ -2366,6 +2454,52 @@ function extractWebSearchServerToolEvent(iuCase, iuVal) {
     },
     error: _asString(resultValue.error || resultValue.reason || resultCase || 'web_search_failed'),
   };
+}
+
+function extractWebFetchServerToolEvent(iuCase, iuVal) {
+  if (iuCase !== 'toolCallStarted' && iuCase !== 'toolCallCompleted') return null;
+  const decoded = _decodeKnownOrUnknownWebFetchToolCall(iuVal?.toolCall);
+  if (!decoded) return null;
+  const args = decoded.args || {};
+  const url = _asString(args.url).trim();
+  const cursorToolCallId = _asString(args.toolCallId || args.tool_call_id).trim();
+  const rawId = _asString(iuVal?.callId || cursorToolCallId || iuVal?.modelCallId).trim()
+    || crypto.createHash('sha1').update(`web-fetch:${url}`).digest('hex').slice(0, 16);
+  const base = {
+    name: 'web_fetch',
+    serverTool: 'web_fetch',
+    id: rawId,
+    input: { url },
+  };
+
+  if (iuCase === 'toolCallStarted') {
+    return { ...base, phase: 'started' };
+  }
+
+  if (decoded.resultCase === 'success') {
+    const markdown = _asString(decoded.resultValue?.markdown).trim();
+    return {
+      ...base,
+      phase: 'completed',
+      content: markdown
+        ? [{ type: 'web_fetch_result', url: _asString(decoded.resultValue?.url || url), content: markdown }]
+        : [],
+      bytes: Buffer.byteLength(markdown),
+    };
+  }
+  return {
+    ...base,
+    phase: 'completed',
+    content: {
+      type: 'web_fetch_tool_result_error',
+      error_code: _normalizeWebSearchErrorCode(decoded.resultCase, decoded.resultValue),
+    },
+    error: _asString(decoded.resultValue?.error || decoded.resultCase || 'web_fetch_failed'),
+  };
+}
+
+function extractServerToolEvent(iuCase, iuVal) {
+  return extractWebSearchServerToolEvent(iuCase, iuVal) || extractWebFetchServerToolEvent(iuCase, iuVal);
 }
 
 // ── Build an ExecClientMessage and send it as a binary connect frame ──
@@ -3029,7 +3163,7 @@ function startConversation(token, options = {}) {
       // by Cursor's backend before we see this envelope — we cannot rewrite
       // it from here. See WEBSEARCH_WEBFETCH_REVIEW.md Issues 1 and 2 for
       // the broader observability gap.
-      const serverToolEvent = extractWebSearchServerToolEvent(iuCase, iuVal);
+      const serverToolEvent = extractServerToolEvent(iuCase, iuVal);
       if (serverToolEvent) {
         try { currentCallbacks.onServerToolUse(serverToolEvent); }
         catch (e) { console.log(`[cursor-agent] onServerToolUse threw: ${e.message}`); }
@@ -3691,6 +3825,8 @@ module.exports = {
   handleKvMessage,
   handleInteractionQuery,
   extractWebSearchServerToolEvent,
+  extractWebFetchServerToolEvent,
+  extractServerToolEvent,
   sendExecClientMessage,
   sendExecClientControlMessage,
   sendExecClientMessageAndClose,

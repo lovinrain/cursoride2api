@@ -47,7 +47,7 @@ const {
   handleExecMessage,
   handleKvMessage,
   handleInteractionQuery,
-  extractWebSearchServerToolEvent,
+  extractServerToolEvent,
   sendExecClientMessage,
   sendExecClientControlMessage,
   sendExecClientMessageAndClose,
@@ -723,7 +723,7 @@ function startConversation(token, options = {}) {
         }
         return;
       }
-      const serverToolEvent = extractWebSearchServerToolEvent(iuCase, iuVal);
+      const serverToolEvent = extractServerToolEvent(iuCase, iuVal);
       if (serverToolEvent) {
         try { currentCallbacks.onServerToolUse(serverToolEvent); }
         catch (e) { console.log(`[cursor-agent-h1] onServerToolUse threw: ${e.message}`); }

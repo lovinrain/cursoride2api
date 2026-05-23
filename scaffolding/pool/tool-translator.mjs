@@ -101,10 +101,38 @@ const ARG_CURSOR_TO_ANTHROPIC = {
   // We accept either and emit claude-code's exact shape.
   StrReplace: (args) => {
     const file_path = args.file_path || args.path || args.target_file || '';
-    const old_string = args.old_string || args.old_str || args.find || '';
-    const new_string = args.new_string || args.new_str || args.replace || '';
-    const replace_all = args.replace_all === true;
+    const old_string = args.old_string ?? args.oldString ?? args.old_str ?? args.old ?? args.find ?? args.target ?? '';
+    const new_string = args.new_string ?? args.newString ?? args.new_str ?? args.new ?? args.replace ?? args.replacement ?? '';
+    const replace_all = args.replace_all === true || args.replaceAll === true || args.all === true;
     return { file_path, old_string, new_string, ...(replace_all ? { replace_all: true } : {}) };
+  },
+
+  Edit: (args) => {
+    const out = { ...(args || {}) };
+    if (out.path != null && out.file_path == null) { out.file_path = out.path; delete out.path; }
+    if (out.oldString != null && out.old_string == null) { out.old_string = out.oldString; delete out.oldString; }
+    if (out.old_str != null && out.old_string == null) { out.old_string = out.old_str; delete out.old_str; }
+    if (out.old != null && out.old_string == null) { out.old_string = out.old; delete out.old; }
+    if (out.find != null && out.old_string == null) { out.old_string = out.find; delete out.find; }
+    if (out.target != null && out.old_string == null) { out.old_string = out.target; delete out.target; }
+    if (out.newString != null && out.new_string == null) { out.new_string = out.newString; delete out.newString; }
+    if (out.new_str != null && out.new_string == null) { out.new_string = out.new_str; delete out.new_str; }
+    if (out.new != null && out.new_string == null) { out.new_string = out.new; delete out.new; }
+    if (out.replace != null && out.new_string == null) { out.new_string = out.replace; delete out.replace; }
+    if (out.replacement != null && out.new_string == null) { out.new_string = out.replacement; delete out.replacement; }
+    if (out.replaceAll != null && out.replace_all == null) { out.replace_all = out.replaceAll; delete out.replaceAll; }
+    return out;
+  },
+
+  Grep: (args) => {
+    const out = { ...(args || {}) };
+    if (!out.output_mode && !out.outputMode) out.output_mode = 'files_with_matches';
+    if (out.outputMode != null && out.output_mode == null) {
+      out.output_mode = out.outputMode;
+      delete out.outputMode;
+    }
+    if (out.output_mode === 'files') out.output_mode = 'files_with_matches';
+    return out;
   },
 
   // EditNotebook → NotebookEdit. Likely takes notebook_path + cell_id + new_source.
@@ -259,6 +287,23 @@ export function defaultTranslateModeTools() {
           path: { type: 'string', description: 'Optional directory to search in (defaults to cwd).' },
         },
         required: ['pattern'],
+      },
+    },
+    // Anthropic `WebFetch` — explicit public URL fetch. Cursor also has a
+    // native fetch surface, but registering this MCP-compatible name gives
+    // the relay model a stable path that api-server can satisfy locally
+    // without leaking a Bash/curl fallback to the outer client.
+    {
+      name: 'WebFetch',
+      description:
+        'Fetch the contents of an explicit public http(s) URL. Use this for URL fetch requests; do not use Bash/curl for URL fetching unless the user specifically asks for a shell command.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'The public http(s) URL to fetch.' },
+          prompt: { type: 'string', description: 'Optional extraction instruction from the caller.' },
+        },
+        required: ['url'],
       },
     },
     // Anthropic `NotebookEdit` — Cursor calls this `EditNotebook` natively;

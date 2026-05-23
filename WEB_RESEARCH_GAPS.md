@@ -15,29 +15,36 @@ This doc:
 2. Identifies the three gaps precisely with code locations.
 3. Proposes a concrete fix for each, ranked by blast radius and value.
 
-**Status as of 2026-05-23**: ALL THREE GAPS FIXED in a single commit.
-Default behavior changes:
+**Status as of 2026-05-23** (revised after porting colleague's work):
+ALL THREE GAPS FIXED with the **real** Fix 2B (approval, not
+rejection) for Gap 2.
 
-- **Gap 3 (Fix 3A)**: any `agent-tools/<uuid>.txt` Write — empty or
-  pre-filled — triggers the spoof-mitigation. Real Bing RSS results
-  replace the (possibly hallucinated) content. Log line distinguishes
-  the two cases: `Write-spoof intercept: rewriting PRE-FILLED Write→...`
-  vs. the existing empty-write log.
+- **Gap 3 (Fix 3A → virtual store)**: `agent-tools/<uuid>.txt` Writes
+  no longer round-trip through claude-code at all. The proxy captures
+  the content in an in-memory virtual store and replies directly with
+  a synthetic tool_result. Reads from the same path return the stored
+  content. The model's hallucinated content never reaches the user's
+  disk and never appears in the claude-code TUI. The earlier Bing-RSS
+  spoof (broadened predicate + injection) is retained as a fallback
+  for non-translate mode but is dead code for the typical pool config.
 - **Gap 1 (Fix 1A+1C)**: when Cursor's WebSearch completes but the
   proxy can't extract result metadata, the cached query is re-run on
   Bing RSS and substituted as a real `web_search_tool_result` content
   array. Env var `RATLC_WEBSEARCH_FALLBACK=0` to disable.
-- **Gap 2 (Fix 2C)**: `webFetchRequestQuery` is detected (post-vendoring
-  field 9), URL and tool_use_id decoded from wire bytes, and Cursor
-  receives a structured rejection with a clear reason. Model gets a
-  definite NO instead of silent timeout-then-fabricate. Fix 2B (real
-  proxy-side fetch + approved response) is deferred — see "Open
-  follow-ups" below.
+- **Gap 2 (Fix 2B — REAL handler)**: `webFetchRequestQuery` is
+  detected (post-vendoring field 9), the URL decoded, and the proxy
+  APPROVES so Cursor's backend actually fetches the URL. The fetched
+  content streams back via `toolCallCompleted` and is surfaced to
+  claude-code as a `web_fetch_tool_result` content block (visible in
+  TUI as `[Cursor WebFetch] <url>`). Model gets the real page content
+  instead of falling into Write-spoof fabrication.
+
+The previous Gap-2 rejection-only path (commit `a5f0e2c`) has been
+removed — the real approval path supersedes it.
 
 Live verification: api-server restarted (channels preserved); next live
-session should show `spoof: launching async search` and
-`websearch fallback: substituted N Bing results` log lines instead of
-silent fabrication.
+session should show `[Cursor WebFetch]` blocks with real result counts
+instead of silent abandonment + Write-spoof cascade.
 
 ## The symptom users see
 

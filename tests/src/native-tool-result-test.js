@@ -64,7 +64,7 @@ const {
   assert.equal(grep.result.case, 'success');
   assert.equal(grep.result.value.pattern, 'TODO');
   assert.equal(grep.result.value.path, '/tmp');
-  assert.equal(grep.result.value.outputMode, 'files');
+  assert.equal(grep.result.value.outputMode, 'files_with_matches');
   assert.ok(grep.result.value.workspaceResults['/tmp']);
   assert.equal(grep.result.value.workspaceResults['/tmp'].result.case, 'files');
   assert.deepEqual(
@@ -72,6 +72,15 @@ const {
     ['/tmp/a.txt', '/tmp/b.txt']
   );
   assert.equal(grep.result.value.workspaceResults['/tmp'].result.value.totalFiles, 2);
+
+  const grepDefault = buildNativeGrepResult(
+    create,
+    agent,
+    { pattern: 'TODO', path: '/tmp' },
+    '/tmp/default.txt\n'
+  );
+  assert.equal(grepDefault.result.value.outputMode, 'files_with_matches');
+  assert.equal(grepDefault.result.value.workspaceResults['/tmp'].result.case, 'files');
 
   const grepContent = buildNativeGrepResult(
     create,

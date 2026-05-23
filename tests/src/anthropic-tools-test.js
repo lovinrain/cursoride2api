@@ -25,6 +25,33 @@ const oldServerWebFetch = process.env.CURSOR_SERVER_WEBFETCH;
 }
 
 {
+  const registered = new Set(['Edit']);
+  assert.equal(tools.canonicalizeHallucinatedToolName('StrReplace', registered), 'Edit');
+  assert.deepEqual(tools.normalizeHallucinatedToolArgs('Edit', {
+    path: '/tmp/a.txt',
+    oldString: 'old',
+    replacement: 'new',
+    replaceAll: true,
+  }), {
+    file_path: '/tmp/a.txt',
+    old_string: 'old',
+    new_string: 'new',
+    replace_all: true,
+  });
+}
+
+{
+  assert.deepEqual(tools.normalizeHallucinatedToolArgs('Grep', {
+    pattern: 'TODO',
+    path: '/tmp',
+  }), {
+    pattern: 'TODO',
+    path: '/tmp',
+    output_mode: 'files_with_matches',
+  });
+}
+
+{
   delete process.env.CURSOR_SERVER_WEBFETCH;
   assert.equal(tools.shouldDropClientWebLookupToolName('WebFetch'), false);
   assert.equal(tools.shouldDropClientWebLookupToolName('Fetch'), false);

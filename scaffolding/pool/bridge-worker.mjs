@@ -166,7 +166,7 @@ function buildPrimingPrompt(system, callerTools) {
   // and Y". The model has the explicit tool list in its prompt; we want it
   // to feel free to use whatever's there, including Cursor's native built-ins
   // (Shell, Read, Write, Grep, ...) that get auto-injected alongside ours.
-  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND Cursor-native built-ins. For broad web search, use Cursor-native WebSearch. For a user-explicit URL fetch, WebFetch/Fetch may be used; Bash/curl is allowed only when the environment permits it. Do not use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.');
+  lines.push('Inspect your available-tools list and use whatever tools are present as appropriate. Tools include any caller-registered MCP tools AND Cursor-native built-ins. For broad web search, use Cursor-native WebSearch. For a user-explicit URL fetch, use WebFetch/Fetch when available; do not use Bash/curl for URL fetching unless the user specifically asks for a shell command. Do not use WebFetch/Fetch as a broad-search substitute for Cursor-native WebSearch.');
   lines.push('When a delivered request lists client MCP tools named like `mcp__server__tool` (for example browser-devtools), use the `client_mcp_call` tool: pass the exact MCP name as `tool_name` and the real tool arguments as `input`. Do not say the MCP server is unavailable just because that exact `mcp__...` name is not in this warm pool\'s static tool list.');
   lines.push(`At the END of EVERY response (after any other tool calls), you MUST call \`${YIELD_TOOL_NAME}\` to wait for the next user message.`);
   if (POOL_CONTEXT_MODE === 'full') {

@@ -103,6 +103,43 @@ process.on('message', (msg) => {
         });
         return;
       }
+      if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_AGENT_TOOLS_WRITE__')) {
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}-agent-tools-write`,
+          name: 'Write',
+          args: {
+            file_path: 'agent-tools/11111111-2222-4333-8444-555555555555.txt',
+            content: 'virtual web payload',
+          },
+        });
+        return;
+      }
+      if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_AGENT_TOOLS_READ__')) {
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}-agent-tools-read`,
+          name: 'Read',
+          args: {
+            file_path: 'agent-tools/11111111-2222-4333-8444-555555555555.txt',
+          },
+        });
+        return;
+      }
+      if (msg.type === 'send_user_message' && String(msg.text || '').includes('__MOCK_WEBFETCH__')) {
+        send({
+          type: 'tool_use',
+          requestId: msg.requestId,
+          execId: `exec-${CHANNEL_ID}-webfetch`,
+          name: 'WebFetch',
+          args: {
+            url: 'http://127.0.0.1/',
+          },
+        });
+        return;
+      }
       send({ type: 'text_delta', requestId: msg.requestId, text: `[mock ${CHANNEL_ID}/${MODEL}] ack` });
       send({ type: 'yield', requestId: msg.requestId });
       setState('ready');

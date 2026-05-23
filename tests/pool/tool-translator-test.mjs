@@ -29,10 +29,45 @@ import {
 }
 
 {
+  const out = cursorToAnthropic('mcp_WebFetch', { url: 'https://example.com/' });
+  assert.equal(out.ok, true);
+  assert.equal(out.name, 'WebFetch');
+  assert.deepEqual(out.input, { url: 'https://example.com/' });
+}
+
+{
   const out = cursorToAnthropic('mcp_Write', { file_path: '/tmp/a.txt', content: 'hello' });
   assert.equal(out.ok, true);
   assert.equal(out.name, 'Write');
   assert.deepEqual(out.input, { file_path: '/tmp/a.txt', content: 'hello' });
+}
+
+{
+  const out = cursorToAnthropic('StrReplace', {
+    path: '/tmp/a.txt',
+    oldString: 'old',
+    replacement: 'new',
+    replaceAll: true,
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.name, 'Edit');
+  assert.deepEqual(out.input, {
+    file_path: '/tmp/a.txt',
+    old_string: 'old',
+    new_string: 'new',
+    replace_all: true,
+  });
+}
+
+{
+  const out = cursorToAnthropic('Grep', { pattern: 'TODO', path: '/tmp' });
+  assert.equal(out.ok, true);
+  assert.equal(out.name, 'Grep');
+  assert.deepEqual(out.input, {
+    pattern: 'TODO',
+    path: '/tmp',
+    output_mode: 'files_with_matches',
+  });
 }
 
 {
@@ -45,6 +80,7 @@ import {
 {
   const tools = defaultTranslateModeTools();
   assert.ok(tools.some((t) => t.name === CLIENT_MCP_DISPATCH_TOOL_NAME));
+  assert.ok(tools.some((t) => t.name === 'WebFetch'));
 }
 
 console.log('tool-translator-test: OK');

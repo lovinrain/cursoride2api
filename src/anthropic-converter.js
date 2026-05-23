@@ -165,7 +165,7 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
       `(for example Claude Code), not by the user's Cursor IDE configuration. ` +
       `When one of these tools is needed, call it normally; do not tell the user to configure it in Cursor. ` +
       `If Cursor shows an mcp_ prefix for a tool, it is the same client-declared tool with a collision-safe name. ` +
-      `Broad web search should use Cursor's native WebSearch. For an explicit URL fetch, WebFetch/Fetch may be used and is served by the proxy with public-URL safety checks; Bash/curl is allowed only when the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files. ` +
+      `Broad web search should use Cursor's native WebSearch. For an explicit URL fetch, use WebFetch/Fetch when available; it is served by the proxy with public-URL safety checks. Do not use Bash/curl for URL fetching unless the user specifically asks for a shell command. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files. ` +
       `Available client-declared tools for this request: ${shown}${more}.\n` +
       `</system>`
     );
@@ -173,7 +173,7 @@ function anthropicMessagesToPrompt(messages, system, opts = {}) {
     parts.push(
       `<system>\n` +
       `Web search is provided by Cursor's native WebSearch in this bridge. ` +
-      `Do not look for or call client-declared MCP WebSearch or mcp_WebSearch variants as a broad-search fallback. For explicit URL fetches, WebFetch/Fetch may be used when available. Do not use Bash, Shell, curl, wget, or local HTTP requests as a broad-search fallback unless the user explicitly asks for a URL fetch/curl test and the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files.\n` +
+      `Do not look for or call client-declared MCP WebSearch or mcp_WebSearch variants as a broad-search fallback. For explicit URL fetches, use WebFetch/Fetch when available. Do not use Bash, Shell, curl, wget, or local HTTP requests as a broad-search fallback or URL-fetch workaround unless the user explicitly asks for a shell/curl test and the environment permits it. If native WebSearch is unavailable for broad search, say that web search is unavailable; do not print pseudo tool calls or create agent-tools placeholder files.\n` +
       `</system>`
     );
   }

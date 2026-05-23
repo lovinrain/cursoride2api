@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  getPoolLocalToolDecision,
   isPoolLocalToolName,
   normalizePoolLocalToolName,
   runPoolLocalTool,
@@ -21,6 +22,8 @@ try {
 
   assert.equal(normalizePoolLocalToolName('mcp_Grep'), 'Grep');
   assert.equal(normalizePoolLocalToolName('mcp_Glob'), 'Glob');
+  assert.equal(normalizePoolLocalToolName('StrReplace'), 'Edit');
+  assert.equal(normalizePoolLocalToolName('mcp_Edit'), 'Edit');
   assert.equal(normalizePoolLocalToolName('mcp_WebFetch'), 'WebFetch');
   assert.equal(normalizePoolLocalToolName('mcp__github__search'), '');
   assert.equal(isPoolLocalToolName('Fetch'), true);
@@ -72,6 +75,83 @@ try {
     const res = await runPoolLocalTool('WebFetch', { url: 'http://127.0.0.1/' });
     assert.equal(res.ok, false);
     assert.match(res.content, /Private or local IP URLs are blocked|Localhost URLs are blocked/);
+  }
+
+  {
+    const editFile = path.join(root, 'src', 'edit.txt');
+    await fs.writeFile(editFile, 'alpha\nbeta\n');
+    const res = await runPoolLocalTool('StrReplace', {
+      file_path: editFile,
+      old_string: 'beta',
+      new_string: 'gamma',
+    });
+    assert.equal(res.ok, true);
+    assert.match(res.content, /Replacements: 1/);
+    assert.equal(await fs.readFile(editFile, 'utf8'), 'alpha\ngamma\n');
+  }
+
+  {
+    const oldRoots = process.env.RATLC_WINDOWS_DRIVE_ROOTS;
+    const missingDriveRoot = path.join(root, 'missing-drive-d');
+    process.env.RATLC_WINDOWS_DRIVE_ROOTS = `${missingDriveRoot}`;
+    try {
+      const decision = getPoolLocalToolDecision('Grep', {
+        pattern: 'Testing',
+        path: 'D:/XM/Nx/test_tools.txt',
+      });
+      assert.equal(decision.canRun, false);
+      assert.equal(decision.retryOnClient, true);
+      assert.match(decision.reason, /not visible to the proxy process/);
+
+      const grep = await runPoolLocalTool('Grep', {
+        pattern: 'Testing',
+        path: 'D:/XM/Nx/test_tools.txt',
+        output_mode: 'content',
+      });
+      assert.equal(grep.ok, false);
+      assert.equal(grep.retryOnClient, true);
+      assert.match(grep.content, /should be forwarded to the outer client/);
+
+      const editDecision = getPoolLocalToolDecision('Edit', {
+        file_path: 'D:/XM/Nx/test_tools.txt',
+        old_string: 'Testing',
+        new_string: 'Checked',
+      });
+      assert.equal(editDecision.canRun, false);
+      assert.equal(editDecision.retryOnClient, true);
+    } finally {
+      if (oldRoots == null) delete process.env.RATLC_WINDOWS_DRIVE_ROOTS;
+      else process.env.RATLC_WINDOWS_DRIVE_ROOTS = oldRoots;
+    }
+  }
+
+  {
+    const driveRoot = path.join(root, 'drive-d');
+    const mappedFile = path.join(driveRoot, 'XM', 'Nx', 'test_tools.txt');
+    await fs.mkdir(path.dirname(mappedFile), { recursive: true });
+    await fs.writeFile(mappedFile, 'Testing windows path\n');
+    const oldRoots = process.env.RATLC_WINDOWS_DRIVE_ROOTS;
+    process.env.RATLC_WINDOWS_DRIVE_ROOTS = `${driveRoot}`;
+    try {
+      const grep = await runPoolLocalTool('Grep', {
+        pattern: 'Testing',
+        path: 'D:/XM/Nx/test_tools.txt',
+        output_mode: 'content',
+      });
+      assert.equal(grep.ok, true);
+      assert.match(grep.content, /test_tools\.txt:1:Testing windows path/);
+
+      const edit = await runPoolLocalTool('Edit', {
+        file_path: 'D:/XM/Nx/test_tools.txt',
+        old_string: 'windows',
+        new_string: 'mapped',
+      });
+      assert.equal(edit.ok, true);
+      assert.equal(await fs.readFile(mappedFile, 'utf8'), 'Testing mapped path\n');
+    } finally {
+      if (oldRoots == null) delete process.env.RATLC_WINDOWS_DRIVE_ROOTS;
+      else process.env.RATLC_WINDOWS_DRIVE_ROOTS = oldRoots;
+    }
   }
 
   console.log('local-tool-executor-test: OK');

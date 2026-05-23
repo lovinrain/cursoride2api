@@ -1,7 +1,19 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+
+// Stub for the context-store feature from a separate WIP commit (f2715c7
+// "avoid inline full-context stalls") on the colleague's branch. We ported
+// the webFetch + virtual-store work without that feature; this stub keeps
+// the references in normalizePoolLocalToolName and getPoolLocalToolDecision
+// functional (always returns false → no tool name is treated as a context
+// tool). If/when the context-store is ported, replace this with:
+//   import { isContextToolName } from './context-store.mjs';
+function isContextToolName(_name) {
+  return false;
+}
 
 const DEFAULT_CWD = process.env.RATLC_LOCAL_TOOL_CWD || process.cwd();
 const MAX_RESULTS = Math.max(1, parseInt(process.env.RATLC_LOCAL_TOOL_MAX_RESULTS || '2000', 10));
@@ -25,8 +37,10 @@ export function normalizePoolLocalToolName(name) {
   const lower = unprefixed.toLowerCase();
   if (lower === 'grep') return 'Grep';
   if (lower === 'glob') return 'Glob';
+  if (lower === 'edit' || lower === 'strreplace') return 'Edit';
   if (lower === 'webfetch') return 'WebFetch';
   if (lower === 'fetch') return 'Fetch';
+  if (isContextToolName(unprefixed)) return unprefixed;
   return '';
 }
 
@@ -37,11 +51,25 @@ export function isPoolLocalToolName(name) {
 export async function runPoolLocalTool(name, args = {}, opts = {}) {
   const normalized = normalizePoolLocalToolName(name);
   try {
+    const decision = getPoolLocalToolDecision(normalized, args, opts);
+    if (!decision.canRun) {
+      return {
+        ok: false,
+        name: normalized || String(name || ''),
+        retryOnClient: !!decision.retryOnClient,
+        localToolSkipped: true,
+        reason: decision.reason || 'Local tool cannot run in this proxy process',
+        content: formatLocalToolUnavailable(normalized || name, decision),
+      };
+    }
     if (normalized === 'Grep') {
       return { ok: true, name: normalized, content: await runLocalGrep(args, opts) };
     }
     if (normalized === 'Glob') {
       return { ok: true, name: normalized, content: await runLocalGlob(args, opts) };
+    }
+    if (normalized === 'Edit') {
+      return { ok: true, name: normalized, content: await runLocalEdit(args, opts) };
     }
     if (normalized === 'WebFetch' || normalized === 'Fetch') {
       return { ok: true, name: normalized, content: await runLocalWebFetch(args) };
@@ -53,14 +81,192 @@ export async function runPoolLocalTool(name, args = {}, opts = {}) {
   }
 }
 
+export function getPoolLocalToolDecision(name, args = {}, opts = {}) {
+  const normalized = normalizePoolLocalToolName(name);
+  const cwd = opts.cwd || DEFAULT_CWD;
+  if (!normalized) {
+    return { canRun: false, retryOnClient: false, reason: `Unsupported local tool: ${name || '(empty)'}` };
+  }
+  if (normalized === 'WebFetch' || normalized === 'Fetch' || isContextToolName(normalized)) {
+    return { canRun: true, retryOnClient: false, reason: 'proxy-local tool' };
+  }
+  if (normalized === 'Grep') {
+    const searchPath = args.path || deriveGlobSearchRoot(args.glob || '', '', cwd);
+    const detail = inspectResolvablePath(searchPath, cwd);
+    if (!detail.exists) {
+      return {
+        canRun: false,
+        retryOnClient: true,
+        reason: `Grep path is not visible to the proxy process: ${detail.requested}`,
+        detail,
+      };
+    }
+    return { canRun: true, retryOnClient: false, detail };
+  }
+  if (normalized === 'Glob') {
+    const pattern = String(args.pattern || args.glob || '*').trim() || '*';
+    const root = deriveGlobSearchRoot(pattern, args.path || '', cwd);
+    const detail = inspectResolvablePath(root, cwd);
+    if (!detail.exists) {
+      return {
+        canRun: false,
+        retryOnClient: true,
+        reason: `Glob search root is not visible to the proxy process: ${detail.requested}`,
+        detail,
+      };
+    }
+    if (!detail.isDirectory) {
+      return {
+        canRun: false,
+        retryOnClient: true,
+        reason: `Glob search root is not a directory in the proxy process: ${detail.requested}`,
+        detail,
+      };
+    }
+    return { canRun: true, retryOnClient: false, detail };
+  }
+  if (normalized === 'Edit') {
+    const requestedPath = String(extractEditPath(args) || '').trim();
+    if (!requestedPath) return { canRun: true, retryOnClient: false, reason: 'invalid Edit request; let tool return schema error' };
+    const detail = inspectResolvablePath(requestedPath, cwd);
+    if (!detail.exists) {
+      return {
+        canRun: false,
+        retryOnClient: true,
+        reason: `Edit file is not visible to the proxy process: ${detail.requested}`,
+        detail,
+      };
+    }
+    if (!detail.isFile) {
+      return {
+        canRun: false,
+        retryOnClient: true,
+        reason: `Edit path is not a file in the proxy process: ${detail.requested}`,
+        detail,
+      };
+    }
+    return { canRun: true, retryOnClient: false, detail };
+  }
+  return { canRun: false, retryOnClient: false, reason: `Unsupported local tool: ${normalized}` };
+}
+
+function formatLocalToolUnavailable(name, decision = {}) {
+  const detail = decision.detail || {};
+  const lines = [
+    `[proxy_notice] ${decision.reason || `Local ${name || 'tool'} cannot run in this proxy process.`}`,
+  ];
+  if (detail.resolved) lines.push(`requested=${detail.requested || ''}`);
+  if (detail.resolved) lines.push(`resolved=${detail.resolved}`);
+  if (detail.kind === 'windows-drive' && Array.isArray(detail.candidates)) {
+    lines.push(`windows_drive_roots=${windowsDriveRootTemplates().join(',')}`);
+    lines.push(`candidate_roots=${detail.candidateRoots.join(',')}`);
+  }
+  if (decision.retryOnClient) {
+    lines.push('The tool should be forwarded to the outer client because the file path may live in the client workspace.');
+  }
+  return lines.join('\n');
+}
+
 function resolveFromCwd(value, cwd = DEFAULT_CWD) {
+  return inspectResolvablePath(value, cwd).resolved;
+}
+
+function inspectResolvablePath(value, cwd = DEFAULT_CWD) {
   const raw = String(value || '').trim();
-  if (!raw) return path.resolve(cwd);
-  return path.resolve(cwd, raw);
+  const requested = raw || '.';
+  let detail;
+  if (!raw) {
+    detail = { kind: 'cwd', requested, resolved: path.resolve(cwd) };
+  } else {
+    const windowsPath = resolveWindowsDrivePathDetailed(raw);
+    if (windowsPath) detail = windowsPath;
+    else detail = { kind: path.isAbsolute(raw) ? 'absolute' : 'relative', requested, resolved: path.resolve(cwd, raw) };
+  }
+  let st = null;
+  try {
+    st = fsSync.statSync(detail.resolved);
+  } catch {
+    st = null;
+  }
+  return {
+    ...detail,
+    exists: !!st,
+    isFile: !!st && st.isFile(),
+    isDirectory: !!st && st.isDirectory(),
+  };
 }
 
 function normalizeSlash(value) {
   return String(value || '').replace(/\\/g, '/');
+}
+
+function windowsDrivePathParts(value) {
+  const raw = normalizeSlash(String(value || '').trim());
+  const m = /^([A-Za-z]):\/?(.*)$/.exec(raw);
+  if (!m) return null;
+  return {
+    drive: m[1].toLowerCase(),
+    driveUpper: m[1].toUpperCase(),
+    rest: String(m[2] || '').replace(/^\/+/, ''),
+  };
+}
+
+function windowsDriveRootTemplates() {
+  return String(process.env.RATLC_WINDOWS_DRIVE_ROOTS || '/{drive},/mnt/{drive},/{DRIVE},/mnt/{DRIVE}')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function resolveWindowsDrivePath(value) {
+  const detail = resolveWindowsDrivePathDetailed(value);
+  return detail ? detail.resolved : '';
+}
+
+function resolveWindowsDrivePathDetailed(value) {
+  const parts = windowsDrivePathParts(value);
+  if (!parts) return null;
+  const templates = windowsDriveRootTemplates();
+  const candidateRoots = templates.map((template) => template
+    .replace(/\{drive\}/g, parts.drive)
+    .replace(/\{DRIVE\}/g, parts.driveUpper));
+  const candidates = candidateRoots.map((root) => {
+    return path.resolve(root, parts.rest);
+  });
+  for (let i = 0; i < candidates.length; i++) {
+    if (fsSync.existsSync(candidates[i])) {
+      return {
+        kind: 'windows-drive',
+        requested: normalizeSlash(String(value || '').trim()),
+        resolved: candidates[i],
+        root: path.resolve(candidateRoots[i]),
+        candidateRoots: candidateRoots.map((r) => path.resolve(r)),
+        candidates,
+      };
+    }
+  }
+  for (let i = 0; i < candidates.length; i++) {
+    const root = path.resolve(candidateRoots[i]);
+    if (fsSync.existsSync(root)) {
+      return {
+        kind: 'windows-drive',
+        requested: normalizeSlash(String(value || '').trim()),
+        resolved: candidates[i],
+        root,
+        candidateRoots: candidateRoots.map((r) => path.resolve(r)),
+        candidates,
+      };
+    }
+  }
+  const root = candidateRoots[0] || '';
+  return {
+    kind: 'windows-drive',
+    requested: normalizeSlash(String(value || '').trim()),
+    resolved: candidates[0] || '',
+    root: root ? path.resolve(root) : '',
+    candidateRoots: candidateRoots.map((r) => path.resolve(r)),
+    candidates,
+  };
 }
 
 function hasGlobMagic(value) {
@@ -78,6 +284,14 @@ function deriveGlobSearchRoot(pattern, pathArg, cwd = DEFAULT_CWD) {
   const raw = String(pattern || '').trim();
   if (!raw) return path.resolve(cwd);
   const magicAt = firstGlobMagicIndex(raw);
+  if (windowsDrivePathParts(raw)) {
+    if (magicAt < 0) return path.dirname(resolveFromCwd(raw, cwd));
+    const staticPart = normalizeSlash(raw.slice(0, magicAt));
+    const dir = staticPart.endsWith('/')
+      ? staticPart
+      : path.posix.dirname(staticPart);
+    return resolveFromCwd(dir, cwd);
+  }
   if (path.isAbsolute(raw)) {
     if (magicAt < 0) return path.dirname(raw);
     const staticPart = raw.slice(0, magicAt);
@@ -137,7 +351,8 @@ function globToRegExp(glob) {
 }
 
 function makeGlobMatcher(pattern, root, cwd = DEFAULT_CWD) {
-  const raw = String(pattern || '*').trim() || '*';
+  const inputRaw = String(pattern || '*').trim() || '*';
+  const raw = windowsDrivePathParts(inputRaw) ? resolveWindowsDrivePath(inputRaw) : inputRaw;
   const absolutePattern = path.isAbsolute(raw);
   const rootAbs = path.resolve(cwd, root || cwd);
   const regex = globToRegExp(absolutePattern ? normalizeSlash(path.resolve(cwd, raw)) : raw);
@@ -239,6 +454,64 @@ async function runLocalGrep(args = {}, opts = {}) {
     }
   }
   return out.slice(0, MAX_RESULTS).join('\n') + (out.length ? '\n' : '');
+}
+
+function extractEditPath(args = {}) {
+  return args.file_path || args.filePath || args.path || args.filename || '';
+}
+
+function extractOldString(args = {}) {
+  return args.old_string ?? args.oldString ?? args.old_str ?? args.old ?? args.find ?? args.target ?? '';
+}
+
+function extractNewString(args = {}) {
+  return args.new_string ?? args.newString ?? args.new_str ?? args.new ?? args.replace ?? args.replacement ?? '';
+}
+
+function countOccurrences(text, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let at = 0;
+  while (true) {
+    const idx = text.indexOf(needle, at);
+    if (idx < 0) return count;
+    count++;
+    at = idx + needle.length;
+  }
+}
+
+async function runLocalEdit(args = {}, opts = {}) {
+  const cwd = opts.cwd || DEFAULT_CWD;
+  const requestedPath = String(extractEditPath(args) || '').trim();
+  if (!requestedPath) throw new Error('Edit requires file_path');
+  const filePath = resolveFromCwd(requestedPath, cwd);
+  const oldString = String(extractOldString(args));
+  const newString = String(extractNewString(args));
+  if (!oldString) throw new Error('Edit requires old_string');
+  if (oldString === newString) throw new Error('new_string must differ from old_string');
+
+  let before;
+  try {
+    before = await fs.readFile(filePath, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') throw new Error(`File not found: ${requestedPath}`);
+    throw e;
+  }
+  const occurrences = countOccurrences(before, oldString);
+  if (occurrences === 0) {
+    throw new Error(`string not found in ${requestedPath}: ${oldString.slice(0, 160)}`);
+  }
+  const replaceAll = args.replace_all === true || args.replaceAll === true || args.all === true;
+  const after = replaceAll
+    ? before.split(oldString).join(newString)
+    : before.replace(oldString, newString);
+  await fs.writeFile(filePath, after, 'utf8');
+  const applied = replaceAll ? occurrences : 1;
+  return [
+    `Edited ${requestedPath}`,
+    `Resolved path: ${filePath}`,
+    `Replacements: ${applied}`,
+  ].join('\n');
 }
 
 async function runLocalGlob(args = {}, opts = {}) {
