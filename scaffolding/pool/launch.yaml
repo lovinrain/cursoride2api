@@ -56,6 +56,12 @@ CURSOR_ALLOW_LOCAL_SHELL_NETWORK: 1
 # to `darwin` (see memory: project_token_machine_os_fingerprint.md).
 CURSOR_CLIENT_OS: darwin
 
+# ── api-server HTTP bind ───────────────────────────────────────────────────
+# 0.0.0.0 = reachable from any interface (LAN / WAN if firewall permits).
+# 127.0.0.1 = localhost only. The API is unauthenticated; only expose to
+# untrusted networks when you understand the implications.
+RATLC_API_HOST: 0.0.0.0
+
 # ── Optional diagnostic toggles (leave commented unless debugging) ────────
 # CURSOR_LOG_NATIVE_EXEC: 1                    # log every ExecServerMessage case
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)
