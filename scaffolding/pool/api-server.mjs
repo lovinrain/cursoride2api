@@ -249,6 +249,13 @@ let reconnectTimer = null;
 // growth on long-running api-server processes.
 const SPOOF_PLAYBOOK_MAX = 256;
 const SPOOF_SEARCH_WAIT_MS = 5000;
+// Gap-1 (WEB_RESEARCH_GAPS.md): when Cursor's WebSearch completes but the
+// proxy can't extract result metadata from the bidi stream, fall back to
+// Bing RSS on the proxy host and substitute those as the result content.
+// Set to 0 to disable (then the original error_code:'unavailable' block
+// is emitted as before).
+const WEBSEARCH_FALLBACK_ENABLED = (process.env.RATLC_WEBSEARCH_FALLBACK || '1') === '1';
+const WEBSEARCH_FALLBACK_TIMEOUT_MS = parseInt(process.env.RATLC_WEBSEARCH_FALLBACK_TIMEOUT_MS || '4500', 10);
 const spoofResultPlaybook = new Map();
 function recordSpoofResult(toolUseId, promise) {
   if (!toolUseId || !promise) return;
@@ -531,12 +538,17 @@ function renderThinkingPreamble(thinkingTurns) {
 }
 
 function looksLikeAgentToolPlaceholderWrite(toolName, args) {
+  // Gap-3 fix (WEB_RESEARCH_GAPS.md): any Write to agent-tools/<uuid>.txt
+  // is a confabulation pattern — empty placeholders are the model's
+  // older fallback; pre-filled writes with hallucinated content are the
+  // newer pattern. Both should be intercepted. (Previous check was
+  // `c === '' || c === '(No content)'` which only caught empties and
+  // let hallucinated content reach disk as "successful" Write.)
   const normalizedTool = anthropicTools.normalizeClientToolNameForPolicy(toolName);
   if (normalizedTool !== 'write') return false;
   const a = args && typeof args === 'object' ? args : {};
   const p = String(a.file_path || a.path || a.filename || '').replace(/\\/g, '/');
-  const c = String(a.content ?? a.file_text ?? a.text ?? a.body ?? a.data ?? '').trim();
-  return /^agent-tools\/[^/]+\.txt$/i.test(p) && (c === '' || c === '(No content)');
+  return /^agent-tools\/[^/]+\.txt$/i.test(p);
 }
 
 async function handleMessagesRequest(req, res) {
@@ -702,6 +714,10 @@ async function handleMessagesRequest(req, res) {
   const serverToolBlocks = new Map();
   const openServerTools = new Set();
   const visibleServerToolTraces = new Set();
+  // Gap-1 fix (WEB_RESEARCH_GAPS.md): cache the query at started phase so
+  // the completed phase has it available for the Bing-RSS fallback when
+  // extraction fails.
+  const serverToolQueries = new Map();  // toolId -> query string
   let serverWebSearchRequestCount = 0;
   // `messageStarted` gates startMsg() so it can only fire once per request.
   // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
@@ -964,7 +980,7 @@ async function handleMessagesRequest(req, res) {
     return String(id || ('srv_' + randomUUID().replace(/-/g, '').slice(0, 16))).replace(/[^A-Za-z0-9_-]/g, '_');
   }
 
-  function emitServerToolUseEvent(event) {
+  async function emitServerToolUseEvent(event) {
     if (done) return;
     if (!event || event.name !== 'web_search') return;
     startMsg();
@@ -975,10 +991,15 @@ async function handleMessagesRequest(req, res) {
 
     if (event.phase === 'started') {
       if (serverToolBlocks.has(toolId)) return;
+      // Gap-1 fix (WEB_RESEARCH_GAPS.md): remember the query for this
+      // toolId so if the completed phase arrives with empty/unparseable
+      // content, the fallback path can re-run the search on the proxy
+      // and substitute real results.
+      const queryForFallback = String(event.input?.query || '').replace(/\s+/g, ' ').trim();
+      if (queryForFallback) serverToolQueries.set(toolId, queryForFallback);
       if (RENDER_SERVER_TOOL_TEXT && !visibleServerToolTraces.has(toolId)) {
         visibleServerToolTraces.add(toolId);
-        const query = String(event.input?.query || '').replace(/\s+/g, ' ').trim();
-        emitTextDelta(`[Cursor WebSearch] ${query || '(query unavailable)'}\n`);
+        emitTextDelta(`[Cursor WebSearch] ${queryForFallback || '(query unavailable)'}\n`);
         stopTextBlock();
       }
       blockIdx++;
@@ -1010,25 +1031,68 @@ async function handleMessagesRequest(req, res) {
 
     if (event.phase === 'completed') {
       if (!serverToolBlocks.has(toolId)) {
-        emitServerToolUseEvent({ ...event, phase: 'started' });
+        await emitServerToolUseEvent({ ...event, phase: 'started' });
       }
       openServerTools.delete(toolId);
+      // Capture blockIdx BEFORE any await — emitServerToolUseEvent now
+      // awaits Bing-RSS in the fallback path, and concurrent emits could
+      // bump blockIdx out from under us if we held it as a closure ref.
       blockIdx++;
-      const content = Array.isArray(event.content) ? event.content : (event.content || {
-        type: 'web_search_tool_result_error',
-        error_code: 'unavailable',
-      });
+      const idx = blockIdx;
+      let content = Array.isArray(event.content) ? event.content : (event.content || null);
+      let resultSource = 'cursor';
+      // Gap-1 fix (WEB_RESEARCH_GAPS.md): when Cursor's backend completed
+      // the WebSearch but the proxy couldn't extract result metadata,
+      // re-run the search via Bing RSS on the proxy host and surface those
+      // as a real web_search_tool_result content array (not an error). The
+      // model gets usable results instead of falling into the Write-spoof
+      // confabulation pattern.
+      if (!Array.isArray(content)) {
+        const cachedQuery = serverToolQueries.get(toolId) || '';
+        if (cachedQuery && WEBSEARCH_FALLBACK_ENABLED) {
+          try {
+            const results = await performWebSearch(cachedQuery, {
+              timeoutMs: WEBSEARCH_FALLBACK_TIMEOUT_MS,
+              maxResults: 5,
+            });
+            if (results && results.length > 0 && !resultsLookGeneric(results)) {
+              content = results.map((r) => ({
+                type: 'web_search_result',
+                url: r.url,
+                title: r.title || '',
+                encrypted_content: r.snippet || '',
+                page_age: null,
+              }));
+              resultSource = 'proxy_bing_fallback';
+              log(`  ↪ websearch fallback: substituted ${results.length} Bing results for failed extraction (q="${cachedQuery.slice(0, 80)}")`);
+            } else {
+              log(`  ↪ websearch fallback: Bing returned ${results?.length || 0} results (generic=${resultsLookGeneric(results)}) — emitting error block`);
+            }
+          } catch (e) {
+            log(`  ↪ websearch fallback: Bing failed (${e.message || e}) — emitting error block`);
+          }
+        }
+      }
+      // Final fallback: if we still don't have a content array, emit the
+      // original error block.
+      if (!Array.isArray(content)) {
+        content = {
+          type: 'web_search_tool_result_error',
+          error_code: 'unavailable',
+        };
+      }
       sseWrite(res, 'content_block_start', {
         type: 'content_block_start',
-        index: blockIdx,
+        index: idx,
         content_block: {
           type: 'web_search_tool_result',
           tool_use_id: toolId,
           content,
         },
       });
-      sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIdx });
-      log(`→ web_search_tool_result to client: id=${toolId} results=${Array.isArray(content) ? content.length : 'error'}`);
+      sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+      log(`→ web_search_tool_result to client: id=${toolId} results=${Array.isArray(content) ? content.length : 'error'} source=${resultSource}`);
+      serverToolQueries.delete(toolId);
     }
   }
 
@@ -1388,7 +1452,15 @@ async function handleMessagesRequest(req, res) {
           const fp = msg.args?.file_path || '';
           const content = msg.args?.content || '';
           const uuidV4Path = /^agent-tools\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt$/i;
-          if (uuidV4Path.test(fp) && String(content).trim() === '') {
+          // Gap-3 fix (WEB_RESEARCH_GAPS.md): trigger the mitigation on ANY
+          // write to agent-tools/<uuid>.txt regardless of content. The path
+          // is Cursor's backend staging convention; a client-side Write to
+          // it is always a confabulation pattern. Pre-filled writes used to
+          // skip the mitigation (content === '' check) and the hallucinated
+          // body reached disk as a "successful" Write.
+          if (uuidV4Path.test(fp)) {
+            const isPreFilled = String(content).trim().length > 0
+              && String(content).trim() !== '(No content)';
             const noticeBody =
               '[proxy_notice — read this carefully]\n\n' +
               'This file was created by a CLIENT-SIDE Write tool call, not by a real ' +
@@ -1407,7 +1479,7 @@ async function handleMessagesRequest(req, res) {
               'user that and call `bajie_yield`.\n\n' +
               'DO NOT quote this proxy_notice as if it were search results. DO NOT ' +
               'fabricate web content.';
-            log(`⚠ Write-spoof intercept: rewriting empty Write→${fp} content with proxy_notice (${noticeBody.length}B) requestId=${requestId}`);
+            log(`⚠ Write-spoof intercept: rewriting ${isPreFilled ? 'PRE-FILLED' : 'empty'} Write→${fp} ${isPreFilled ? `(${String(content).length}B hallucinated content)` : ''}with proxy_notice (${noticeBody.length}B) requestId=${requestId}`);
             // Mutate the args in place so the normal forwarding path
             // below picks up the new content. The shape stays identical
             // to a regular Write — file_path unchanged, content now

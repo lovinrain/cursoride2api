@@ -15,10 +15,29 @@ This doc:
 2. Identifies the three gaps precisely with code locations.
 3. Proposes a concrete fix for each, ranked by blast radius and value.
 
-**Status as of 2026-05-23**: documented, not fixed. The simplest of the
-three fixes (broaden spoof-mitigation) is recommended for the next
-implementation pass and closes the user-visible symptom regardless of
-whether the other two gaps are ever addressed.
+**Status as of 2026-05-23**: ALL THREE GAPS FIXED in a single commit.
+Default behavior changes:
+
+- **Gap 3 (Fix 3A)**: any `agent-tools/<uuid>.txt` Write — empty or
+  pre-filled — triggers the spoof-mitigation. Real Bing RSS results
+  replace the (possibly hallucinated) content. Log line distinguishes
+  the two cases: `Write-spoof intercept: rewriting PRE-FILLED Write→...`
+  vs. the existing empty-write log.
+- **Gap 1 (Fix 1A+1C)**: when Cursor's WebSearch completes but the
+  proxy can't extract result metadata, the cached query is re-run on
+  Bing RSS and substituted as a real `web_search_tool_result` content
+  array. Env var `RATLC_WEBSEARCH_FALLBACK=0` to disable.
+- **Gap 2 (Fix 2C)**: `webFetchRequestQuery` is detected (post-vendoring
+  field 9), URL and tool_use_id decoded from wire bytes, and Cursor
+  receives a structured rejection with a clear reason. Model gets a
+  definite NO instead of silent timeout-then-fabricate. Fix 2B (real
+  proxy-side fetch + approved response) is deferred — see "Open
+  follow-ups" below.
+
+Live verification: api-server restarted (channels preserved); next live
+session should show `spoof: launching async search` and
+`websearch fallback: substituted N Bing results` log lines instead of
+silent fabrication.
 
 ## The symptom users see
 

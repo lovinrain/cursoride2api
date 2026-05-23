@@ -562,6 +562,30 @@ function getUnknownLengthDelimited(execMsg, fieldNo) {
   return unknown.find((u) => u && u.no === fieldNo && u.wireType === WIRE_LENGTH_DELIMITED) || null;
 }
 
+// Scan a serialized proto message for a top-level length-delimited field
+// with the given field number, return its body bytes (or null). Used to
+// detect post-vendoring oneof cases like webFetchRequestQuery without
+// relying on $unknown population (which is unreliable for nested oneofs).
+function _findUnknownLengthDelimitedField(messageBytes, targetFieldNo) {
+  const data = _asUint8Array(messageBytes);
+  let off = 0;
+  while (off < data.length) {
+    const tag = readProtoVarint(data, off);
+    if (tag.error || tag.offset <= off) break;
+    off = tag.offset;
+    const no = Math.floor(tag.value / 8);
+    const wireType = tag.value & 7;
+    if (wireType === WIRE_LENGTH_DELIMITED) {
+      const value = readProtoLengthDelimited(data, off);
+      if (no === targetFieldNo) return value.bytes;
+      off = value.offset;
+    } else {
+      off = skipProtoField(data, wireType, off);
+    }
+  }
+  return null;
+}
+
 function getUnknownLengthDelimitedPayload(execMsg, fieldNo) {
   const unknown = getUnknownLengthDelimited(execMsg, fieldNo);
   if (!unknown) return null;
@@ -2127,7 +2151,72 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
       });
       traceInteraction('empty-success');
       break;
-    default:
+    default: {
+      // Gap-2 fix (WEB_RESEARCH_GAPS.md): detect webFetchRequestQuery
+      // BEFORE the diagnostic dump. Cursor's webFetchRequestQuery is a
+      // post-vendoring oneof case (field 9) — when the inner model asks
+      // its backend to fetch a URL as a research follow-up. Without a
+      // handler, our previous code abandoned the interaction; Cursor
+      // then attached an "error" to the parent WebSearch result, the
+      // model lost confidence in real tools, and fell back to writing
+      // hallucinated content into agent-tools/<uuid>.txt.
+      //
+      // Wire format (decoded from production hex dumps):
+      //   InteractionQuery field 9 (length-delimited) {
+      //     field 1 (length-delimited): URL string
+      //     field 2 (length-delimited): tool_use_id string
+      //   }
+      //
+      // Default behavior: send a clean structured rejection with a clear
+      // reason, so the model gets a definite NO and decides whether to
+      // tell the user or retry differently — instead of silent timeout.
+      //
+      // Opt-in (RATLC_NATIVE_WEBFETCH_HANDLER=1): actually run the fetch
+      // on the proxy host and synthesize a "success" response. Not yet
+      // implemented because the success-response field layout is unknown;
+      // sending an empty approved {} is the closest analog.
+      try {
+        const iqBytes = toBinary(A.InteractionQuerySchema, iq);
+        const webFetchFieldBytes = _findUnknownLengthDelimitedField(iqBytes, 9);
+        if (webFetchFieldBytes) {
+          let url = '';
+          let toolUseId = '';
+          try {
+            const inner = parseLengthDelimitedFields(webFetchFieldBytes);
+            for (const f of inner) {
+              if (f.no === 1 && f.wireType === 2) url = decodeUtf8(f.data);
+              else if (f.no === 2 && f.wireType === 2) toolUseId = decodeUtf8(f.data);
+            }
+          } catch { /* decode failures fall through to abandon */ }
+          if (url) {
+            console.log(`[cursor-agent] webFetchRequestQuery detected: url="${url.slice(0, 120)}" toolUseId="${toolUseId}"`);
+            // Build WebFetchRequestResponse { rejected = field 2 { reason = field 1 } }
+            // Field numbers mirror WebSearchRequestResponse: approved=1, rejected=2
+            const rejectReason =
+              'WebFetch is not available through this proxy bridge. The model is asked to either ' +
+              '(a) tell the user this URL cannot be fetched, or (b) summarize/answer from existing context if possible. ' +
+              'Do NOT fabricate URL content from training data.';
+            const rejectedInner = protoMessage([protoFieldString(1, rejectReason)]);
+            const webFetchResponseBytes = protoFieldBytes(2, rejectedInner);
+            // Build raw InteractionResponse bytes: field 1 = id (varint), field 9 = response
+            const baseBytes = toBinary(A.InteractionResponseSchema, create(A.InteractionResponseSchema, { id }));
+            const combinedBytes = Buffer.concat([Buffer.from(baseBytes), protoFieldBytes(9, webFetchResponseBytes)]);
+            // Re-parse into InteractionResponse so the unknown field 9 goes into
+            // $unknown; the schema's toBinary will preserve it when wrapped.
+            const { fromBinary: fb } = _requireProto();
+            const interactionResponseWithUnknown = fb(A.InteractionResponseSchema, combinedBytes);
+            const wrapper2 = create(A.AgentClientMessageSchema, {
+              message: { case: 'interactionResponse', value: interactionResponseWithUnknown },
+            });
+            sendBinaryFrame(toBinary(A.AgentClientMessageSchema, wrapper2));
+            traceInteraction('webfetch-rejected', `url="${url.slice(0, 80)}"`);
+            return;
+          }
+        }
+      } catch (e) {
+        console.log(`[cursor-agent] webFetchRequestQuery detection failed: ${e.message} — falling through to abandon`);
+      }
+
       // Unknown / not in our vendored proto. Send a bare InteractionResponse
       // with just `id` set.
       // Cursor's server treats an unset `result` oneof as "client abandoned
@@ -2189,6 +2278,7 @@ function handleInteractionQuery(iq, sendBinaryFrame, opts) {
       resultCase = undefined;
       resultValue = undefined;
       break;
+    }
   }
 
   const interactionResponseFields = { id };
