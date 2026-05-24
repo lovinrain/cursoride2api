@@ -257,6 +257,33 @@ const SPOOF_SEARCH_WAIT_MS = 5000;
 // is emitted as before).
 const WEBSEARCH_FALLBACK_ENABLED = (process.env.RATLC_WEBSEARCH_FALLBACK || '1') === '1';
 const WEBSEARCH_FALLBACK_TIMEOUT_MS = parseInt(process.env.RATLC_WEBSEARCH_FALLBACK_TIMEOUT_MS || '4500', 10);
+
+// ── Auto-retry on transient upstream failures ──────────────────────────────
+// Two distinct symptoms get separately-budgeted retry:
+//
+//   upstream_silent_timeout — pool routed, Cursor accepted the bidi frame, then
+//     >NO_VISIBLE_EVENT_TIMEOUT_MS passed with no text/thinking/tool_use/yield/
+//     error. Usually a transient (Cursor's vendored proto evolves; an unknown
+//     exec message makes the inner model wait forever). A different channel
+//     usually succeeds. Retry cancels the stuck channel + replays the original
+//     send_user_message payload; pool round-robins to a fresh channel.
+//
+//   empty_assistant_turn — Cursor cleanly ended the turn (yield/step_completed)
+//     but the model produced ZERO visible content. Less likely to be transient
+//     since the same prompt against the same model often gets the same answer;
+//     retry overrides sessionKey to null so the pool routes to a DIFFERENT
+//     channel. Optionally skipped if substantive thinking was captured (the
+//     model may have legitimately decided to say nothing).
+//
+// Both default off. Recommended starting point: silent=2, empty=1 with
+// thinking-aware default. Each retry burns one Cursor turn worth of quota +
+// adds latency, so cap conservatively. Only fires for send_user_message
+// payloads — send_tool_results retries are unsafe (consumed tool_use_id state).
+const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_UPSTREAM_SILENT_RETRY_MAX || '0', 10));
+const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_EMPTY_TURN_RETRY_MAX || '0', 10));
+const EMPTY_TURN_RETRY_IGNORE_THINKING = (process.env.RATLC_EMPTY_TURN_RETRY_IGNORE_THINKING || '0') === '1';
+const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
+const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
 const spoofResultPlaybook = new Map();
 function recordSpoofResult(toolUseId, promise) {
   if (!toolUseId || !promise) return;
@@ -727,6 +754,14 @@ async function handleMessagesRequest(req, res) {
   const serverToolQueries = new Map();  // toolId -> query string
   let serverWebSearchRequestCount = 0;
   let serverWebFetchRequestCount = 0;
+  // Auto-retry state (see RATLC_UPSTREAM_SILENT_RETRY_MAX / RATLC_EMPTY_TURN_RETRY_MAX).
+  // Snapshot of the original send_user_message poolWrite payload — captured
+  // for replay on retry. Only set for send_user_message; send_tool_results
+  // retries are unsafe so we don't retry them.
+  let lastSendUserMessagePayload = null;
+  let silentRetryCount = 0;
+  let emptyTurnRetryCount = 0;
+  let pendingRetryTimer = null;
   // `messageStarted` gates startMsg() so it can only fire once per request.
   // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
   // blockIdx — so the route_decision branch AND the error branch would
@@ -791,7 +826,12 @@ async function handleMessagesRequest(req, res) {
     noVisibleEventTimer = setTimeout(() => {
       noVisibleEventTimer = null;
       if (done || visibleUpstreamEventSeen) return;
-      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}`);
+      // Auto-retry hook: try once before giving up. Returns true if a retry
+      // was scheduled (in which case we just return — the replay will re-arm
+      // this watchdog). Returns false if retry is disabled, exhausted, or
+      // not safe (content already emitted).
+      if (tryRetryRequest('upstream_silent_timeout')) return;
+      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}${silentRetryCount ? ` (retries exhausted ${silentRetryCount}/${UPSTREAM_SILENT_RETRY_MAX})` : ''}`);
       finalStatusOverride = 'upstream_no_visible_event_timeout';
       finalErrorMessage = `No visible Cursor event within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms after routing`;
       emitTextDelta(
@@ -811,6 +851,84 @@ async function handleMessagesRequest(req, res) {
   function markVisibleUpstreamEvent() {
     visibleUpstreamEventSeen = true;
     disarmNoVisibleEventTimer();
+  }
+
+  // Auto-retry helper. Returns true if a retry was scheduled, false if not.
+  // Safe to call from both the watchdog (upstream_silent_timeout) and the
+  // empty-turn detection in finishMessage (empty_assistant_turn).
+  //
+  // Safety invariants checked in order:
+  //   1. The relevant per-symptom retry budget must allow it.
+  //   2. No client-visible content can have been emitted yet — retry would
+  //      otherwise produce duplicates in the same SSE response.
+  //   3. We must have captured the original send_user_message payload to
+  //      replay. send_tool_results-triggered failures cannot be retried
+  //      because the consumed tool_use_id state can't be cleanly re-injected.
+  //
+  // For `empty_assistant_turn` the sticky channel that produced the empty
+  // turn is still alive and would be selected again under session affinity;
+  // we override sessionKey to null on the replay payload so the pool routes
+  // round-robin to a different channel. For `upstream_silent_timeout` the
+  // channel got killed by the cancel_request, so a fresh routing decision
+  // is implicit.
+  function tryRetryRequest(symptom) {
+    if (done && symptom !== 'empty_assistant_turn') return false;
+    if (!lastSendUserMessagePayload) return false;
+    if (messageStarted) return false;
+    if (toolUseEmitted) return false;
+    const budget = symptom === 'upstream_silent_timeout'
+      ? UPSTREAM_SILENT_RETRY_MAX
+      : EMPTY_TURN_RETRY_MAX;
+    if (budget <= 0) return false;
+    const counterBefore = symptom === 'upstream_silent_timeout'
+      ? silentRetryCount
+      : emptyTurnRetryCount;
+    if (counterBefore >= budget) return false;
+    const counterAfter = counterBefore + 1;
+    if (symptom === 'upstream_silent_timeout') silentRetryCount = counterAfter;
+    else emptyTurnRetryCount = counterAfter;
+    log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} requestId=${requestId}`);
+    patchRequest(requestId, {
+      retryCount: silentRetryCount + emptyTurnRetryCount,
+      lastRetrySymptom: symptom,
+      lastRetryAt: Date.now(),
+    });
+    if (RETRY_EMIT_NOTICE && (silentRetryCount + emptyTurnRetryCount) === 1) {
+      // Only emit on the first overall retry so the client gets ONE breadcrumb,
+      // not a wall of notices on repeated retries.
+      emitTextDelta(`[proxy_notice] ${symptom} — auto-retrying through a fresh channel...\n`);
+    }
+    // For upstream_silent_timeout: cancel kills the stuck channel, releasing
+    // it for recycling. For empty_assistant_turn: the channel is fine but we
+    // want to break affinity, so we cancel anyway (no-op on already-finished
+    // request) and override sessionKey in the replay.
+    poolWrite({ type: 'cancel_request', requestId, reason: `retry:${symptom}` });
+    const replayPayload = symptom === 'empty_assistant_turn'
+      ? { ...lastSendUserMessagePayload, sessionKey: null }
+      : lastSendUserMessagePayload;
+    // Reset per-request state so the new attempt looks like a fresh route.
+    // We DO NOT clear lastSendUserMessagePayload — successive retries replay
+    // the same input. We DO clear watchdog state.
+    disarmNoVisibleEventTimer();
+    disarmToolUseFinalizer();
+    visibleUpstreamEventSeen = false;
+    if (symptom === 'empty_assistant_turn') {
+      // finishMessage was about to commit — reverse the done flag so the
+      // replay path can re-issue and the new response can stream.
+      done = false;
+      stopReason = null;
+      finalStatusOverride = null;
+      finalErrorMessage = null;
+    }
+    if (pendingRetryTimer) clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = setTimeout(() => {
+      pendingRetryTimer = null;
+      if (done) return;  // client disconnected during delay
+      log(`  → retry: ${symptom} firing replay requestId=${requestId} attempt=${counterAfter}`);
+      poolWrite(replayPayload);
+      armNoVisibleEventTimer();
+    }, RETRY_DELAY_MS);
+    return true;
   }
 
   function startMsg() {
@@ -1230,6 +1348,27 @@ async function handleMessagesRequest(req, res) {
       const rescued = tryRescueHallucinatedToolCalls();
       if (rescued > 0) stopReason = 'tool_use';
     } catch { /* never let textual tool-call rescue crash finalization */ }
+    // Auto-retry hook for empty_assistant_turn. Detected BEFORE we set done
+    // so the retry can re-issue cleanly. If thinking was captured for this
+    // convKey, the model may have legitimately decided to say nothing — gate
+    // the retry on EMPTY_TURN_RETRY_IGNORE_THINKING (default off, so we
+    // respect the model's silent thinking decision).
+    if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen && EMPTY_TURN_RETRY_MAX > 0) {
+      let thinkingHasContent = false;
+      try {
+        const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+        thinkingHasContent = Array.isArray(thinkingTurns)
+          && thinkingTurns.some((t) => t && typeof t.text === 'string' && t.text.trim().length > 0);
+      } catch { /* thinking-buffer access is best-effort */ }
+      const allowedByThinking = EMPTY_TURN_RETRY_IGNORE_THINKING || !thinkingHasContent;
+      if (allowedByThinking && tryRetryRequest('empty_assistant_turn')) {
+        // tryRetryRequest already reset done=false and scheduled the replay.
+        // Do NOT proceed with the rest of finishMessage — let the replay take
+        // over. The next finishMessage call (from the replayed turn) will
+        // commit/close as normal.
+        return;
+      }
+    }
     done = true;
     // Disarm watchdog centrally so the bookkeeping is symmetric across all
     // exit paths (step_completed / yield / error / watchdog / disconnect).
@@ -2004,7 +2143,7 @@ async function handleMessagesRequest(req, res) {
       imageCount,
       reinjectTurns: thinkingTurns.length,
     });
-    poolWrite({
+    const poolReqPayload = {
       type: 'request', requestId, action: poolAction,
       model: routingModel || null,
       requestedModel: model || null,
@@ -2015,7 +2154,12 @@ async function handleMessagesRequest(req, res) {
       sessionKey: sessionKey || null,
       contextMode: effectiveContextMode,
       hybridReason: contextGuardReason || hybrid?.reason || null,
-    });
+    };
+    // Snapshot for potential retry on upstream_silent_timeout / empty_assistant_turn.
+    // Only the initial send_user_message gets retried; tool_result follow-ups
+    // have consumed-id state that makes replay unsafe.
+    lastSendUserMessagePayload = poolReqPayload;
+    poolWrite(poolReqPayload);
   }
 
 	  function cancelForClientDisconnect() {
@@ -2023,6 +2167,7 @@ async function handleMessagesRequest(req, res) {
 	    log(`client disconnected mid-stream for ${requestId}`);
 	    patchRequest(requestId, { clientDisconnectedAt: Date.now() });
 	    poolWrite({ type: 'cancel_request', requestId, reason: 'client_disconnected' });
+	    if (pendingRetryTimer) { clearTimeout(pendingRetryTimer); pendingRetryTimer = null; }
 	    finishMessage();  // disarms the watchdog centrally
 	  }
 

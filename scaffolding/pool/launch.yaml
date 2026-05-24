@@ -62,6 +62,30 @@ CURSOR_CLIENT_OS: darwin
 # untrusted networks when you understand the implications.
 RATLC_API_HOST: 0.0.0.0
 
+# ── Auto-retry on transient upstream failures ──────────────────────────────
+# Two distinct symptoms can be auto-retried server-side. See
+# UPSTREAM_RETRY_DESIGN.md for the full design + cost model.
+#
+# upstream_silent_timeout — pool routed, Cursor accepted the bidi frame, then
+#   >25s passed with no text/thinking/tool_use/yield/error. Usually transient
+#   (unknown exec message, slow Cursor). A fresh channel typically succeeds.
+#   Retry cancels the stuck channel + replays the original payload.
+#
+# empty_assistant_turn — Cursor cleanly ended the turn but the model produced
+#   zero visible content. Less reliably transient (model may have legitimately
+#   decided to say nothing); retry overrides sessionKey to force a different
+#   channel. By default we SKIP retry when the model captured substantive
+#   thinking (set IGNORE_THINKING=1 to retry anyway).
+#
+# Both default off (MAX=0). Enable cautiously — each retry burns one Cursor
+# turn worth of quota and adds NO_VISIBLE_EVENT_TIMEOUT_MS to worst-case
+# client latency. Recommended starting values: SILENT=2, EMPTY=1.
+RATLC_UPSTREAM_SILENT_RETRY_MAX: 2             # 0=off, N=up to N retries on silent timeout
+RATLC_EMPTY_TURN_RETRY_MAX: 1                  # 0=off, N=up to N retries on empty turn
+# RATLC_EMPTY_TURN_RETRY_IGNORE_THINKING: 0    # 1=retry even if model captured thinking
+# RATLC_RETRY_DELAY_MS: 500                    # backoff between retries
+# RATLC_RETRY_EMIT_NOTICE: 1                   # tell client (one notice) on first retry
+
 # ── Optional diagnostic toggles (leave commented unless debugging) ────────
 # CURSOR_LOG_NATIVE_EXEC: 1                    # log every ExecServerMessage case
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)
