@@ -52,13 +52,18 @@ Causes are more mixed:
 - Pre-emptive content filter / refusal that surfaced as silence
 - Long-context confusion
 
-Retry can recover the wire-level case; the "model legitimately said
-nothing" case would re-fire on retry. We mitigate this by:
+Retry always fires up to the budget, regardless of whether thinking was
+captured. Rationale: an empty visible response is a degraded outcome from
+the caller's perspective in all cases. The "model thought and chose
+silence" case is rare and the cost of one extra Cursor call when it
+happens is acceptable. Captured thinking is preserved either way via
+the thinking-buffer and carried into the next request, so retry doesn't
+lose any latent state.
+
+We mitigate the risk of retry-loops on the rare "always-empty" case by:
 1. Defaulting `RATLC_EMPTY_TURN_RETRY_MAX=0` (opt-in only)
-2. Defaulting to thinking-aware behavior — if substantive thinking was
-   captured, skip retry (the model thought and chose silence; respect it)
-3. Recommended starting value `=1` (one retry, not aggressive)
-4. Forcing a different channel via `sessionKey: null` on the replay
+2. Recommending `=1` as the starting value (one retry, not aggressive)
+3. Forcing a different channel via `sessionKey: null` on the replay
    (otherwise session affinity routes back to the same channel which
    would produce the same empty output)
 
@@ -131,7 +136,6 @@ either to 0 disables that symptom's retry entirely.
 |---|---|---|---|
 | `RATLC_UPSTREAM_SILENT_RETRY_MAX` | `0` | 0–N | 0 disables; N enables up to N silent-timeout retries per request |
 | `RATLC_EMPTY_TURN_RETRY_MAX` | `0` | 0–N | 0 disables; N enables up to N empty-turn retries per request |
-| `RATLC_EMPTY_TURN_RETRY_IGNORE_THINKING` | `0` | 0 or 1 | 1 = retry even if model captured thinking; 0 (default) = respect silent thinking decisions |
 | `RATLC_RETRY_DELAY_MS` | `500` | ms | Backoff between cancel and replay |
 | `RATLC_RETRY_EMIT_NOTICE` | `1` | 0 or 1 | 1 (default) = emit a single `[proxy_notice]` to the client on first retry; 0 = silent |
 

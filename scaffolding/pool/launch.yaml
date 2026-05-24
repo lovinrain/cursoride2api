@@ -72,17 +72,16 @@ RATLC_API_HOST: 0.0.0.0
 #   Retry cancels the stuck channel + replays the original payload.
 #
 # empty_assistant_turn — Cursor cleanly ended the turn but the model produced
-#   zero visible content. Less reliably transient (model may have legitimately
-#   decided to say nothing); retry overrides sessionKey to force a different
-#   channel. By default we SKIP retry when the model captured substantive
-#   thinking (set IGNORE_THINKING=1 to retry anyway).
+#   zero visible content. Retry overrides sessionKey to force a different
+#   channel (otherwise affinity routes back to the same one which produced
+#   the empty output). Always retries up to budget regardless of thinking —
+#   empty visible output is a degraded outcome either way.
 #
 # Both default off (MAX=0). Enable cautiously — each retry burns one Cursor
 # turn worth of quota and adds NO_VISIBLE_EVENT_TIMEOUT_MS to worst-case
 # client latency. Recommended starting values: SILENT=2, EMPTY=1.
 RATLC_UPSTREAM_SILENT_RETRY_MAX: 2             # 0=off, N=up to N retries on silent timeout
 RATLC_EMPTY_TURN_RETRY_MAX: 1                  # 0=off, N=up to N retries on empty turn
-# RATLC_EMPTY_TURN_RETRY_IGNORE_THINKING: 0    # 1=retry even if model captured thinking
 # RATLC_RETRY_DELAY_MS: 500                    # backoff between retries
 # RATLC_RETRY_EMIT_NOTICE: 1                   # tell client (one notice) on first retry
 

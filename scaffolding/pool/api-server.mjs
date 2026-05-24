@@ -281,7 +281,6 @@ const WEBSEARCH_FALLBACK_TIMEOUT_MS = parseInt(process.env.RATLC_WEBSEARCH_FALLB
 // payloads — send_tool_results retries are unsafe (consumed tool_use_id state).
 const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_UPSTREAM_SILENT_RETRY_MAX || '0', 10));
 const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_EMPTY_TURN_RETRY_MAX || '0', 10));
-const EMPTY_TURN_RETRY_IGNORE_THINKING = (process.env.RATLC_EMPTY_TURN_RETRY_IGNORE_THINKING || '0') === '1';
 const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
 const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
 const spoofResultPlaybook = new Map();
@@ -1349,19 +1348,12 @@ async function handleMessagesRequest(req, res) {
       if (rescued > 0) stopReason = 'tool_use';
     } catch { /* never let textual tool-call rescue crash finalization */ }
     // Auto-retry hook for empty_assistant_turn. Detected BEFORE we set done
-    // so the retry can re-issue cleanly. If thinking was captured for this
-    // convKey, the model may have legitimately decided to say nothing — gate
-    // the retry on EMPTY_TURN_RETRY_IGNORE_THINKING (default off, so we
-    // respect the model's silent thinking decision).
+    // so the retry can re-issue cleanly. Empty visible output is always a
+    // degraded outcome from the caller's POV — retry up to budget regardless
+    // of whether thinking was captured. Captured thinking carries forward to
+    // the next request via thinkingBuffer either way.
     if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen && EMPTY_TURN_RETRY_MAX > 0) {
-      let thinkingHasContent = false;
-      try {
-        const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
-        thinkingHasContent = Array.isArray(thinkingTurns)
-          && thinkingTurns.some((t) => t && typeof t.text === 'string' && t.text.trim().length > 0);
-      } catch { /* thinking-buffer access is best-effort */ }
-      const allowedByThinking = EMPTY_TURN_RETRY_IGNORE_THINKING || !thinkingHasContent;
-      if (allowedByThinking && tryRetryRequest('empty_assistant_turn')) {
+      if (tryRetryRequest('empty_assistant_turn')) {
         // tryRetryRequest already reset done=false and scheduled the replay.
         // Do NOT proceed with the rest of finishMessage — let the replay take
         // over. The next finishMessage call (from the replayed turn) will
