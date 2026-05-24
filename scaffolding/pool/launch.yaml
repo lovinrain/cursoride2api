@@ -80,8 +80,8 @@ RATLC_API_HOST: 0.0.0.0
 # Both default off (MAX=0). Enable cautiously — each retry burns one Cursor
 # turn worth of quota and adds NO_VISIBLE_EVENT_TIMEOUT_MS to worst-case
 # client latency. Recommended starting values: SILENT=2, EMPTY=1.
-RATLC_UPSTREAM_SILENT_RETRY_MAX: 2             # 0=off, N=up to N retries on silent timeout
-RATLC_EMPTY_TURN_RETRY_MAX: 1                  # 0=off, N=up to N retries on empty turn
+RATLC_RETRY_UPSTREAM_SILENT_MAX: 2             # 0=off, N=up to N retries on silent timeout
+RATLC_RETRY_EMPTY_TURN_MAX: 1                  # 0=off, N=up to N retries on empty turn
 # RATLC_RETRY_DELAY_MS: 500                    # backoff between retries
 # RATLC_RETRY_EMIT_NOTICE: 1                   # tell client (one notice) on first retry
 

@@ -279,8 +279,8 @@ const WEBSEARCH_FALLBACK_TIMEOUT_MS = parseInt(process.env.RATLC_WEBSEARCH_FALLB
 // thinking-aware default. Each retry burns one Cursor turn worth of quota +
 // adds latency, so cap conservatively. Only fires for send_user_message
 // payloads — send_tool_results retries are unsafe (consumed tool_use_id state).
-const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_UPSTREAM_SILENT_RETRY_MAX || '0', 10));
-const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_EMPTY_TURN_RETRY_MAX || '0', 10));
+const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_UPSTREAM_SILENT_MAX || '0', 10));
+const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_EMPTY_TURN_MAX || '0', 10));
 const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
 const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
 const spoofResultPlaybook = new Map();
@@ -753,7 +753,7 @@ async function handleMessagesRequest(req, res) {
   const serverToolQueries = new Map();  // toolId -> query string
   let serverWebSearchRequestCount = 0;
   let serverWebFetchRequestCount = 0;
-  // Auto-retry state (see RATLC_UPSTREAM_SILENT_RETRY_MAX / RATLC_EMPTY_TURN_RETRY_MAX).
+  // Auto-retry state (see RATLC_RETRY_UPSTREAM_SILENT_MAX / RATLC_RETRY_EMPTY_TURN_MAX).
   // Snapshot of the original send_user_message poolWrite payload — captured
   // for replay on retry. Only set for send_user_message; send_tool_results
   // retries are unsafe so we don't retry them.

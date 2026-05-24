@@ -2008,6 +2008,62 @@ Practical workarounds for real web search through this stack:
 
 ---
 
+## Auto-retry on transient upstream failures (2026-05-24)
+
+Added server-side retry for two distinct failure patterns that previously
+surfaced as user-visible `[proxy_notice]` messages. Both opt-in via env-var
+budgets; both default to off. See `UPSTREAM_RETRY_DESIGN.md` for full
+design + cost model.
+
+**Symptoms with retry hooks:**
+
+- `upstream_silent_timeout` — pool routed, Cursor accepted the bidi frame,
+  then `NO_VISIBLE_EVENT_TIMEOUT_MS` (25s) elapsed with no
+  text/thinking/tool_use/yield/error. Typically a Cursor-side exec message
+  our vendored proto doesn't decode (the bridge-worker is waiting forever
+  on something it can't respond to). Retry cancels the stuck channel +
+  replays the original `send_user_message` payload; pool round-robins to
+  a fresh channel.
+
+- `empty_assistant_turn` — Cursor cleanly ended the turn (yield /
+  step_completed) but the model produced zero visible content. Retry
+  overrides `sessionKey: null` on the replay to force a different channel
+  (session affinity would otherwise route back to the same one which
+  produced the empty output). Always retries up to budget regardless of
+  whether thinking was captured — empty visible output is degraded either
+  way, and thinking is preserved via thinkingBuffer for the next request.
+
+**Env-var contract** (all share the `RATLC_RETRY_` prefix for grep-ability):
+
+```
+RATLC_RETRY_UPSTREAM_SILENT_MAX=0    # default off; recommend 2
+RATLC_RETRY_EMPTY_TURN_MAX=0         # default off; recommend 1
+RATLC_RETRY_DELAY_MS=500             # backoff between cancel + replay
+RATLC_RETRY_EMIT_NOTICE=1            # emit ONE [proxy_notice] on first retry
+```
+
+**Safety invariants** (`tryRetryRequest()` in `api-server.mjs`):
+
+- Only fires for `send_user_message` (the initial poolWrite payload is
+  snapshotted at request start). `send_tool_results` failures are NOT
+  retried — consumed `tool_use_id` state can't safely be replayed.
+- `!messageStarted && !toolUseEmitted` — if anything has been streamed
+  to the client, retry would produce duplicates in the SSE response.
+- Per-symptom budget tracked separately; total retries surface in the
+  request_log as `retryCount` + `lastRetrySymptom` + `lastRetryAt`.
+
+**Restart semantics**: changes are entirely in `scaffolding/pool/api-server.mjs`.
+Bridge-workers do not need restart. `./launch.sh` env-var changes take effect
+on the next api-server reload.
+
+**Naming note (2026-05-24)**: initial env names had inconsistent prefixes
+(`RATLC_UPSTREAM_SILENT_RETRY_MAX`, `RATLC_EMPTY_TURN_RETRY_MAX`). Renamed
+all four to share the `RATLC_RETRY_*` prefix so they group together when
+grepping or reading the env list. If you see the old names anywhere
+(`UPSTREAM_SILENT_RETRY_MAX` etc.), update — they're no longer recognized.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

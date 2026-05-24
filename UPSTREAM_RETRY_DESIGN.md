@@ -9,8 +9,8 @@ opt-in by setting the budget knobs > 0.
 
 | Symptom (internal name) | Trigger | Default | Recommended |
 |---|---|---|---|
-| `upstream_silent_timeout` | Pool routed, Cursor accepted bidi frame, then >25s with no text/thinking/tool_use/yield/error | `RATLC_UPSTREAM_SILENT_RETRY_MAX=0` (off) | `=2` |
-| `empty_assistant_turn` | Cursor cleanly ended the turn (yield/step_completed) but model emitted zero visible content | `RATLC_EMPTY_TURN_RETRY_MAX=0` (off) | `=1` |
+| `upstream_silent_timeout` | Pool routed, Cursor accepted bidi frame, then >25s with no text/thinking/tool_use/yield/error | `RATLC_RETRY_UPSTREAM_SILENT_MAX=0` (off) | `=2` |
+| `empty_assistant_turn` | Cursor cleanly ended the turn (yield/step_completed) but model emitted zero visible content | `RATLC_RETRY_EMPTY_TURN_MAX=0` (off) | `=1` |
 
 Status as of 2026-05-24: implemented in `scaffolding/pool/api-server.mjs`,
 committed, api-server-only restart sufficient (no bridge-worker changes).
@@ -61,7 +61,7 @@ the thinking-buffer and carried into the next request, so retry doesn't
 lose any latent state.
 
 We mitigate the risk of retry-loops on the rare "always-empty" case by:
-1. Defaulting `RATLC_EMPTY_TURN_RETRY_MAX=0` (opt-in only)
+1. Defaulting `RATLC_RETRY_EMPTY_TURN_MAX=0` (opt-in only)
 2. Recommending `=1` as the starting value (one retry, not aggressive)
 3. Forcing a different channel via `sessionKey: null` on the replay
    (otherwise session affinity routes back to the same channel which
@@ -134,8 +134,8 @@ either to 0 disables that symptom's retry entirely.
 
 | Variable | Default | Range | Effect |
 |---|---|---|---|
-| `RATLC_UPSTREAM_SILENT_RETRY_MAX` | `0` | 0–N | 0 disables; N enables up to N silent-timeout retries per request |
-| `RATLC_EMPTY_TURN_RETRY_MAX` | `0` | 0–N | 0 disables; N enables up to N empty-turn retries per request |
+| `RATLC_RETRY_UPSTREAM_SILENT_MAX` | `0` | 0–N | 0 disables; N enables up to N silent-timeout retries per request |
+| `RATLC_RETRY_EMPTY_TURN_MAX` | `0` | 0–N | 0 disables; N enables up to N empty-turn retries per request |
 | `RATLC_RETRY_DELAY_MS` | `500` | ms | Backoff between cancel and replay |
 | `RATLC_RETRY_EMIT_NOTICE` | `1` | 0 or 1 | 1 (default) = emit a single `[proxy_notice]` to the client on first retry; 0 = silent |
 
