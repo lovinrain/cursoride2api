@@ -155,14 +155,32 @@ Grep `/tmp/ratlc-api.log` for `retry:` to see all retry activity.
 
 ## What's NOT retried
 
-- `send_tool_results` failures — too much state (consumed tool_use_id,
-  channel mid-conversation) to safely replay
 - Auth errors (`ERROR_NOT_LOGGED_IN`), quota exhaustion, rate-limit
   errors — these aren't transient, they're persistent and retrying
   would amplify the problem. Existing pool-manager handles them via
   `killTokenImmediately` / channel cooldown
-- Requests where `messageStarted` or `toolUseEmitted` is true at
-  timeout — partial SSE content can't be undone
+- Requests where `toolUseEmitted` is true at timeout — partial SSE
+  content can't be undone
+
+## What IS retried (added later, 2026-05-24)
+
+`send_tool_results` follow-ups are now retryable too. The pool exposes
+a `release_consumed_ids` IPC that lets api-server tell pool-manager to
+forget specific entries from `consumedToolUseIndex` before a replay.
+Without this, the pool's "already consumed anthropic_tool_use_id"
+guard would reject the replayed tool_result.
+
+Safety: cancel_request kills the channel before any real result was
+produced upstream (the watchdog only fires when no events arrived);
+release_consumed_ids only clears IDs we know never resulted in actual
+model output. Then the replay re-delivers the same tool_use_ids on a
+fresh channel.
+
+This matters because in a typical claude-code session, the bulk of
+proxy traffic is tool_result follow-ups (model iterates: tool → result
+→ tool → result). The initial send_user_message happens once per
+user turn. Without tool_results retry, the failure-mode coverage was
+"first request only" per turn; now it's every request.
 
 ## Open follow-ups (not blocking)
 

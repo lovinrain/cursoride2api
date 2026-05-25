@@ -1202,6 +1202,26 @@ function handleClientMessage(client, msg) {
 	    return;
 	  }
 
+	  // Used by api-server's send_tool_results retry path. After a
+	  // cancel_request, the channel that held the in-flight tool_use_ids
+	  // got killed and its toolUseIndex entries are gone — but the ids
+	  // remain in consumedToolUseIndex (the 30-min dedup cache). Without
+	  // release, a retry that re-delivers the same tool_use_id would hit
+	  // "already consumed". Release-then-replay is safe because cancel
+	  // already killed the channel before it could produce a real result.
+	  if (msg.type === 'release_consumed_ids') {
+	    const ids = Array.isArray(msg.ids) ? msg.ids : [];
+	    let released = 0;
+	    for (const id of ids) {
+	      if (consumedToolUseIndex.has(id)) {
+	        consumedToolUseIndex.delete(id);
+	        released++;
+	      }
+	    }
+	    log(`release_consumed_ids: released=${released}/${ids.length} reason=${msg.reason || '(none)'}`);
+	    return;
+	  }
+
 	  if (msg.type === 'list_groups') {
     writeToClient(client, { type: 'groups', groups: groupsSnapshot() });
     return;

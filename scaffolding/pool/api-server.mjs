@@ -778,10 +778,12 @@ async function handleMessagesRequest(req, res) {
   let serverWebSearchRequestCount = 0;
   let serverWebFetchRequestCount = 0;
   // Auto-retry state (see RATLC_RETRY_UPSTREAM_SILENT_MAX / RATLC_RETRY_EMPTY_TURN_MAX).
-  // Snapshot of the original send_user_message poolWrite payload — captured
-  // for replay on retry. Only set for send_user_message; send_tool_results
-  // retries are unsafe so we don't retry them.
-  let lastSendUserMessagePayload = null;
+  // Snapshot of the original poolWrite payload (send_user_message OR
+  // send_tool_results) — captured for replay on retry. Both action types
+  // are retryable as of the release_consumed_ids IPC; tool_result retries
+  // first ask pool-manager to forget the consumed-id entries so the
+  // replay isn't rejected with "already consumed".
+  let lastPoolRetryPayload = null;
   let silentRetryCount = 0;
   let emptyTurnRetryCount = 0;
   let pendingRetryTimer = null;
@@ -889,9 +891,11 @@ async function handleMessagesRequest(req, res) {
   //      `!visibleUpstreamEventSeen` (so no text/thinking/tool_use has been
   //      forwarded yet); the empty-turn detection only fires when
   //      `outputTokens === 0 && !textBlockOpen`.
-  //   3. We must have captured the original send_user_message payload to
-  //      replay. send_tool_results-triggered failures cannot be retried
-  //      because the consumed tool_use_id state can't be cleanly re-injected.
+  //   3. We must have captured the original poolWrite payload to replay
+  //      (lastPoolRetryPayload). Both send_user_message AND send_tool_results
+  //      are eligible: for tool_results, we ask pool-manager to release the
+  //      consumed-id entries via release_consumed_ids before re-delivering
+  //      (otherwise the replay would be rejected with "already consumed").
   //
   // For `empty_assistant_turn` the sticky channel that produced the empty
   // turn is still alive and would be selected again under session affinity;
@@ -906,7 +910,7 @@ async function handleMessagesRequest(req, res) {
   // invariant is "no content emitted", which the callers already ensure.
   function tryRetryRequest(symptom) {
     if (done && symptom !== 'empty_assistant_turn') return false;
-    if (!lastSendUserMessagePayload) return false;
+    if (!lastPoolRetryPayload) return false;
     if (toolUseEmitted) return false;
     const budget = symptom === 'upstream_silent_timeout'
       ? UPSTREAM_SILENT_RETRY_MAX
@@ -919,7 +923,8 @@ async function handleMessagesRequest(req, res) {
     const counterAfter = counterBefore + 1;
     if (symptom === 'upstream_silent_timeout') silentRetryCount = counterAfter;
     else emptyTurnRetryCount = counterAfter;
-    log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} requestId=${requestId}`);
+    const replayAction = lastPoolRetryPayload.action || 'send_user_message';
+    log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} action=${replayAction} requestId=${requestId}`);
     patchRequest(requestId, {
       retryCount: silentRetryCount + emptyTurnRetryCount,
       lastRetrySymptom: symptom,
@@ -935,11 +940,24 @@ async function handleMessagesRequest(req, res) {
     // want to break affinity, so we cancel anyway (no-op on already-finished
     // request) and override sessionKey in the replay.
     poolWrite({ type: 'cancel_request', requestId, reason: `retry:${symptom}` });
+    // For send_tool_results retries: the pool's consumedToolUseIndex would
+    // reject a naive replay with "already consumed". Tell the pool to
+    // forget those ids so the replay can re-deliver them on a fresh channel.
+    // Safe because cancel_request just killed the channel — the original
+    // delivery never produced a real result.
+    if (replayAction === 'send_tool_results' && Array.isArray(lastPoolRetryPayload.results)) {
+      const idsToRelease = lastPoolRetryPayload.results
+        .map((r) => r.anthropic_tool_use_id)
+        .filter(Boolean);
+      if (idsToRelease.length > 0) {
+        poolWrite({ type: 'release_consumed_ids', ids: idsToRelease, reason: `retry:${symptom}` });
+      }
+    }
     const replayPayload = symptom === 'empty_assistant_turn'
-      ? { ...lastSendUserMessagePayload, sessionKey: null }
-      : lastSendUserMessagePayload;
+      ? { ...lastPoolRetryPayload, sessionKey: null }
+      : lastPoolRetryPayload;
     // Reset per-request state so the new attempt looks like a fresh route.
-    // We DO NOT clear lastSendUserMessagePayload — successive retries replay
+    // We DO NOT clear lastPoolRetryPayload — successive retries replay
     // the same input. We DO clear watchdog state.
     disarmNoVisibleEventTimer();
     disarmToolUseFinalizer();
@@ -956,7 +974,7 @@ async function handleMessagesRequest(req, res) {
     pendingRetryTimer = setTimeout(() => {
       pendingRetryTimer = null;
       if (done) return;  // client disconnected during delay
-      log(`  → retry: ${symptom} firing replay requestId=${requestId} attempt=${counterAfter}`);
+      log(`  → retry: ${symptom} firing replay requestId=${requestId} attempt=${counterAfter} action=${replayAction}`);
       poolWrite(replayPayload);
       armNoVisibleEventTimer();
     }, RETRY_DELAY_MS);
@@ -2136,12 +2154,18 @@ async function handleMessagesRequest(req, res) {
       toolResultCount: enriched.length,
       toolResultIds: enriched.map(r => r.anthropic_tool_use_id),
     });
-    poolWrite({
+    const toolResultPayload = {
       type: 'request', requestId, action: 'send_tool_results',
       model: routingModel || null,
       requestedModel: model || null,
       results: enriched,
-    });
+    };
+    // Snapshot for potential retry on upstream_silent_timeout. The pool's
+    // consumedToolUseIndex would reject a naive replay with "already
+    // consumed"; tryRetryRequest handles this by emitting
+    // release_consumed_ids before re-sending.
+    lastPoolRetryPayload = toolResultPayload;
+    poolWrite(toolResultPayload);
   } else {
     // Mode selection: in `full` mode, render the ENTIRE messages[] into
     // one self-contained prompt; in `last` mode (default, backwards-
@@ -2229,9 +2253,11 @@ async function handleMessagesRequest(req, res) {
       hybridReason: contextGuardReason || hybrid?.reason || null,
     };
     // Snapshot for potential retry on upstream_silent_timeout / empty_assistant_turn.
-    // Only the initial send_user_message gets retried; tool_result follow-ups
-    // have consumed-id state that makes replay unsafe.
-    lastSendUserMessagePayload = poolReqPayload;
+    // Both send_user_message AND send_tool_results are retryable as of the
+    // release_consumed_ids IPC; for tool_results, tryRetryRequest emits
+    // release_consumed_ids before replaying so the pool doesn't reject
+    // with "already consumed".
+    lastPoolRetryPayload = poolReqPayload;
     poolWrite(poolReqPayload);
   }
 

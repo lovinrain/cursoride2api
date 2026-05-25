@@ -2064,6 +2064,50 @@ grepping or reading the env list. If you see the old names anywhere
 
 ---
 
+## Auto-retry extended to send_tool_results (2026-05-24)
+
+Initial retry feature only covered the first request of each user turn
+(`send_user_message`). Tool-result follow-ups (`send_tool_results`)
+were intentionally excluded because of `consumedToolUseIndex` state:
+the pool marks tool_use_ids consumed once delivered to a channel; a
+naive replay would hit "already consumed" and the second result would
+be rejected.
+
+In practice the bulk of proxy traffic is tool_result follow-ups (the
+model iterates: tool → result → tool → result; initial
+send_user_message happens once per user turn). So the original retry
+covered only ~10% of failure-prone requests.
+
+Fixed by adding a new pool IPC `release_consumed_ids` (in
+`scaffolding/pool/pool-manager.mjs`) that lets api-server tell the
+pool to forget specific entries from `consumedToolUseIndex` before
+replaying. Safe because `cancel_request` kills the channel before any
+real result was produced (the watchdog only fires when no upstream
+events arrived).
+
+Implementation:
+- `pool-manager.mjs`: new `if (msg.type === 'release_consumed_ids')`
+  handler that iterates the ids list and deletes from
+  `consumedToolUseIndex`; logs `released=N/total`
+- `api-server.mjs`: renamed `lastSendUserMessagePayload` →
+  `lastPoolRetryPayload`; capture site added for the user-initiated
+  `send_tool_results` path (~line 2132 area); `tryRetryRequest`
+  detects the payload's action type and emits `release_consumed_ids`
+  for tool_use_ids in the payload before replaying
+
+Log signature when tool_results retry fires:
+  → retry: upstream_silent_timeout attempt N/MAX action=send_tool_results requestId=...
+  (pool log: `release_consumed_ids: released=N/total reason=retry:upstream_silent_timeout`)
+  → retry: upstream_silent_timeout firing replay requestId=... attempt=N action=send_tool_results
+
+**Restart semantics**: pool-manager has the new IPC handler, so
+api-server-only restart is NOT sufficient. Full `launch.sh down/up`
+required (or kill pool-manager and let it re-spawn from systemd-like
+supervision — but our launch.sh tracks both processes via PID files
+so the symmetric down/up is cleanest).
+
+---
+
 ## Local-tool-adapter dedup (2026-05-24)
 
 Fixes the "already consumed anthropic_tool_use_id" proxy_notice that
