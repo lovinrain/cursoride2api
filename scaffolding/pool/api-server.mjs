@@ -967,6 +967,29 @@ async function handleMessagesRequest(req, res) {
     if (messageStarted) return;
     messageStarted = true;
     writeHeadersOnce();
+    // Cumulative input-token estimate for /context display.
+    //
+    // The previous version reported only the LAST user message's char/4
+    // count — which for short messages came out as e.g. "4/600k tokens
+    // (0%)" in claude-code's /context bar even though the actual sent
+    // payload was hundreds of thousands of tokens. Claude-code reads
+    // this value from message_start.usage.input_tokens and uses it as
+    // the "used" number in the top line of /context.
+    //
+    // `text` is the full rendered payload (system + tools + entire
+    // messages history) we sent to the pool, captured via closure from
+    // the outer handleMessagesRequest scope. By the time startMsg() is
+    // called via route_decision, the payload has been built. The /3.5
+    // chars-per-token ratio matches what handleCountTokens uses so the
+    // category breakdown (computed via count_tokens RPCs) and the top
+    // number stay consistent.
+    //
+    // Fallback to the old last-message estimate if `text` somehow isn't
+    // set yet (defensive — shouldn't happen with the route_decision
+    // sequencing but keeps the message_start well-formed).
+    const inputTokensEstimate = (typeof text === 'string' && text.length > 0)
+      ? Math.ceil(text.length / 3.5)
+      : (extractTextFromContent(lastMsg.content).length / 4 | 0);
     sseWrite(res, 'message_start', {
       type: 'message_start',
       message: {
@@ -974,7 +997,7 @@ async function handleMessagesRequest(req, res) {
         content: [], model: model || 'claude-opus-4-7',
         stop_reason: null, stop_sequence: null,
         usage: {
-          input_tokens: extractTextFromContent(lastMsg.content).length / 4 | 0,
+          input_tokens: inputTokensEstimate,
           output_tokens: 0,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
