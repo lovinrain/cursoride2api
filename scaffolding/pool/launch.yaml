@@ -85,6 +85,17 @@ RATLC_RETRY_EMPTY_TURN_MAX: 1                  # 0=off, N=up to N retries on emp
 # RATLC_RETRY_DELAY_MS: 500                    # backoff between retries
 # RATLC_RETRY_EMIT_NOTICE: 1                   # tell client (one notice) on first retry
 
+# ── Keep-alive ping ────────────────────────────────────────────────────────
+# After message_start we can sit silent for many seconds waiting on Cursor's
+# first token (large full-mode payloads are slow to first-byte). The wire goes
+# quiet and the CLIENT's read-idle timeout fires BEFORE our 25s watchdog — so
+# claude-code aborts with "API returned an empty or malformed response (HTTP
+# 200)" and the silent-timeout retry never gets to run. A recurring SSE ping
+# (same event Anthropic interleaves) keeps the client's read timer fed. The
+# ping runs from message_start until the turn finishes, including across
+# retries. Default 3000ms; set 0 to disable.
+# RATLC_KEEPALIVE_PING_MS: 3000
+
 # ── Optional diagnostic toggles (leave commented unless debugging) ────────
 # CURSOR_LOG_NATIVE_EXEC: 1                    # log every ExecServerMessage case
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)

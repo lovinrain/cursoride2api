@@ -2240,6 +2240,70 @@ is one if-block to add.
 
 ---
 
+## Keep-alive ping + suppress empty-turn retry on disconnect (2026-05-25)
+
+**Symptom**: client logs `API Error: API returned an empty or malformed
+response (HTTP 200) — check for a proxy or gateway intercepting the request`.
+User asked why the auto-retry feature didn't catch it.
+
+**Diagnosis** (from `/tmp/ratlc-api.log`): that string is emitted by
+*claude-code* (the client), never by us — we only reference it in comments
+describing what SSE shapes trigger it. It is the client's verdict about *our*
+output, not a server-side symptom, so it's outside the retry taxonomy
+(`upstream_silent_timeout` / `empty_assistant_turn`, both server-detected).
+
+The concrete trigger: measured POST→disconnect latency for every disconnected
+request — `0.02s, 0.04s, 0.15s, 0.75s, 0.97s, 1.39s, …, 5.30s, 9.39s, 17.49s`.
+**None reach our 25s `NO_VISIBLE_EVENT_TIMEOUT_MS`.** On large `full`-mode
+payloads (one was 803KB / msgCount=225) Cursor is slow to first-byte; after
+`message_start` we sent exactly one `ping` then went silent on the wire. The
+client's own read-idle timeout fired first → it declared the 200 malformed and
+closed the socket — before our silent-timeout watchdog (and therefore its
+retry) could ever run. You can't retry into a closed socket anyway: retry
+streams into the same `res`, and once it's closed the bytes go nowhere.
+
+Bonus bug found while tracing: `cancelForClientDisconnect → finishMessage`
+was firing an `empty_assistant_turn` retry on the disconnected request — a
+fresh channel + quota burned to produce output nobody would read. Visible all
+over the log as a `retry: empty_assistant_turn` line one millisecond after
+`client disconnected mid-stream`.
+
+**Fix A — recurring keep-alive ping** (`api-server.mjs`): `armKeepalivePing()`
+is called at the end of `startMsg()`; a `setInterval` emits `event: ping`
+every `RATLC_KEEPALIVE_PING_MS` (default 3000) until `finishMessage()`
+disarms it. The ping runs through the slow-first-byte window AND across
+retries (the retry path returns before the central disarm), so the client's
+read timer stays fed until real content arrives or our 25s watchdog fires.
+`sseWrite` already guards `res.writableEnded`, so a ping racing a close is a
+no-op. `.unref()` so it never holds the process open.
+
+**Fix B — suppress empty-turn retry on disconnect**: a per-request
+`clientGone` flag, set by `cancelForClientDisconnect()` before it calls
+`finishMessage()`. The empty-turn guard checks `!clientGone`, and
+`tryRetryRequest()` bails on `clientGone` at the top (belt-and-suspenders for
+all symptoms / future call sites).
+
+**Verified live** (api-server-only restart, pool left warm):
+- Ping cadence on a long generation: `message_start@16.050 → ping@16.053 →
+  ping@19.051 → content_block_start@19.068 → ping@22.050 → message_stop@23.806`.
+  Exactly 3s apart, firing during the silent first-byte gap, stopping at finish.
+- Aborted request: `route_decision@41.379 → client disconnected@41.776`, then
+  **zero** `retry:` lines for that requestId; channel cleanly cancelled.
+
+**Restart note**: api-server-only. Killing + relaunching just
+`api-server.mjs` (preserving its env from `/proc/<pid>/environ`) keeps the
+pool-manager + bridge-workers and their warm channels intact — do NOT
+`ratlc down/up` for an api-server-only code change (that re-throttles the
+whole pool). See `/tmp/relaunch-api.mjs` pattern.
+
+**Note on the slowness this rides on**: the keep-alive masks the symptom, not
+the cause. The root cause is slow first-byte on huge `full`-mode payloads
+(ties to the separate "Cursor is slow" thread). Real latency wins come from
+smaller payloads (hybrid mode) and/or a fresher `CURSOR_CLIENT_VERSION` than
+the pinned `2.6.20`.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

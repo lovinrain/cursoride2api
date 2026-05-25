@@ -284,6 +284,18 @@ const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_EMPTY_
 const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
 const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
 
+// ── Keep-alive ping cadence ────────────────────────────────────────────────
+// After message_start we may sit silent for many seconds waiting on Cursor's
+// first token (large `full`-mode payloads are slow to first-byte). The wire
+// goes quiet and the client's read-idle timeout fires FIRST — before our 25s
+// no-visible-event watchdog — so claude-code aborts with "API returned an
+// empty or malformed response (HTTP 200)" and we never get to retry. A
+// recurring SSE `ping` (the same event Anthropic interleaves) resets the
+// client's read timer at the transport layer regardless of how the client
+// treats the event semantically. Armed in startMsg, cleared in finishMessage.
+// Set to 0 to disable.
+const KEEPALIVE_PING_MS = Math.max(0, parseInt(process.env.RATLC_KEEPALIVE_PING_MS || '3000', 10));
+
 // ── Local-tool-adapter dedup ───────────────────────────────────────────────
 // The bridge-worker can deliver the SAME tool_use IPC twice — Cursor's
 // backend sometimes re-emits an unhandled tool_use after the parallel-tools
@@ -787,6 +799,12 @@ async function handleMessagesRequest(req, res) {
   let silentRetryCount = 0;
   let emptyTurnRetryCount = 0;
   let pendingRetryTimer = null;
+  let keepalivePingTimer = null;
+  // Set true by cancelForClientDisconnect before it calls finishMessage(), so
+  // the empty_assistant_turn retry path knows not to replay a turn for a
+  // client that already hung up (would burn a fresh channel + quota for
+  // output nobody reads).
+  let clientGone = false;
   // `messageStarted` gates startMsg() so it can only fire once per request.
   // Was previously gated on `blockIdx === -1`, but startMsg doesn't bump
   // blockIdx — so the route_decision branch AND the error branch would
@@ -915,6 +933,10 @@ async function handleMessagesRequest(req, res) {
   // route_decision arrives (long before the 25s watchdog). The real
   // invariant is "no content emitted", which the callers already ensure.
   function tryRetryRequest(symptom) {
+    // No socket to deliver a replay into once the client hung up. Covers all
+    // symptoms and any future call site (the finishMessage guard is the
+    // primary one; this is belt-and-suspenders).
+    if (clientGone) return false;
     if (done && symptom !== 'empty_assistant_turn') return false;
     if (!lastPoolRetryPayload) return false;
     if (toolUseEmitted) return false;
@@ -1029,6 +1051,26 @@ async function handleMessagesRequest(req, res) {
       },
     });
     sseWrite(res, 'ping', { type: 'ping' });
+    armKeepalivePing();
+  }
+
+  // Recurring SSE ping so a slow first-byte (or any mid-stream silent gap)
+  // doesn't trip the client's read-idle timeout. Idempotent; cleared by
+  // disarmKeepalivePing(). The ping is harmless interleaved with real
+  // content blocks — it matches Anthropic's own keep-alive cadence.
+  function armKeepalivePing() {
+    if (KEEPALIVE_PING_MS <= 0 || keepalivePingTimer || done) return;
+    keepalivePingTimer = setInterval(() => {
+      if (done || res.writableEnded) { disarmKeepalivePing(); return; }
+      sseWrite(res, 'ping', { type: 'ping' });
+    }, KEEPALIVE_PING_MS);
+    if (keepalivePingTimer.unref) keepalivePingTimer.unref();
+  }
+  function disarmKeepalivePing() {
+    if (keepalivePingTimer) {
+      clearInterval(keepalivePingTimer);
+      keepalivePingTimer = null;
+    }
   }
 
   function startTextBlock() {
@@ -1428,7 +1470,12 @@ async function handleMessagesRequest(req, res) {
     // degraded outcome from the caller's POV — retry up to budget regardless
     // of whether thinking was captured. Captured thinking carries forward to
     // the next request via thinkingBuffer either way.
-    if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen && EMPTY_TURN_RETRY_MAX > 0) {
+    //
+    // Skip entirely when the client already disconnected (clientGone): the
+    // turn looks "empty" only because we never got to stream it, and there's
+    // no open socket to deliver a replay into — retrying would burn a fresh
+    // channel + quota for output nobody reads.
+    if (!clientGone && !toolUseEmitted && outputTokens === 0 && !textBlockOpen && EMPTY_TURN_RETRY_MAX > 0) {
       if (tryRetryRequest('empty_assistant_turn')) {
         // tryRetryRequest already reset done=false and scheduled the replay.
         // Do NOT proceed with the rest of finishMessage — let the replay take
@@ -1444,6 +1491,7 @@ async function handleMessagesRequest(req, res) {
     // the disarm was at the call sites of the other paths only.
     disarmToolUseFinalizer();
     disarmNoVisibleEventTimer();
+    disarmKeepalivePing();
     if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen) {
       emitTextDelta('[proxy_notice] Cursor ended this turn without visible text or tool calls. Any upstream thinking was captured for the next request, but there is no assistant-visible content to display.\n');
     }
@@ -2293,10 +2341,12 @@ async function handleMessagesRequest(req, res) {
 
 	  function cancelForClientDisconnect() {
 	    if (done) return;
+	    clientGone = true;  // suppress the now-pointless empty_assistant_turn retry
 	    log(`client disconnected mid-stream for ${requestId}`);
 	    patchRequest(requestId, { clientDisconnectedAt: Date.now() });
 	    poolWrite({ type: 'cancel_request', requestId, reason: 'client_disconnected' });
 	    if (pendingRetryTimer) { clearTimeout(pendingRetryTimer); pendingRetryTimer = null; }
+	    disarmKeepalivePing();
 	    finishMessage();  // disarms the watchdog centrally
 	  }
 
