@@ -891,13 +891,17 @@ async function handleMessagesRequest(req, res) {
   //      `!visibleUpstreamEventSeen` (so no text/thinking/tool_use has been
   //      forwarded yet); the empty-turn detection only fires when
   //      `outputTokens === 0 && !textBlockOpen`.
-  //   3. We must have captured the original poolWrite payload to replay
-  //      (lastPoolRetryPayload). Only send_user_message is eligible —
-  //      send_tool_results retries are structurally infeasible (cancel
-  //      wipes the channel's tool_use_id registrations via
-  //      clearPendingToolUsesForChannel, so the replay can't reach a
-  //      different channel that has no record of those ids). See the
-  //      reverted attempt + the unknown-id bug it produced for context.
+  //   3. We must have captured a send_user_message-shape payload as
+  //      lastPoolRetryPayload. For send_user_message POSTs this is the
+  //      original payload. For send_tool_results POSTs this is a
+  //      pre-rendered fallback (full conversation history serialized
+  //      via mode=full) — replaying THIS on a fresh channel gives the
+  //      model a complete transcript including the tool_results that
+  //      were stuck, and the model continues with fresh tool_use_ids.
+  //      Replaying the raw send_tool_results would fail with "unknown
+  //      anthropic_tool_use_id" (tool_use_ids are channel-bound and the
+  //      original channel was killed by cancel_request); the fallback
+  //      sidesteps that by re-establishing context on a new channel.
   //
   // For `empty_assistant_turn` the sticky channel that produced the empty
   // turn is still alive and would be selected again under session affinity;
@@ -914,19 +918,16 @@ async function handleMessagesRequest(req, res) {
     if (done && symptom !== 'empty_assistant_turn') return false;
     if (!lastPoolRetryPayload) return false;
     if (toolUseEmitted) return false;
-    // Reverted 2026-05-24: send_tool_results retries are structurally
-    // infeasible. The pool's cancel_request kills the channel AND wipes
-    // the tool_use_id registrations from toolUseIndex (via
-    // clearPendingToolUsesForChannel). The replayed send_tool_results
-    // then fails with "unknown anthropic_tool_use_id" because the ids
-    // are channel-bound and a fresh channel has no record of them.
-    // Concrete trace: req-1054ab14f6614b90 at 04:14:43-44 — retry
-    // fired, channel killed, replay hit "unknown" error, conversation
-    // broke. The pre-retry behavior (visible notice, channel state
-    // intact, user can resend) is strictly better. So tool_results
-    // failures fall through to the existing notice path.
+    // lastPoolRetryPayload is ALWAYS a send_user_message-shape payload:
+    //   - For send_user_message POSTs: the original payload itself.
+    //   - For send_tool_results POSTs: a fallback payload pre-rendered
+    //     in the tool_results branch (full conversation history rendered
+    //     into one bajie_yield text via mode=full). The fresh channel
+    //     gets the complete transcript including the tool_results that
+    //     would otherwise have been lost; the model continues from
+    //     there with fresh tool_use_ids.
+    // No action-type check needed — replay always send_user_message.
     const replayAction = lastPoolRetryPayload.action || 'send_user_message';
-    if (replayAction !== 'send_user_message') return false;
     const budget = symptom === 'upstream_silent_timeout'
       ? UPSTREAM_SILENT_RETRY_MAX
       : EMPTY_TURN_RETRY_MAX;
@@ -2155,14 +2156,40 @@ async function handleMessagesRequest(req, res) {
       toolResultCount: enriched.length,
       toolResultIds: enriched.map(r => r.anthropic_tool_use_id),
     });
-    // No retry snapshot for send_tool_results — see tryRetryRequest's
-    // comment. Tool_use_ids are channel-bound; cancel_request wipes them
-    // from toolUseIndex, so a replay on a fresh channel hits "unknown
-    // anthropic_tool_use_id". The failure mode is documented as
-    // non-retryable; silent timeout here falls through to the existing
-    // notice. If anything, retry was making things strictly worse by
-    // also breaking the channel state the user could otherwise recover
-    // from with a fresh user message.
+    // Retry snapshot for upstream_silent_timeout on send_tool_results:
+    // tool_use_ids are channel-bound, so we CANNOT replay the same
+    // send_tool_results on a fresh channel ("unknown anthropic_tool_use_id").
+    // Instead we pre-render a send_user_message fallback that includes the
+    // ENTIRE messages[] history (with tool_result blocks inlined via
+    // mode=full). On retry, the fresh channel receives the complete
+    // transcript and the model continues from there, emitting NEW
+    // tool_use_ids on the new channel. The original stuck channel is
+    // cancelled (killed); its stale ids are no longer referenced.
+    //
+    // The fallback uses sessionKey=null (force fresh routing) and
+    // contextMode='full' (always full transcript — retry is recovery,
+    // not steady-state, so we want the full conversation regardless of
+    // hybrid optimizations).
+    try {
+      const retryThinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+      const retryContent = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns: retryThinkingTurns });
+      const retryText = cursorMcpContentToText(retryContent);
+      lastPoolRetryPayload = {
+        type: 'request', requestId, action: 'send_user_message',
+        model: routingModel || null,
+        requestedModel: model || null,
+        text: retryText,
+        content: retryContent,
+        system: extractSystemPrompt(system),
+        tools: tools || [],
+        sessionKey: null,  // force fresh channel
+        contextMode: 'full',
+        hybridReason: 'retry-fallback-from-tool-results',
+      };
+    } catch (e) {
+      log(`  ↪ retry fallback build failed: ${e.message || e}; tool_result silent timeouts on this request won't be retried`);
+      lastPoolRetryPayload = null;
+    }
     poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
       model: routingModel || null,

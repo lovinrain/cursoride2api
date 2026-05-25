@@ -162,45 +162,78 @@ Grep `/tmp/ratlc-api.log` for `retry:` to see all retry activity.
 - Requests where `toolUseEmitted` is true at timeout — partial SSE
   content can't be undone
 
-## Attempted-and-reverted: send_tool_results retry (2026-05-24)
+## How send_tool_results retry works (after iteration)
 
-An earlier same-day attempt extended retry to `send_tool_results`
-follow-ups via a new `release_consumed_ids` pool IPC. **Reverted**
-once we saw the actual failure mode in production.
+Naive retry of `send_tool_results` doesn't work: tool_use_ids are
+channel-bound, and `cancel_request` wipes them from `toolUseIndex` via
+`clearPendingToolUsesForChannel`. A replay on a fresh channel would
+fail with `unknown anthropic_tool_use_id` (the new channel has no
+record of those ids; there's no way to inject foreign state).
 
-Root cause of revert: pool's `cancelRequest()` calls
-`clearPendingToolUsesForChannel(ch.id)` (`pool-manager.mjs:889`) which
-wipes the channel's `toolUseIndex` entries before SIGTERM. The replay
-on a fresh channel then fails with `unknown anthropic_tool_use_id`
-because tool_use_ids are bound to the SPECIFIC channel that emitted
-them — a different channel has no record of them and there's no way
-to inject foreign state.
+**The fix**: convert the tool_results retry into a fresh
+`send_user_message` carrying the FULL conversation history. The proxy
+already does this for `POOL_CONTEXT_MODE=full` — `send_user_message`
+renders the entire `messages[]` array (including tool_result content
+blocks) into a single bajie_yield text payload. The receiving model on
+a fresh channel sees a complete transcript and continues from there,
+emitting fresh tool_use_ids on the new channel.
 
-Concrete trace (`req-1054ab14f6614b90` at 04:14:43-44):
-- Original `send_tool_results` with ids `[toolu_f3b89, ...]` routed to
-  ch-180 successfully
-- Watchdog fired at 25s, retry path activated
-- `cancel_request` killed ch-180, wiping its toolUseIndex entries
-- Replay `send_tool_results` → pool sees ids as `unknown` → error
-- User saw a NEW "unknown anthropic_tool_use_id" error AND lost the
-  channel state that would otherwise have let them recover with a
-  fresh user message
+**Implementation** (`scaffolding/pool/api-server.mjs`):
 
-The fundamental issue: "retry on a different channel" assumes the
-new channel can accept the same payload. For send_user_message that's
-true (text in, text out — model-agnostic). For send_tool_results it's
-false because tool_use_ids carry channel-specific state.
+1. At the send_tool_results POST, pre-render the equivalent
+   send_user_message payload (mode=full, sessionKey=null) and stash it
+   as `lastPoolRetryPayload`. The actual poolWrite uses the
+   tool_results payload as before.
+2. tryRetryRequest is unchanged from the send_user_message case — it
+   just replays `lastPoolRetryPayload`. Since that payload is always
+   send_user_message-shaped, no action-type branching needed.
+3. cancel_request kills the stuck channel. release_consumed_ids
+   isn't called (no consumed-id state to clean — the original delivery
+   never produced a real result).
+4. The fresh channel receives the full transcript and the model
+   continues with fresh tool_use_ids.
+
+**What the user sees on a successful retry**:
+- Original tool_results stuck on ch-X for 25s
+- One `[proxy_notice]` line: "upstream_silent_timeout — auto-retrying..."
+- 0.5s later: the model's continuation arrives normally
+- New tool_use_ids in the response → next iteration works normally
+
+**Cost**: the fresh channel re-processes the entire conversation
+including the model's prior thinking. This adds latency proportional
+to the conversation length. For typical short-to-medium sessions
+(<200K tokens), this is a few seconds of extra processing — much
+better than the conversation breaking entirely.
+
+**Failure cases**:
+- If `buildFullContextCursorMcpContent` throws during the fallback
+  pre-render (e.g. malformed messages[]): `lastPoolRetryPayload`
+  stays null, retry is skipped, fall through to the existing notice.
+  Logged as `↪ retry fallback build failed: ...`.
+- If the fresh channel ALSO silent-times-out: budget decrements,
+  another retry fires if available, otherwise the existing notice.
+
+**Open question**: model behavior on receiving the full transcript
+as a fresh user message. We expect the model to "continue the
+iteration" naturally — Claude is trained to read conversation history
+and pick up where it left off. Worst case: model emits a recap or
+asks a clarifying question instead of continuing the original task.
+That's a degraded outcome but recoverable (user can prompt for
+continuation). Better than the alternative (silent failure with no
+retry).
+
+### History: the previous iteration
+
+Initial implementation (commit `1b8400e`) tried direct replay of
+`send_tool_results` with a `release_consumed_ids` IPC. Failed in
+production because of the channel-bound tool_use_id issue described
+above. See DEVLOG entries `1b8400e` → `bf857a3` (revert) → the
+current fix.
 
 The `release_consumed_ids` pool IPC remains in `pool-manager.mjs`
-(harmless, may be useful for future work — e.g. if we ever build a
-"resurrect the same channel" recovery mechanism that doesn't kill
-+wipe-+restart). The api-server side no longer uses it.
-
-**Current behavior** for send_tool_results upstream_silent_timeout:
-falls through to the existing notice (`[proxy_notice] Cursor upstream
-accepted the request but did not emit ... Please retry after the
-channel is recycled.`). User can /retry from the prior message with
-the channel state intact.
+(harmless, possibly useful for future "resurrect-same-channel" work
+that doesn't kill+wipe). The api-server side now uses the
+conversion-to-send_user_message approach instead.
 
 ## Open follow-ups (not blocking)
 

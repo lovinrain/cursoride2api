@@ -2064,7 +2064,53 @@ grepping or reading the env list. If you see the old names anywhere
 
 ---
 
-## Attempted and reverted: send_tool_results retry (2026-05-24)
+## send_tool_results retry, properly (2026-05-24, third iteration)
+
+Same-day cycle: first attempt at send_tool_results retry (commit
+`1b8400e`) broke production conversations; reverted (commit `bf857a3`);
+realized revert wasn't the long-term fix, designed and shipped the
+real solution.
+
+**Insight**: naive retry of `send_tool_results` doesn't work because
+tool_use_ids are channel-bound. The replay can't reach a fresh
+channel that has no record of those ids. BUT: we don't need to replay
+the same payload — we can replay the entire conversation as a fresh
+`send_user_message`. The proxy already serializes the full history
+(including tool_result blocks) into a single bajie_yield payload in
+`mode=full`. The receiving model on a fresh channel sees a complete
+transcript and continues from there with new tool_use_ids.
+
+**Implementation** (`scaffolding/pool/api-server.mjs`):
+
+- At the send_tool_results POST, pre-render the equivalent
+  send_user_message payload (mode=full, sessionKey=null forces fresh
+  routing) and stash as `lastPoolRetryPayload`.
+- tryRetryRequest is action-agnostic: always replays
+  `lastPoolRetryPayload`, which is always send_user_message-shaped.
+- cancel_request kills the stuck channel (its stale tool_use_ids
+  become irrelevant since the conversation continues on a fresh
+  channel with new ids).
+- Pool routes the fallback to a new channel via round-robin (no
+  affinity since sessionKey=null).
+
+**Cost**: fresh channel re-processes the full conversation including
+prior thinking. Adds latency proportional to context size. For typical
+sessions (<200K tokens), few seconds — much better than the
+conversation breaking.
+
+**Open risk**: model behavior on receiving full transcript as a fresh
+user message. Expectation: Claude reads the conversation history and
+continues the iteration naturally (that's the standard multi-turn
+pattern). Worst case: model recaps or asks a clarifying question
+instead of continuing — degraded but recoverable.
+
+**Restart**: api-server only. No pool-manager changes; the
+release_consumed_ids IPC from the failed first attempt remains in
+pool-manager (harmless, possibly useful later).
+
+---
+
+## Attempted and reverted: send_tool_results retry (2026-05-24) — superseded by the conversion fix above
 
 Same-day cycle: extended retry to send_tool_results, observed it
 breaking real conversations in production, reverted.
