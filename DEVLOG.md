@@ -2064,6 +2064,56 @@ grepping or reading the env list. If you see the old names anywhere
 
 ---
 
+## Local-tool-adapter dedup (2026-05-24)
+
+Fixes the "already consumed anthropic_tool_use_id" proxy_notice that
+appeared sporadically (twice in our recent logs) when the bridge-worker
+delivered the same `tool_use` IPC twice.
+
+**Root cause**: Cursor's backend can re-emit an unhandled `tool_use`
+after our parallel-tools watchdog finalizes the outer turn and a new
+request arrives on the same channel. Concrete trace from `req-8cb6...`
+at 23:43:43–45:
+
+```
+23:43:43.804  → local tool adapter: name=Grep id=toolu_9d8...
+23:43:44.606  → finalize tool_use turn (WATCHDOG @1000ms)
+23:43:44.616  POST: Bash tool_result back (new request, same channel)
+23:43:44.620  → local tool adapter: name=Grep id=toolu_9d8...   ← duplicate
+23:43:45.074  ↪ local tool adapter ok: ... bytes=0              ← first finishes
+23:43:45.905  ↪ local tool adapter ok: ... bytes=0              ← second finishes
+23:43:45.906  → soften pool error: already consumed
+```
+
+Both Grep invocations completed successfully (0 bytes each — the actual
+filesystem call ran twice for nothing). The pool-manager correctly
+rejected the second `send_tool_results` via its `consumedToolUseIndex`
+dedup; api-server softened the error to a `proxy_notice`. No user-facing
+crash, but ugly + wasted work.
+
+**Fix** (`scaffolding/pool/api-server.mjs`):
+
+  - Module-level Maps `localToolInFlight` + `localToolCompleted`
+  - 30s TTL on the completed set, swept every 10s
+  - Before invoking `runPoolLocalTool`, check both maps; suppress
+    duplicates with a log line and `return`
+  - On completion / catch, move id from in-flight → completed
+
+Scope is module-global (not per-request) because the duplicate observed
+in production crossed HTTP requests — first invocation under one
+requestId, second under the follow-up POST's requestId. Per-request
+scope would not catch this case.
+
+Log signature when the dedup fires:
+- `↪ local tool adapter dedup: in-flight id=... — suppressing duplicate`
+- `↪ local tool adapter dedup: already completed id=... NNN ms ago — suppressing duplicate`
+
+No env-var knob; the behavior is unambiguously correct (never run the
+same tool_use twice). If we ever want to disable it, an env-var gate
+is one if-block to add.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).

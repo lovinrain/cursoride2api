@@ -283,6 +283,30 @@ const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_U
 const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_EMPTY_TURN_MAX || '0', 10));
 const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
 const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
+
+// ── Local-tool-adapter dedup ───────────────────────────────────────────────
+// The bridge-worker can deliver the SAME tool_use IPC twice — Cursor's
+// backend sometimes re-emits an unhandled tool_use after the parallel-tools
+// watchdog finalizes the outer turn and a follow-up request comes in on
+// the same channel. The local-tool-adapter would then run twice, both
+// would send_tool_results, and the second one would hit the pool's
+// `already consumed anthropic_tool_use_id` check (which softens to a
+// proxy_notice but is ugly + wastes a tool execution).
+//
+// This dedup tracks in-flight + recently-completed tool_use_ids module-wide
+// (the duplicate can cross HTTP requests, so per-request scope wouldn't
+// catch it). On duplicate arrival: skip the second invocation entirely;
+// the first invocation's send_tool_results stands.
+const localToolInFlight = new Map();    // tool_use_id -> { startedAt, name }
+const localToolCompleted = new Map();   // tool_use_id -> completedAt
+const LOCAL_TOOL_DEDUP_TTL_MS = 30_000;
+setInterval(() => {
+  const cutoff = Date.now() - LOCAL_TOOL_DEDUP_TTL_MS;
+  for (const [id, ts] of localToolCompleted) {
+    if (ts < cutoff) localToolCompleted.delete(id);
+  }
+}, 10_000).unref();
+
 const spoofResultPlaybook = new Map();
 function recordSpoofResult(toolUseId, promise) {
   if (!toolUseId || !promise) return;
@@ -1749,11 +1773,35 @@ async function handleMessagesRequest(req, res) {
             if (!localDecision.canRun && localDecision.retryOnClient) {
               log(`→ local tool adapter skip: name=${xlated.name} reason=${localDecision.reason || 'not runnable locally'}; forwarding to client id=${msg.anthropic_id}`);
             } else {
+              // Dedup: suppress duplicate invocations for the same tool_use_id.
+              // The bridge-worker can deliver the same tool_use IPC twice
+              // (Cursor backend re-emits unhandled tool_use after our watchdog
+              // finalizes the outer turn). Without this check, we'd run the
+              // local tool twice, send two tool_results, and the second would
+              // trip the pool's `already consumed anthropic_tool_use_id` guard.
+              const tid = msg.anthropic_id;
+              if (tid && localToolInFlight.has(tid)) {
+                log(`  ↪ local tool adapter dedup: in-flight id=${tid} name=${xlated.name} — suppressing duplicate`);
+                return;
+              }
+              if (tid && localToolCompleted.has(tid)) {
+                const agoMs = Date.now() - localToolCompleted.get(tid);
+                log(`  ↪ local tool adapter dedup: already completed id=${tid} name=${xlated.name} ${agoMs}ms ago — suppressing duplicate`);
+                return;
+              }
+              if (tid) localToolInFlight.set(tid, { startedAt: Date.now(), name: xlated.name });
               log(`→ local tool adapter: name=${xlated.name} args=${JSON.stringify(xlated.input).slice(0, 200)} id=${msg.anthropic_id}`);
               reqLog.status = 'local_tool';
               reqLog.lastToolName = xlated.name;
+              const markCompleted = () => {
+                if (tid) {
+                  localToolInFlight.delete(tid);
+                  localToolCompleted.set(tid, Date.now());
+                }
+              };
               runPoolLocalTool(xlated.name, xlated.input || {})
                 .then((result) => {
+                  markCompleted();
                   if (!result.ok) {
                     log(`  ↪ local tool adapter error: name=${result.name || xlated.name} id=${msg.anthropic_id} ${String(result.content || '').slice(0, 200)}`);
                   } else {
@@ -1772,6 +1820,7 @@ async function handleMessagesRequest(req, res) {
                   });
                 })
                 .catch((e) => {
+                  markCompleted();
                   const message = e && e.message ? e.message : String(e);
                   log(`  ↪ local tool adapter threw: name=${xlated.name} id=${msg.anthropic_id} ${message}`);
                   poolWrite({
