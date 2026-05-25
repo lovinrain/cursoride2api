@@ -882,8 +882,13 @@ async function handleMessagesRequest(req, res) {
   //
   // Safety invariants checked in order:
   //   1. The relevant per-symptom retry budget must allow it.
-  //   2. No client-visible content can have been emitted yet — retry would
-  //      otherwise produce duplicates in the same SSE response.
+  //   2. No MODEL CONTENT can have been emitted yet (tool_use, text deltas,
+  //      thinking deltas). The bare `message_start` SSE event from startMsg()
+  //      is fine — it's a wrapper that's idempotent on the replay path. The
+  //      callers ensure this invariant holds: the watchdog only fires when
+  //      `!visibleUpstreamEventSeen` (so no text/thinking/tool_use has been
+  //      forwarded yet); the empty-turn detection only fires when
+  //      `outputTokens === 0 && !textBlockOpen`.
   //   3. We must have captured the original send_user_message payload to
   //      replay. send_tool_results-triggered failures cannot be retried
   //      because the consumed tool_use_id state can't be cleanly re-injected.
@@ -894,10 +899,14 @@ async function handleMessagesRequest(req, res) {
   // round-robin to a different channel. For `upstream_silent_timeout` the
   // channel got killed by the cancel_request, so a fresh routing decision
   // is implicit.
+  //
+  // Note: an earlier version checked `messageStarted` and never fired for
+  // upstream_silent_timeout because messageStarted is set the moment
+  // route_decision arrives (long before the 25s watchdog). The real
+  // invariant is "no content emitted", which the callers already ensure.
   function tryRetryRequest(symptom) {
     if (done && symptom !== 'empty_assistant_turn') return false;
     if (!lastSendUserMessagePayload) return false;
-    if (messageStarted) return false;
     if (toolUseEmitted) return false;
     const budget = symptom === 'upstream_silent_timeout'
       ? UPSTREAM_SILENT_RETRY_MAX
