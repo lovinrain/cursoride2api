@@ -892,10 +892,12 @@ async function handleMessagesRequest(req, res) {
   //      forwarded yet); the empty-turn detection only fires when
   //      `outputTokens === 0 && !textBlockOpen`.
   //   3. We must have captured the original poolWrite payload to replay
-  //      (lastPoolRetryPayload). Both send_user_message AND send_tool_results
-  //      are eligible: for tool_results, we ask pool-manager to release the
-  //      consumed-id entries via release_consumed_ids before re-delivering
-  //      (otherwise the replay would be rejected with "already consumed").
+  //      (lastPoolRetryPayload). Only send_user_message is eligible —
+  //      send_tool_results retries are structurally infeasible (cancel
+  //      wipes the channel's tool_use_id registrations via
+  //      clearPendingToolUsesForChannel, so the replay can't reach a
+  //      different channel that has no record of those ids). See the
+  //      reverted attempt + the unknown-id bug it produced for context.
   //
   // For `empty_assistant_turn` the sticky channel that produced the empty
   // turn is still alive and would be selected again under session affinity;
@@ -912,6 +914,19 @@ async function handleMessagesRequest(req, res) {
     if (done && symptom !== 'empty_assistant_turn') return false;
     if (!lastPoolRetryPayload) return false;
     if (toolUseEmitted) return false;
+    // Reverted 2026-05-24: send_tool_results retries are structurally
+    // infeasible. The pool's cancel_request kills the channel AND wipes
+    // the tool_use_id registrations from toolUseIndex (via
+    // clearPendingToolUsesForChannel). The replayed send_tool_results
+    // then fails with "unknown anthropic_tool_use_id" because the ids
+    // are channel-bound and a fresh channel has no record of them.
+    // Concrete trace: req-1054ab14f6614b90 at 04:14:43-44 — retry
+    // fired, channel killed, replay hit "unknown" error, conversation
+    // broke. The pre-retry behavior (visible notice, channel state
+    // intact, user can resend) is strictly better. So tool_results
+    // failures fall through to the existing notice path.
+    const replayAction = lastPoolRetryPayload.action || 'send_user_message';
+    if (replayAction !== 'send_user_message') return false;
     const budget = symptom === 'upstream_silent_timeout'
       ? UPSTREAM_SILENT_RETRY_MAX
       : EMPTY_TURN_RETRY_MAX;
@@ -923,7 +938,6 @@ async function handleMessagesRequest(req, res) {
     const counterAfter = counterBefore + 1;
     if (symptom === 'upstream_silent_timeout') silentRetryCount = counterAfter;
     else emptyTurnRetryCount = counterAfter;
-    const replayAction = lastPoolRetryPayload.action || 'send_user_message';
     log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} action=${replayAction} requestId=${requestId}`);
     patchRequest(requestId, {
       retryCount: silentRetryCount + emptyTurnRetryCount,
@@ -940,19 +954,6 @@ async function handleMessagesRequest(req, res) {
     // want to break affinity, so we cancel anyway (no-op on already-finished
     // request) and override sessionKey in the replay.
     poolWrite({ type: 'cancel_request', requestId, reason: `retry:${symptom}` });
-    // For send_tool_results retries: the pool's consumedToolUseIndex would
-    // reject a naive replay with "already consumed". Tell the pool to
-    // forget those ids so the replay can re-deliver them on a fresh channel.
-    // Safe because cancel_request just killed the channel — the original
-    // delivery never produced a real result.
-    if (replayAction === 'send_tool_results' && Array.isArray(lastPoolRetryPayload.results)) {
-      const idsToRelease = lastPoolRetryPayload.results
-        .map((r) => r.anthropic_tool_use_id)
-        .filter(Boolean);
-      if (idsToRelease.length > 0) {
-        poolWrite({ type: 'release_consumed_ids', ids: idsToRelease, reason: `retry:${symptom}` });
-      }
-    }
     const replayPayload = symptom === 'empty_assistant_turn'
       ? { ...lastPoolRetryPayload, sessionKey: null }
       : lastPoolRetryPayload;
@@ -2154,18 +2155,20 @@ async function handleMessagesRequest(req, res) {
       toolResultCount: enriched.length,
       toolResultIds: enriched.map(r => r.anthropic_tool_use_id),
     });
-    const toolResultPayload = {
+    // No retry snapshot for send_tool_results — see tryRetryRequest's
+    // comment. Tool_use_ids are channel-bound; cancel_request wipes them
+    // from toolUseIndex, so a replay on a fresh channel hits "unknown
+    // anthropic_tool_use_id". The failure mode is documented as
+    // non-retryable; silent timeout here falls through to the existing
+    // notice. If anything, retry was making things strictly worse by
+    // also breaking the channel state the user could otherwise recover
+    // from with a fresh user message.
+    poolWrite({
       type: 'request', requestId, action: 'send_tool_results',
       model: routingModel || null,
       requestedModel: model || null,
       results: enriched,
-    };
-    // Snapshot for potential retry on upstream_silent_timeout. The pool's
-    // consumedToolUseIndex would reject a naive replay with "already
-    // consumed"; tryRetryRequest handles this by emitting
-    // release_consumed_ids before re-sending.
-    lastPoolRetryPayload = toolResultPayload;
-    poolWrite(toolResultPayload);
+    });
   } else {
     // Mode selection: in `full` mode, render the ENTIRE messages[] into
     // one self-contained prompt; in `last` mode (default, backwards-

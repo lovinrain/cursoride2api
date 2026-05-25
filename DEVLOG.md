@@ -2064,14 +2064,50 @@ grepping or reading the env list. If you see the old names anywhere
 
 ---
 
-## Auto-retry extended to send_tool_results (2026-05-24)
+## Attempted and reverted: send_tool_results retry (2026-05-24)
 
-Initial retry feature only covered the first request of each user turn
-(`send_user_message`). Tool-result follow-ups (`send_tool_results`)
-were intentionally excluded because of `consumedToolUseIndex` state:
-the pool marks tool_use_ids consumed once delivered to a channel; a
-naive replay would hit "already consumed" and the second result would
-be rejected.
+Same-day cycle: extended retry to send_tool_results, observed it
+breaking real conversations in production, reverted.
+
+**Why we tried it**: in a typical claude-code session, the bulk of
+proxy traffic is tool_result follow-ups. The send_user_message-only
+retry covered ~10% of failure-prone requests.
+
+**Why it failed**: pool's `cancelRequest()` calls
+`clearPendingToolUsesForChannel(ch.id)` (`pool-manager.mjs:889`)
+before SIGTERM. The replay on a fresh channel then can't find the
+tool_use_ids because they're channel-bound — a different channel
+never emitted them and there's no way to inject foreign state.
+
+**Production trace** (`req-1054ab14f6614b90` at 04:14:43-44):
+- Original send_tool_results to ch-180 succeeded routing-wise
+- Watchdog fired at 25s, retry activated
+- cancel_request wiped ch-180's toolUseIndex entries
+- Replay → pool sees ids as `unknown anthropic_tool_use_id`
+- User saw a NEW unrecoverable error AND lost the channel state that
+  would otherwise have let them recover with a fresh user message
+
+**Lesson**: retry-on-different-channel only works for action types
+where the payload is channel-agnostic (text in, text out). For state-
+bound payloads (tool_use_ids, channel-specific session state), retry
+needs different semantics — either same-channel retry (which means
+not killing the channel) or full conversation restart (which is what
+the user can already do with a fresh message).
+
+**What remains**: the `release_consumed_ids` pool IPC stays in
+`pool-manager.mjs` — harmless, possibly useful for future "resurrect
+same channel" recovery work. The api-server side reverted to
+send_user_message-only retry, matching the original design.
+
+The earlier `feat(retry): extend auto-retry to send_tool_results`
+commit (`1b8400e`) effectively went out and came back in within
+~1 hour of real-traffic observation. Net result: pool-manager has a
+new IPC handler that's currently unused; api-server behavior is back
+to send_user_message-only retry.
+
+---
+
+## Auto-retry extended to send_tool_results (2026-05-24) — superseded by revert above
 
 In practice the bulk of proxy traffic is tool_result follow-ups (the
 model iterates: tool → result → tool → result; initial

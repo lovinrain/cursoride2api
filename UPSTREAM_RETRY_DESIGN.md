@@ -162,25 +162,45 @@ Grep `/tmp/ratlc-api.log` for `retry:` to see all retry activity.
 - Requests where `toolUseEmitted` is true at timeout — partial SSE
   content can't be undone
 
-## What IS retried (added later, 2026-05-24)
+## Attempted-and-reverted: send_tool_results retry (2026-05-24)
 
-`send_tool_results` follow-ups are now retryable too. The pool exposes
-a `release_consumed_ids` IPC that lets api-server tell pool-manager to
-forget specific entries from `consumedToolUseIndex` before a replay.
-Without this, the pool's "already consumed anthropic_tool_use_id"
-guard would reject the replayed tool_result.
+An earlier same-day attempt extended retry to `send_tool_results`
+follow-ups via a new `release_consumed_ids` pool IPC. **Reverted**
+once we saw the actual failure mode in production.
 
-Safety: cancel_request kills the channel before any real result was
-produced upstream (the watchdog only fires when no events arrived);
-release_consumed_ids only clears IDs we know never resulted in actual
-model output. Then the replay re-delivers the same tool_use_ids on a
-fresh channel.
+Root cause of revert: pool's `cancelRequest()` calls
+`clearPendingToolUsesForChannel(ch.id)` (`pool-manager.mjs:889`) which
+wipes the channel's `toolUseIndex` entries before SIGTERM. The replay
+on a fresh channel then fails with `unknown anthropic_tool_use_id`
+because tool_use_ids are bound to the SPECIFIC channel that emitted
+them — a different channel has no record of them and there's no way
+to inject foreign state.
 
-This matters because in a typical claude-code session, the bulk of
-proxy traffic is tool_result follow-ups (model iterates: tool → result
-→ tool → result). The initial send_user_message happens once per
-user turn. Without tool_results retry, the failure-mode coverage was
-"first request only" per turn; now it's every request.
+Concrete trace (`req-1054ab14f6614b90` at 04:14:43-44):
+- Original `send_tool_results` with ids `[toolu_f3b89, ...]` routed to
+  ch-180 successfully
+- Watchdog fired at 25s, retry path activated
+- `cancel_request` killed ch-180, wiping its toolUseIndex entries
+- Replay `send_tool_results` → pool sees ids as `unknown` → error
+- User saw a NEW "unknown anthropic_tool_use_id" error AND lost the
+  channel state that would otherwise have let them recover with a
+  fresh user message
+
+The fundamental issue: "retry on a different channel" assumes the
+new channel can accept the same payload. For send_user_message that's
+true (text in, text out — model-agnostic). For send_tool_results it's
+false because tool_use_ids carry channel-specific state.
+
+The `release_consumed_ids` pool IPC remains in `pool-manager.mjs`
+(harmless, may be useful for future work — e.g. if we ever build a
+"resurrect the same channel" recovery mechanism that doesn't kill
++wipe-+restart). The api-server side no longer uses it.
+
+**Current behavior** for send_tool_results upstream_silent_timeout:
+falls through to the existing notice (`[proxy_notice] Cursor upstream
+accepted the request but did not emit ... Please retry after the
+channel is recycled.`). User can /retry from the prior message with
+the channel state intact.
 
 ## Open follow-ups (not blocking)
 
