@@ -283,6 +283,18 @@ const UPSTREAM_SILENT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_U
 const EMPTY_TURN_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_EMPTY_TURN_MAX || '0', 10));
 const RETRY_DELAY_MS = Math.max(0, parseInt(process.env.RATLC_RETRY_DELAY_MS || '500', 10));
 const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
+// `already consumed` / `unknown` / `span multiple channels` tool_use_id errors
+// mean the client (re)sent a tool_result the pool can't honor on the bound
+// channel — typically a claude-code DOUBLE-SUBMIT (the first submit consumed
+// the id; the duplicate or a later "continue" hits this) or a watchdog-
+// finalized turn whose channel never produced output. The old behavior was a
+// dead-end text notice ("send a fresh user message"), but claude-code's
+// conversation still has an unanswered tool_use, so it just re-sends the same
+// (now-consumed) tool_result forever. Instead we recover by replaying the
+// pre-built full-context send_user_message on a FRESH channel (same machinery
+// as the silent-timeout fallback) so the model actually continues. Defaults
+// ON (1) because the dead-end is strictly worse; set 0 to restore the notice.
+const STALE_TOOL_RESULT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_STALE_TOOL_RESULT_MAX || '1', 10));
 
 // ── Keep-alive ping cadence ────────────────────────────────────────────────
 // After message_start we may sit silent for many seconds waiting on Cursor's
@@ -798,6 +810,7 @@ async function handleMessagesRequest(req, res) {
   let lastPoolRetryPayload = null;
   let silentRetryCount = 0;
   let emptyTurnRetryCount = 0;
+  let staleToolResultRetryCount = 0;
   let pendingRetryTimer = null;
   let keepalivePingTimer = null;
   // Set true by cancelForClientDisconnect before it calls finishMessage(), so
@@ -952,22 +965,27 @@ async function handleMessagesRequest(req, res) {
     const replayAction = lastPoolRetryPayload.action || 'send_user_message';
     const budget = symptom === 'upstream_silent_timeout'
       ? UPSTREAM_SILENT_RETRY_MAX
+      : symptom === 'stale_tool_result'
+      ? STALE_TOOL_RESULT_RETRY_MAX
       : EMPTY_TURN_RETRY_MAX;
     if (budget <= 0) return false;
     const counterBefore = symptom === 'upstream_silent_timeout'
       ? silentRetryCount
+      : symptom === 'stale_tool_result'
+      ? staleToolResultRetryCount
       : emptyTurnRetryCount;
     if (counterBefore >= budget) return false;
     const counterAfter = counterBefore + 1;
     if (symptom === 'upstream_silent_timeout') silentRetryCount = counterAfter;
+    else if (symptom === 'stale_tool_result') staleToolResultRetryCount = counterAfter;
     else emptyTurnRetryCount = counterAfter;
     log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} action=${replayAction} requestId=${requestId}`);
     patchRequest(requestId, {
-      retryCount: silentRetryCount + emptyTurnRetryCount,
+      retryCount: silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount,
       lastRetrySymptom: symptom,
       lastRetryAt: Date.now(),
     });
-    if (RETRY_EMIT_NOTICE && (silentRetryCount + emptyTurnRetryCount) === 1) {
+    if (RETRY_EMIT_NOTICE && (silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount) === 1) {
       // Only emit on the first overall retry so the client gets ONE breadcrumb,
       // not a wall of notices on repeated retries.
       emitTextDelta(`[proxy_notice] ${symptom} — auto-retrying through a fresh channel...\n`);
@@ -2019,6 +2037,18 @@ async function handleMessagesRequest(req, res) {
           log(`  → soften pool error as text requestId=${requestId}: ${String(msg.message || '').slice(0, 180)}`);
           finalStatusOverride = softened.status;
           finalErrorMessage = softened.error || msg.message || null;
+          // Recover stale tool_result errors (already consumed / unknown id /
+          // span-multiple-channels) by replaying the pre-built full-context
+          // send_user_message on a fresh channel, instead of dead-ending with
+          // a notice the client can't act on (it just re-sends the same
+          // consumed tool_result). startMsg() first so the retry breadcrumb
+          // and the replayed turn stream into a well-formed message (there was
+          // no route_decision for a pool-rejected duplicate, so message_start
+          // hasn't been sent yet). tryRetryRequest re-arms the watchdog itself.
+          if (softened.status === 'stale_tool_result' && STALE_TOOL_RESULT_RETRY_MAX > 0) {
+            startMsg();
+            if (tryRetryRequest('stale_tool_result')) return;
+          }
           startMsg();
           emitTextDelta(softened.text);
           stopReason = 'end_turn';

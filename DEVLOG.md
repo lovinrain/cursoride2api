@@ -2304,6 +2304,75 @@ the pinned `2.6.20`.
 
 ---
 
+## Recover stale tool_result instead of dead-ending (2026-05-25)
+
+**Symptom**: malformed-200 on a turn, then on "continue" the client gets
+`[proxy_notice] already consumed anthropic_tool_use_id: toolu_… The client
+replayed a tool_result that the proxy had already consumed. Please send a
+fresh user message to continue.` — and "continue" never works, it just hits
+the same notice again.
+
+**Log trace** (the giveaway): the SAME tool_result was POSTed three times for
+a `run_in_background: true` Bash:
+- `req-50b71225` @05:55:18.46 — consumed `toolu_2c1b…`, routed to ch-1661
+- `req-2f0d6ac0` @05:55:18.48 (**+22ms**) — identical body → "already consumed"
+- `req-d1e01fe3` @05:57:08 (the "continue", body `[tool_result(…), text(8c)]`) → "already consumed"
+
+Root cause is a chain:
+1. `*-thinking-fast` models don't emit `step_completed`, so we finalize
+   tool_use turns with the 1000ms parallel-tools watchdog — i.e. we tell the
+   client `stop_reason=tool_use` while the Cursor channel is *still busy*.
+2. The next tool_result routes (session affinity) to that still-busy channel
+   (`ch-1661`, logged `state was busy`), which then produces **nothing** — no
+   text/yield/step_completed/error. (Its 25s watchdog also didn't log a retry;
+   the late output of the prior watchdog-finalized turn appears to bleed onto
+   the new request, marking a visible event and short-circuiting the watchdog.)
+3. claude-code double-submits the tool_result (the +22ms duplicate — its own
+   client retry / background-bash quirk). First consumed the id; duplicate
+   hits "already consumed".
+4. Because no usable assistant turn was ever delivered, claude-code's
+   conversation still has an unanswered tool_use, so "continue" re-sends the
+   same now-consumed tool_result → dead-end notice again. Stuck.
+
+**Not the same as the keep-alive fix.** That one addressed slow-first-byte
+read-idle timeouts. This is a consumed-id desync — a different class. The
+`already consumed` softening was *working*; it just dead-ended.
+
+**Fix**: convert the dead-end into recovery. The `send_tool_results` POST
+already pre-builds a full-context `send_user_message` fallback
+(`lastPoolRetryPayload`, from the silent-timeout work, commit 5571916). On a
+`stale_tool_result` soften (already-consumed / unknown-id / span-multiple-
+channels), instead of emitting the notice we call `tryRetryRequest`
+(new symptom `stale_tool_result`, budget `RATLC_RETRY_STALE_TOOL_RESULT_MAX`,
+default 1) which replays that full transcript on a FRESH channel
+(`sessionKey:null`). The model sees the complete history (tool_result inlined)
+and continues with new tool_use_ids. `startMsg()` is called first so the
+breadcrumb + replayed turn stream into a well-formed message (a pool-rejected
+duplicate has no prior `route_decision`, so `message_start` wasn't sent yet).
+
+**Verified live** (synthetic tool_result for a never-issued id):
+```
+→ soften pool error: unknown anthropic_tool_use_id: toolu_FAKE…
+→ retry: stale_tool_result attempt 1/1 action=send_user_message
+→ retry: stale_tool_result firing replay … → route_decision → ch-1682
+```
+Client SSE: `message_start · ping · content_block_start · 2×delta · stop ·
+message_delta · message_stop` — one `[proxy_notice] stale_tool_result —
+auto-retrying…` breadcrumb followed by the model's real continuation
+("The command ran successfully and output: hello-world"). Well-formed, no
+malformed-200, conversation unstuck.
+
+**Residual (not fixed, lower priority)**: the *first* submit (`req-50b71225`)
+still hangs on the busy channel and its watchdog didn't fire — the recovery
+salvages the conversation via the duplicate/continue, but the original
+channel is wasted until the pool's 240s busy-reaper collects it. Proper fix
+would be either (a) not routing a tool_result to a channel still busy from a
+watchdog-finalized turn, or (b) api-server-level dedup of the double-submit
+before it reaches the pool. Both deferred — the recovery makes the failure
+non-blocking for the user.
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
