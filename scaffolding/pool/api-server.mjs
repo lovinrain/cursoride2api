@@ -635,7 +635,14 @@ async function handleMessagesRequest(req, res) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad json' } }));
   }
-  const { messages, system, tools, model } = body;
+  const { tools, model } = body;
+  // messages/system are mutable: a trailing (or embedded) role:system message
+  // gets hoisted into the system field below (see the hoist block before
+  // validation). Some clients append MCP-server-instructions / skills-list
+  // content as a `{role:"system"}` element in messages[] — illegal in the
+  // Anthropic schema (system belongs in the top-level field) — which would
+  // otherwise 400 with "last message must be user".
+  let { messages, system } = body;
   const routingModel = normalizeModelForRouting(model);
   // claude-code (and other clients) enable `interleaved-thinking-2025-05-14`
   // beta plus `thinking: {type:'enabled'}` in the body when talking to
@@ -675,6 +682,43 @@ async function handleMessagesRequest(req, res) {
       summary = `content type=${typeof last.content}`;
     }
     log(`  body: lastMsg.role=${last.role} content=[${summary}] msgCount=${messages.length}`);
+  }
+  // ── Hoist role:system messages out of messages[] ──────────────────────────
+  // The Anthropic Messages API only permits `user`/`assistant` roles inside
+  // messages[]; system content belongs in the top-level `system` field. Some
+  // clients (observed: claude-code appending "# MCP Server Instructions" /
+  // "The following skills are available…" as a trailing element) violate this,
+  // which used to 400 with "last message must be user". Instead of rejecting,
+  // fold each system message's text into the system field (in order) and drop
+  // it from messages[]. The cleaned array then flows through the normal
+  // validation below — a request that is STILL malformed after hoisting (e.g.
+  // genuinely empty, or ending in assistant) is still correctly rejected.
+  if (Array.isArray(messages) && messages.some((m) => m && m.role === 'system')) {
+    const hoisted = [];
+    const kept = [];
+    for (const m of messages) {
+      if (m && m.role === 'system') {
+        const t = extractTextFromContent(m.content);
+        if (t) hoisted.push(t);
+      } else {
+        kept.push(m);
+      }
+    }
+    if (hoisted.length > 0) {
+      const hoistedText = hoisted.join('\n\n');
+      if (Array.isArray(system)) {
+        system = [...system, { type: 'text', text: hoistedText }];
+      } else if (typeof system === 'string' && system.length > 0) {
+        system = `${system}\n\n${hoistedText}`;
+      } else {
+        system = hoistedText;
+      }
+      log(`  → hoisted ${hoisted.length} role:system message(s) out of messages[] into system field (${hoistedText.length}c); msgCount ${messages.length}→${kept.length}`);
+    }
+    messages = kept;
+    // Keep body in sync for any downstream reader (e.g. extractClientSessionId).
+    body.messages = messages;
+    body.system = system;
   }
   if (!Array.isArray(messages) || messages.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });

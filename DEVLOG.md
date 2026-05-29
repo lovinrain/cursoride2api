@@ -2373,6 +2373,47 @@ non-blocking for the user.
 
 ---
 
+## Tolerate role:system messages in messages[] (2026-05-28)
+
+**Symptom**: client got `API Error: 400 last message must be user` — and it
+"was working earlier."
+
+**Diagnosis**: the proxy did NOT change. The `last message must be user`
+check (`api-server.mjs`) is from the pool's first commit `a10b2d3` (May 13),
+byte-identical for 2 weeks, and the pool api-server has never had any
+system-message normalization (history search empty). So the *input* changed:
+the client started sending `/v1/messages` whose **last element of messages[]
+is `{role:"system", …}`** — content was claude-code's `"# MCP Server
+Instructions"` and `"The following skills are available for use with the
+Skill tool:"`. The Anthropic schema only allows `user`/`assistant` in
+messages[]; system content belongs in the top-level `system` field (which the
+client *also* populated — `system=array(3)`). So it's a client-side
+serialization change (newer claude-code build and/or newly-added MCP servers,
+since the "MCP Server Instructions" block only appears when an MCP server
+advertises instructions). All 3 occurrences were the second POST of a
+startup-probe pair; the paired real turns routed fine.
+
+**Fix**: instead of 400-ing, hoist every `role:system` entry out of
+messages[] into the system field (in order, text extracted via
+`extractTextFromContent`), drop them from messages[], then run the existing
+validation on the cleaned array. `system` is kept in whatever shape it
+arrived (array → push a `{type:'text'}` block; string → append; absent →
+set) — both shapes are read by `extractSystemPrompt`/`renderFullContext`.
+The body-summary log still prints the original malformed shape
+(`lastMsg.role=system`) for diagnosis, followed by a `→ hoisted N
+role:system message(s) …` line. No env knob — strict-spec recovery that
+never hurts a well-formed request.
+
+**Verified live** (api-server-only restart):
+- `[user, system]` (the failing shape) → 200, `hoisted 1 … msgCount 2→1`,
+  routed, streamed real answer.
+- `[user, system, user]` (system mid-array) → 200.
+- Guard rails intact: `[user, assistant]` → still 400 "last message must be
+  user"; `[system]`-only (hoist empties messages[]) → still 400 "messages
+  required".
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
