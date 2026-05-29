@@ -2436,7 +2436,7 @@ function handleModels(req, res) {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     data: [
-      { id: 'claude-opus-4-7-thinking-max-fast', type: 'model', display_name: 'Claude Opus 4.7 Thinking Max (Fast)', created_at: '2026-01-01T00:00:00Z' },
+      { id: 'claude-opus-4-8-thinking-max-fast', type: 'model', display_name: 'Claude Opus 4.8 Thinking Max (Fast)', created_at: '2026-01-01T00:00:00Z' },
       { id: 'claude-4.6-opus-max-thinking-fast', type: 'model', display_name: 'Claude Opus 4.6 Max Thinking (Fast)', created_at: '2026-01-01T00:00:00Z' },
     ],
   }));

@@ -14,7 +14,7 @@
 # ── Pool sizing & concurrency ──────────────────────────────────────────────
 POOL_SIZE: 10                                  # number of channels to maintain
 POOL_CONCURRENT_OPENS: 30                      # max channel opens running in parallel during cold start
-POOL_MODEL: claude-opus-4-7-thinking-max-fast,claude-4.6-opus-max-thinking-fast
+POOL_MODEL: claude-opus-4-8-thinking-max-fast,claude-4.6-opus-max-thinking-fast
 
 # ── Tool & context handling ────────────────────────────────────────────────
 POOL_TOOL_MODE: translate                      # contract | translate (claude-code uses translate)
