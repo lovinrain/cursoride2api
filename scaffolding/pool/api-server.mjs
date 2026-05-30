@@ -1497,7 +1497,7 @@ async function handleMessagesRequest(req, res) {
         text: `[proxy_notice] ${text}. The tool_result does not match the active RATLC channel. Please send a fresh user message to continue.\n`,
       };
     }
-    if (/channel .* died/i.test(text)) {
+    if (/channel .* (died|no longer alive)/i.test(text)) {
       return {
         status: 'channel_died',
         error: text,
@@ -2099,13 +2099,37 @@ async function handleMessagesRequest(req, res) {
           finishMessage();
           return;
         }
-        // Anthropic's real SSE for errors emits ONLY `event: error` and
-        // closes the stream. NO message_delta + message_stop afterwards.
-        // claude-code's parser treats an SSE that contains an `error`
-        // event followed by message_delta/message_stop as malformed and
-        // surfaces a second "API returned an empty or malformed response
-        // (HTTP 200)" error on top of the original error message. So we
-        // emit the error event, close the stream, and skip finishMessage.
+        // If we've ALREADY streamed client-visible content (text or tool_use),
+        // a bare `error` event orphans the partial message — no
+        // content_block_stop / message_stop — and claude-code DISCARDS the
+        // answer the user already saw as "empty or malformed response (HTTP
+        // 200)". This is the disappearing-answer bug seen during throttle
+        // storms (Cursor aborts the bidi stream mid-response → pool forwards a
+        // `type:error` → here). Preserve what was shown by finalizing the
+        // message cleanly instead of emitting a raw error event. For a text
+        // turn, append a brief truncation notice; for a tool_use turn, leave
+        // the emitted tool_use blocks intact so the client can still act on
+        // them. finishMessage() closes the open blocks and emits
+        // message_delta + message_stop, so the SSE stays well-formed.
+        if (textBlockOpen || toolUseEmitted || outputTokens > 0) {
+          log(`  → upstream error AFTER partial content requestId=${requestId}; finalizing gracefully to preserve shown output: ${String(msg.message || '').slice(0, 140)}`);
+          finalStatusOverride = 'error_after_partial_content';
+          finalErrorMessage = msg.message || null;
+          if (toolUseEmitted) {
+            stopReason = 'tool_use';
+          } else {
+            emitTextDelta('\n\n[proxy_notice] Upstream connection dropped mid-response — the answer above may be incomplete. Send a new message to continue.\n');
+            stopReason = 'end_turn';
+          }
+          finishMessage();
+          return;
+        }
+        // No client-visible content yet — emit a clean `error` event and close.
+        // Anthropic's real SSE for errors emits ONLY `event: error` (no
+        // message_delta/message_stop afterwards); claude-code treats an error
+        // event followed by message_delta/message_stop as malformed. So here,
+        // with nothing streamed to lose, we emit the error event, close the
+        // stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
         finishRequestLog(requestId, {
           status: 'error',

@@ -2414,6 +2414,60 @@ never hurts a well-formed request.
 
 ---
 
+## Graceful-finalize on mid-stream upstream error — stop discarding shown answers (2026-05-29)
+
+**Symptom**: user asked a question, the answer **streamed and was visible**,
+then **disappeared** and was replaced by `API Error: API returned an empty or
+malformed response (HTTP 200) — check for a proxy or gateway intercepting the
+request`.
+
+**Diagnosis** (from logs): during a throttle storm (the dead-token situation —
+6/7 tokens dead, 1 rate-limited), Cursor aborts the bidi stream mid-response.
+Observed **8× "Response error: aborted" in 6 minutes**, plus
+`unexpected_turn_ended`. The pool forwards these to the api-server as
+`{type:'error'}`. The error handler's RAW path (non-softened errors) emitted a
+bare `event: error` + `res.end()` with **no content_block_stop / message_stop**.
+When content had ALREADY streamed, that orphans the partial message, and
+claude-code discards the shown answer as malformed-200. The handler comment
+even admitted it assumed nothing was streamed yet — true for the no-content
+case, wrong once the answer is on screen.
+
+Two gaps:
+1. `"channel X no longer alive"` (pool-manager.mjs:244/286) didn't match the
+   `/channel .* died/i` soften pattern → fell to the raw path.
+2. The raw path was content-blind — `"Response error: aborted"` /
+   `"unexpected_turn_ended"` (both unsoftened, mid-stream) orphaned the message.
+
+**Fix** (`api-server.mjs`):
+- Raw error path is now **content-aware**: if `textBlockOpen || toolUseEmitted
+  || outputTokens > 0`, do NOT emit a bare error event. For a text turn, append
+  `[proxy_notice] Upstream connection dropped mid-response …` and call
+  `finishMessage()` (closes blocks + message_delta + message_stop). For a
+  tool_use turn, keep the emitted tool_use blocks and finalize with
+  `stop_reason=tool_use`. Only the no-content case keeps the bare-error
+  behavior (claude-code surfaces it cleanly with nothing to lose).
+- Broadened the soften classifier `/channel .* died/i` →
+  `/channel .* (died|no longer alive)/i` so both channel-death variants get the
+  graceful notice.
+
+This is a strict robustness win — turns "answer flashes then vanishes into an
+error" into "answer stays, with a small truncation note" — and applies every
+time Cursor drops a stream, not just during this storm. It does NOT fix the
+storm itself; that's the token-refresh problem (without it you'll still see
+*truncated* answers, just no longer *vanishing* ones).
+
+**Verified live** (api-server-only restart):
+- Kill a channel mid-stream (SIGKILL → softened "channel died"): 37 essay
+  deltas preserved → notice → `content_block_stop · message_delta(end_turn) ·
+  message_stop`. Well-formed.
+- Stress 6 concurrent long streams on the 1 healthy token: stream 1 hit
+  `unexpected_turn_ended` after **135 deltas** → RAW-path fix fired
+  (`→ upstream error AFTER partial content … finalizing gracefully`) → ended
+  with `message_stop`. **All 6 ended with message_stop, zero bare error
+  events.**
+
+---
+
 ## Future work / open issues
 
 - **opencode integration**: opencode reaches the proxy but Cursor's auto-injected system prompt overrides opencode's framing. The model ends up confused about its identity. A possible fix: detect the opencode-style request and strip Cursor's blob before forwarding (or force-replace it with our own).
