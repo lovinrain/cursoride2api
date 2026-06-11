@@ -42,8 +42,8 @@ const REPO = path.resolve(__dirname, '..', '..');
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_PID = '/tmp/ratlc-pool.pid';
 const API_PID = '/tmp/ratlc-api.pid';
-const POOL_LOG = '/tmp/ratlc-pool.log';
-const API_LOG = '/tmp/ratlc-api.log';
+const POOL_LOG = process.env.RATLC_POOL_LOG || '/tmp/ratlc-pool.log';
+const API_LOG = process.env.RATLC_API_LOG || '/tmp/ratlc-api.log';
 const RATLC_API_HOST = process.env.RATLC_API_HOST || '127.0.0.1';
 const RATLC_API_PORT = process.env.RATLC_API_PORT || '4242';
 const API_URL = process.env.RATLC_API_URL || `http://${RATLC_API_HOST}:${RATLC_API_PORT}`;
@@ -105,7 +105,19 @@ async function getStats() {
     http.get(API_URL + '/v1/_stats', (res) => {
       let buf = '';
       res.on('data', (c) => { buf += c.toString(); });
-      res.on('end', () => { clearTimeout(t); try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
+      res.on('end', () => {
+        clearTimeout(t);
+        // An api-server too old to have /v1/_stats answers 404 with a VALID-JSON
+        // error body ({"error":"not found"}). Reject on any non-2xx so callers
+        // see "unavailable" instead of a truthy error object masquerading as a
+        // snapshot (which renders regime=? hour=undefined). See adversarial Gap #1.
+        if ((res.statusCode || 0) >= 300) { reject(new Error('HTTP ' + res.statusCode)); return; }
+        try {
+          const j = JSON.parse(buf);
+          if (!j || typeof j !== 'object' || j.error) { reject(new Error(String((j && j.error) || 'bad stats body'))); return; }
+          resolve(j);
+        } catch (e) { reject(e); }
+      });
     }).on('error', (e) => { clearTimeout(t); reject(e); });
   });
 }
@@ -252,7 +264,12 @@ function statRow(b, opts = {}) {
 }
 function formatStatsLines(stats) {
   const out = [];
-  if (!stats) { out.push(color('stats unavailable — is the api-server up? (GET /v1/_stats)', ANSI.red)); return out; }
+  // null (unreachable / non-2xx) OR a truthy error object both mean "no usable
+  // snapshot" — show the actionable line, never render regime=? hour=undefined.
+  if (!stats || stats.error || !Array.isArray(stats.models)) {
+    out.push(color('stats unavailable — api-server down or too old; restart it: ./launch.sh up', ANSI.red));
+    return out;
+  }
   const reg = { fast: ANSI.green, medium: ANSI.yellow, slow: ANSI.red };
   const cr = stats.currentRegime || '?';
   const adaptive = stats.adaptiveTimeouts
@@ -286,7 +303,15 @@ function formatStatsLines(stats) {
 // Returns [] when stats are unreachable/disabled so the default view stays clean.
 function formatStatsCompact(stats) {
   const out = [];
-  if (!stats || !Array.isArray(stats.models)) return out;
+  // null/error = api-server unreachable or pre-`/v1/_stats` (version skew): show
+  // an actionable one-liner instead of a silent gap — this is the "no stats"
+  // symptom when the TUI was relaunched but the api-server wasn't. Distinct from
+  // a healthy-but-empty snapshot (models=[]), which shows "learning…" below.
+  if (!stats || stats.error) {
+    out.push(color('Latency', ANSI.bold) + color('  stats unavailable — restart the api-server: ./launch.sh up', ANSI.yellow));
+    return out;
+  }
+  if (!Array.isArray(stats.models)) return out;
   const reg = { fast: ANSI.green, medium: ANSI.yellow, slow: ANSI.red };
   const cr = stats.currentRegime || '?';
   let clock = '';
@@ -394,6 +419,19 @@ async function cmdTui() {
   const poolLines = [];
   let dirty = true;
   let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats'
+  // Throttle the /v1/_stats fetch: render fires on every `dirty` flip (log
+  // activity, keypresses, the 1s tick) — up to ~4×/s — but latency percentiles
+  // don't need sub-second refresh. Cache so the band/detail fetch is decoupled
+  // from the render rate (and we never hammer the endpoint). null is cached too.
+  let _statsCache = null, _statsCacheAt = 0;
+  const STATS_TTL_MS = 3000;
+  async function getStatsCached() {
+    const now = Date.now();
+    if (now - _statsCacheAt < STATS_TTL_MS) return _statsCache;
+    _statsCacheAt = now;
+    try { _statsCache = await getStats(); } catch { _statsCache = null; }
+    return _statsCache;
+  }
   let cmdMode = false;           // vim-style ':' command input
   let cmdBuffer = '';
   let cmdHistory = [];
@@ -758,31 +796,27 @@ async function cmdTui() {
       drawCmdBar(cols); return;
     }
     if (viewMode === 'api') {
-      for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', rows - hdr.length - cmdBarLines)) console.log(l);
+      for (const l of logPaneLines(apiLines, API_LOG, rows - hdr.length - cmdBarLines)) console.log(l);
       drawCmdBar(cols); return;
     }
     if (viewMode === 'pool') {
-      for (const l of logPaneLines(poolLines, '/tmp/ratlc-pool.log', rows - hdr.length - cmdBarLines)) console.log(l);
+      for (const l of logPaneLines(poolLines, POOL_LOG, rows - hdr.length - cmdBarLines)) console.log(l);
       drawCmdBar(cols); return;
     }
     if (viewMode === 'stats') {
-      let stats = null;
-      try { stats = await getStats(); } catch { stats = null; }
-      for (const l of formatStatsLines(stats)) console.log(l);
+      for (const l of formatStatsLines(await getStatsCached())) console.log(l);
       drawCmdBar(cols); return;
     }
     // split — status panel + a compact latency band (always visible by default;
     // full per-bucket table is view 5) + the api log tail.
     const statusLines = buildStatusLines(snap);
-    let splitStats = null;
-    try { splitStats = await getStats(); } catch { splitStats = null; }
-    const compact = formatStatsCompact(splitStats);
+    const compact = formatStatsCompact(await getStatsCached());
     if (compact.length) { statusLines.push(color('─'.repeat(Math.max(1, Math.min(cols, 60)) - 1), ANSI.dim)); for (const l of compact) statusLines.push(l); }
     const minStatusHeight = Math.max(statusLines.length, 12);
     for (let i = 0; i < minStatusHeight; i++) console.log(statusLines[i] ?? '');
     console.log(color('─'.repeat(Math.max(1, cols - 1)), ANSI.dim));
     const apiPaneHeight = Math.max(5, rows - hdr.length - minStatusHeight - cmdBarLines - 2);
-    for (const l of logPaneLines(apiLines, '/tmp/ratlc-api.log', apiPaneHeight)) console.log(l);
+    for (const l of logPaneLines(apiLines, API_LOG, apiPaneHeight)) console.log(l);
     drawCmdBar(cols);
   }
 

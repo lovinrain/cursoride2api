@@ -3143,9 +3143,14 @@ function handleRequests(req, res) {
 }
 
 // ── Server ──────────────────────────────────────────────────────────────
+// High-frequency introspection/polling GETs — NOT logged. The TUI polls
+// /v1/_stats every refresh; logging it floods the very api log the TUI tails,
+// and the log-tail's dirty flag re-triggers the next poll (self-amplifying
+// loop). Real traffic (POST /v1/messages) and one-shot endpoints stay logged.
+const QUIET_LOG_GETS = new Set(['/v1/_stats', '/health', '/metrics', '/requests']);
 const server = http.createServer(async (req, res) => {
   const path = (req.url || '').split('?')[0];
-  log(`${req.method} ${req.url}`);
+  if (!(req.method === 'GET' && QUIET_LOG_GETS.has(path))) log(`${req.method} ${req.url}`);
   if (req.method === 'POST' && path === '/v1/messages') return handleMessagesRequest(req, res);
   if (req.method === 'POST' && path === '/v1/messages/count_tokens') return handleCountTokens(req, res);
   if (req.method === 'GET' && (path === '/v1/models' || path === '/models')) return handleModels(req, res);
