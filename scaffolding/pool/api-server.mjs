@@ -60,6 +60,19 @@ const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
 // Default OFF (no behavior change vs. legacy). See thinking-buffer.mjs.
 const POOL_REINJECT_THINKING = process.env.POOL_REINJECT_THINKING === '1';
 const POOL_PROXY_THINKING_BLOCKS = process.env.POOL_PROXY_THINKING_BLOCKS === '1';
+// Upper bound on how many bytes of upstream reasoning we forward to the client
+// as thinking deltas per turn when POOL_PROXY_THINKING_BLOCKS=1. A pathological
+// reasoning stream shouldn't flood the SSE channel; once over, we stop
+// forwarding (the text is still captured for detection/reinjection). Unset →
+// generous 256KB default (well above MAX_THINKING_TOKENS worth of text); a
+// positive value is the exact cap; <=0 disables the cap (unlimited).
+const POOL_PROXY_THINKING_MAX_BYTES = (() => {
+  const raw = process.env.POOL_PROXY_THINKING_MAX_BYTES;
+  if (raw == null || raw === '') return 262144;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return Infinity;
+  return n;
+})();
 // Claude Code currently does not render Anthropic `server_tool_use` blocks in
 // the same visible way it renders client-side `tool_use` blocks. Keep emitting
 // the official blocks for protocol consumers, and add a small text trace unless
@@ -522,7 +535,11 @@ function renderContentBlocks(blocks) {
       const t = typeof c.thinking === 'string' ? c.thinking : '';
       if (t) out.push(`<thinking>\n${t}\n</thinking>`);
     } else if (c.type === 'redacted_thinking') {
-      // No plaintext to render on the Cursor AgentService path.
+      // No plaintext to render — a redacted_thinking block carries only an
+      // encrypted blob. Safe to drop here: this transport never PRODUCES them
+      // (we emit proxy-local `thinking`, not redacted), so one could only appear
+      // if a client echoed a real-Anthropic block in, which doesn't occur when
+      // claude-code points at this proxy. Nothing actionable to forward upstream.
     } else if (typeof c.text === 'string') {
       // Tolerate untyped {text:"..."} entries (older SDKs).
       out.push(c.text);
@@ -850,14 +867,23 @@ async function handleMessagesRequest(req, res) {
   let thinkingAdapter = null;
   let emittedTextForDetection = '';
   let emittedThinkingForDetection = '';
-  // True once GENUINE upstream visible content (model text or a server tool
-  // use) has been forwarded — as opposed to proxy-injected notices, which also
-  // go through emitTextDelta and bump outputTokens/textBlockOpen. The empty-
-  // assistant-turn detection keys off THIS, not outputTokens, so that emitting
-  // the "auto-retrying" breadcrumb doesn't fool the check into thinking the
-  // next (still-empty) turn produced content — which previously capped the
-  // retry at 1 and left the bare breadcrumb as the whole reply.
+  // True once GENUINE upstream visible content has reached the client — model
+  // text, a server tool use, OR (when POOL_PROXY_THINKING_BLOCKS is on) real
+  // reasoning forwarded as thinking deltas — as opposed to proxy-injected
+  // notices, which also go through emitTextDelta and bump outputTokens/
+  // textBlockOpen. Two consumers key off THIS:
+  //   1. empty-assistant-turn detection (so emitting the "auto-retrying"
+  //      breadcrumb doesn't fool the check into thinking the next still-empty
+  //      turn produced content), and
+  //   2. the silent-timeout recovery (a transparent replay is only safe when
+  //      the client has seen nothing yet; once real thinking/text is out, a
+  //      replay would duplicate it, so we surface a clean error instead).
   let realVisibleEmitted = false;
+  // Bytes of upstream reasoning actually forwarded to the client this turn, and
+  // a one-shot flag so we log the cap only once. Used by emitThinkingDelta to
+  // enforce POOL_PROXY_THINKING_MAX_BYTES.
+  let forwardedThinkingBytes = 0;
+  let forwardedThinkingCapped = false;
   let thinkingCompletedCount = 0;
   let thinkingDurationMs = null;
   let rescuedHitCount = 0;
@@ -975,19 +1001,34 @@ async function handleMessagesRequest(req, res) {
     if (noVisibleEventTimer) { clearTimeout(noVisibleEventTimer); noVisibleEventTimer = null; }
     if (livenessGapTimer) { clearTimeout(livenessGapTimer); livenessGapTimer = null; }
     if (done || visibleUpstreamEventSeen) return;
-    // Auto-retry hook: try once before giving up. Returns true if a retry
-    // was scheduled (in which case we just return — the replay will re-arm
-    // this watchdog). Returns false if retry is disabled, exhausted, or
-    // not safe (content already emitted).
-    if (tryRetryRequest('upstream_silent_timeout')) return;
     const waitedMs = source === 'liveness_gap' ? NO_VISIBLE_LIVENESS_GRACE_MS : NO_VISIBLE_EVENT_TIMEOUT_MS;
-    log(`  → no visible upstream event timeout (${source} @${waitedMs}ms) requestId=${requestId}${silentRetryCount ? ` (retries exhausted ${silentRetryCount}/${UPSTREAM_SILENT_RETRY_MAX})` : ''}`);
+    // If the client has already seen real reasoning forwarded as thinking
+    // (POOL_PROXY_THINKING_BLOCKS) — or any other visible bytes — a transparent
+    // replay would re-stream that output on a fresh channel, duplicating what
+    // the caller already has. In that case do NOT replay: cancel the hung
+    // channel so the pool recycles it, then surface a clean, resumable error.
+    // Otherwise (nothing visible yet) take the existing transparent-retry path:
+    // returns true if a retry was scheduled (the replay re-arms this watchdog),
+    // false if retry is disabled/exhausted/unsafe.
+    const clientSawBytes = realVisibleEmitted || toolUseEmitted;
+    if (!clientSawBytes && tryRetryRequest('upstream_silent_timeout')) return;
+    log(`  → no upstream frame timeout (${source} @${waitedMs}ms) requestId=${requestId} clientSawBytes=${clientSawBytes}${silentRetryCount ? ` (retries exhausted ${silentRetryCount}/${UPSTREAM_SILENT_RETRY_MAX})` : ''}`);
     finalStatusOverride = 'upstream_no_visible_event_timeout';
-    finalErrorMessage = `No visible Cursor event (${source}) within ${waitedMs}ms after routing`;
-    emitTextDelta(
-      `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${waitedMs}ms. ` +
-      'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
-    );
+    finalErrorMessage = `No upstream frame (${source}) within ${waitedMs}ms${clientSawBytes ? ' after thinking/partial output' : ' after routing'}`;
+    if (clientSawBytes) {
+      // Reap the silent channel promptly instead of leaving it busy until the
+      // pool-manager busy-watchdog (minutes later).
+      poolWrite({ type: 'cancel_request', requestId, reason: `silent_after_visible:${source}` });
+      emitTextDelta(
+        `[proxy_notice] Cursor streamed reasoning but then went silent for ${waitedMs}ms without producing an answer; ` +
+        'the channel was recycled. Please send your message again to continue.\n'
+      );
+    } else {
+      emitTextDelta(
+        `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${waitedMs}ms. ` +
+        'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
+      );
+    }
     stopReason = 'end_turn';
     finishMessage();
   }
@@ -1026,6 +1067,23 @@ async function handleMessagesRequest(req, res) {
   function markVisibleUpstreamEvent() {
     visibleUpstreamEventSeen = true;
     disarmNoVisibleEventTimer();
+  }
+  // Thinking-frame liveness (Workstream C). A thinking frame proves the channel
+  // is alive and producing real model output, so RETIRE the absolute first-byte
+  // ceiling (the "did it ever produce content" question is answered) — but keep
+  // the LIVENESS GAP armed and reset it, so a post-thinking silence (the
+  // documented "went quiet after thinkingCompleted before the answer" hang) is
+  // still caught. Deliberately does NOT set visibleUpstreamEventSeen: unlike
+  // text/tool, thinking must leave the gap able to fire. When the gap is
+  // disabled (grace<=0) clearing the ceiling reduces to the legacy behavior
+  // where the first thinking token fully disarms the per-request watchdog.
+  function markThinkingLiveness() {
+    if (done || visibleUpstreamEventSeen) return;
+    if (noVisibleEventTimer) {
+      clearTimeout(noVisibleEventTimer);
+      noVisibleEventTimer = null;
+    }
+    armLivenessGapTimer();
   }
 
   // Auto-retry helper. Returns true if a retry was scheduled, false if not.
@@ -1072,6 +1130,11 @@ async function handleMessagesRequest(req, res) {
     if (done && symptom !== 'empty_assistant_turn') return false;
     if (!lastPoolRetryPayload) return false;
     if (toolUseEmitted) return false;
+    // Forwarded thinking (POOL_PROXY_THINKING_BLOCKS) is client-visible output;
+    // replaying would re-stream it. The silent-timeout caller already branches
+    // on this, but guard here too so no symptom can blind-replay over content
+    // the client has already seen.
+    if (realVisibleEmitted) return false;
     // lastPoolRetryPayload is ALWAYS a send_user_message-shape payload:
     //   - For send_user_message POSTs: the original payload itself.
     //   - For send_tool_results POSTs: a fallback payload pre-rendered
@@ -1340,9 +1403,29 @@ async function handleMessagesRequest(req, res) {
 
   function emitThinkingDelta(text) {
     if (!text) return;
-    if (!thinkingBlockOpen && thinkingBlockStarted) return;
-    if (!thinkingBlockOpen && blockIdx >= 0) return;
-    startThinkingBlock();
+    // A4: cap total forwarded reasoning per turn so a pathological thinking
+    // stream can't flood the client SSE. Over the cap we stop forwarding; the
+    // text is still captured upstream for detection/reinjection.
+    if (forwardedThinkingBytes >= POOL_PROXY_THINKING_MAX_BYTES) {
+      if (!forwardedThinkingCapped) {
+        forwardedThinkingCapped = true;
+        log(`  thinking-forward cap hit (${POOL_PROXY_THINKING_MAX_BYTES}B) req=${requestId} — further reasoning not forwarded`);
+      }
+      return;
+    }
+    // A1: (re)open a thinking block whenever one isn't currently open — this
+    // covers the first thinking block AND re-opening after text. Cursor can
+    // interleave thinking↔text within a turn, and Anthropic SSE permits ordered
+    // thinking/text/thinking blocks. The prior guards (`blockIdx >= 0` /
+    // `thinkingBlockStarted`) silently dropped any thinking that arrived after a
+    // block had opened, losing reasoning mid-stream with no trace.
+    if (!thinkingBlockOpen) {
+      if (thinkingBlockStarted && blockIdx >= 0) {
+        log(`  thinking re-open after prior block req=${requestId} (interleaved thinking/text)`);
+      }
+      startThinkingBlock();
+    }
+    forwardedThinkingBytes += Buffer.byteLength(text, 'utf8');
     if (thinkingAdapter) thinkingAdapter.append(text);
     sseWrite(res, 'content_block_delta', {
       type: 'content_block_delta',
@@ -1833,26 +1916,37 @@ async function handleMessagesRequest(req, res) {
         if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'thinking_delta') {
         if (done) return;
-        markVisibleUpstreamEvent();
+        // C: thinking is liveness, not a watchdog-disarming "visible event".
+        // markThinkingLiveness retires the first-byte ceiling but keeps + resets
+        // the liveness gap, so a post-thinking silence still trips the watchdog.
+        markThinkingLiveness();
         if (!reqLog.firstByteAt) {
           reqLog.firstByteAt = Date.now();
           reqLog.firstByteMs = reqLog.firstByteAt - reqLog.startedAt;
           reqLog.status = 'thinking';
         }
-        // Capture thinking text into the per-convKey buffer for re-injection
-        // on the NEXT turn. Do NOT forward to the client SSE — Anthropic's
-        // signed thinking blocks need a signature we can't produce, and
-        // emitting unsigned blocks poisons claude-code's session against
-        // direct-Anthropic resume. POOL_PROXY_THINKING_BLOCKS explicitly opts
-        // into proxy-local display blocks with non-Anthropic signatures.
+        // Always capture for hallucination detection and (opt-in) re-injection
+        // into the NEXT turn's prompt. Forwarding the reasoning to the client as
+        // a proxy-local thinking block is separately gated on
+        // POOL_PROXY_THINKING_BLOCKS + the client having asked for thinking.
         emittedThinkingForDetection += msg.text || '';
         if (POOL_REINJECT_THINKING) thinkingBuffer.append(convKey, msg.text || '');
         if (POOL_PROXY_THINKING_BLOCKS && clientThinkingEnabled && msg.text) {
           emitThinkingDelta(msg.text);
+          // A2/C: the client now sees real reasoning. Mark visible content so
+          // (a) the empty-turn retry can't fire and duplicate the thinking, and
+          // (b) a post-thinking silent-timeout surfaces a clean error instead of
+          // a transparent replay that would re-stream it. Guard on
+          // forwardedThinkingBytes so a fully-capped turn doesn't count.
+          if (forwardedThinkingBytes > 0) realVisibleEmitted = true;
         }
         if (toolUseEmitted) armToolUseFinalizer();
       } else if (msg.type === 'thinking_completed') {
         if (done) return;
+        // The thinking→answer boundary is exactly where the "went silent before
+        // the answer" hang occurs. Reset the gap here so the answer gets a fresh
+        // grace window; if it never comes, the gap fires (Workstream C).
+        markThinkingLiveness();
         thinkingCompletedCount++;
         const dur = Number.isFinite(msg.durationMs) ? msg.durationMs : Number(msg.durationMs);
         if (Number.isFinite(dur)) thinkingDurationMs = dur;

@@ -543,6 +543,11 @@ function spawnChannel(group) {
     lastActivityAt: Date.now(),
     spawnedAt: Date.now(),
     busyAt: null,
+    // Wall-clock of the last forward-progress frame (text/thinking/tool/progress).
+    // Distinct from lastActivityAt (which also moves on state/heartbeat); the TUI
+    // uses the gap since this to split a busy channel into "thinking" (frames
+    // flowing) vs "busy" (silent — the truly-suspect state).
+    lastProgressAt: null,
     currentRequestId: null,
     pendingExecId: null,
     pendingAnthropicId: null,
@@ -629,6 +634,7 @@ function handleWorkerMessage(ch, msg) {
       // that's slow-to-first-byte but demonstrably alive, then forward it so
       // the api-server can reset its liveness-gap timer.
       ch.lastActivityAt = Date.now();
+      ch.lastProgressAt = Date.now();
       forwardToClient(ch, msg);
       break;
 
@@ -637,8 +643,18 @@ function handleWorkerMessage(ch, msg) {
     case 'thinking_completed':
     case 'server_tool_use':
     case 'tool_use':
-    case 'yield':
     case 'step_completed':
+      // Streaming model output. Stamp lastProgressAt (powers the TUI's
+      // thinking/busy-silent split) AND bump lastActivityAt so the busy-watchdog
+      // never reaps a channel that is actively producing reasoning or text —
+      // these frames, unlike `progress`, previously updated neither, so a long
+      // (>BUSY_STUCK) thinking or answer stream could be SIGTERMed mid-flight.
+      ch.lastProgressAt = Date.now();
+      ch.lastActivityAt = Date.now();
+      forwardToClient(ch, msg);
+      break;
+
+    case 'yield':
     case 'error':
       forwardToClient(ch, msg);
       break;
@@ -1402,6 +1418,8 @@ function statusSnapshot() {
       idleMs: ch.lastActivityAt ? now - ch.lastActivityAt : null,
       busyAt: ch.busyAt,
       busyForMs: ch.state === 'busy' && ch.busyAt ? now - ch.busyAt : null,
+      lastProgressAt: ch.lastProgressAt,
+      progressGapMs: ch.lastProgressAt ? now - ch.lastProgressAt : null,
       roundsServed: ch.roundsServed,
       currentRequestId: ch.currentRequestId,
       pendingToolUseIds: getPendingToolUseIdsForChannel(ch.id),

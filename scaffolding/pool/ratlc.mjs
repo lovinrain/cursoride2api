@@ -62,6 +62,11 @@ const STATE_COLOR = {
   opening: ANSI.cyan, spawning: ANSI.cyan,
   dead: ANSI.red,
 };
+// A busy channel whose last forward-progress frame (text/thinking/tool/progress)
+// landed within this window is actively producing output → shown as "thinking";
+// busy with a longer gap is "busy" (silent — the truly-suspect state).
+const THINK_GAP_MS = 3000;
+const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < THINK_GAP_MS;
 
 // ── IPC: ask the pool for status ─────────────────────────────────────────
 function poolRequest(obj, timeoutMs = 5000) {
@@ -243,9 +248,11 @@ function printStatus(snap) {
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
   console.log('-'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
-    const c = STATE_COLOR[ch.state] || '';
+    const stateCell = isThinking(ch) ? color('thinking', ANSI.cyan)
+      : ch.state === 'busy' ? color('busy', ANSI.yellow)
+      : (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
     const row = [
-      ch.id, c + ch.state + ANSI.reset, ch.group || '-', String(ch.pid || '-'),
+      ch.id, stateCell, ch.group || '-', String(ch.pid || '-'),
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
@@ -427,9 +434,14 @@ async function cmdTui() {
     const out = [];
     if (!snap?.pool) { out.push(color('pool unreachable', ANSI.red)); return out; }
     const { pool, config } = snap;
+    // Split busy into actively-thinking (frames flowing) vs busy-silent (the
+    // truly-suspect state). thinking + busy = pool.busyCount.
+    const thinkingCount = (pool.channels || []).filter(isThinking).length;
+    const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount);
     const counts = [
       'ready=' + color(pool.readyCount, ANSI.green),
-      'busy=' + color(pool.busyCount, ANSI.yellow),
+      'thinking=' + color(thinkingCount, ANSI.cyan),
+      'busy=' + color(busySilent, ANSI.yellow),
       'opening=' + color(pool.openingCount, ANSI.cyan),
       'dead=' + color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray),
     ].join('  ');
@@ -515,7 +527,14 @@ async function cmdTui() {
       const hdr = ['CHANNEL', 'STATE', 'TOK', 'BUSY', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
 
       function emitRow(ch) {
-        const c = STATE_COLOR[ch.state] || '';
+        // STATE cell: split busy into "thinking" (frames flowing, cyan) vs
+        // "busy" (silent ≥ THINK_GAP_MS, yellow). Other states keep STATE_COLOR.
+        let stateCell;
+        if (ch.state === 'busy') {
+          stateCell = isThinking(ch) ? color('thinking', ANSI.cyan) : color('busy', ANSI.yellow);
+        } else {
+          stateCell = (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
+        }
         // BUSY column: time in current turn. Colored yellow at >3 min, red
         // at >4 min (busy-watchdog default kill threshold).
         let busyTxt = '-';
@@ -528,7 +547,7 @@ async function cmdTui() {
         }
         return [
           rpad(ch.id, w[0]),
-          rpad(c + ch.state + ANSI.reset, w[1]),
+          rpad(stateCell, w[1]),
           rpad(String(ch.tokenIdx ?? 0), w[2]),
           rpad(busyTxt, w[3]),
           rpad(String(ch.pid || '-'), w[4]),

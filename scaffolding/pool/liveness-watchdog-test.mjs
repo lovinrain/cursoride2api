@@ -338,6 +338,22 @@ async function main() {
     check('S12 showed a CLEAR exhaustion message', full.includes('auto-retry exhausted') && full.includes('send your message again'), `full=${JSON.stringify(full).slice(0,160)}`);
   }
 
+  // S13: thinking frames keep the channel alive (Workstream C). A thinking_delta
+  // RESETS the liveness gap AND retires the absolute ceiling — so a post-thinking
+  // silence fires at ~grace after the LAST thinking frame, reporting the GAP
+  // window (not the ceiling). Forwarding is off here, so the gap-fire falls
+  // through to the standard silent notice (SILENT_MAX=0).
+  {
+    const r = await runScenario({ idx: 13, name: 'S13 thinking-keeps-alive', model: 's13', collectMs: 2600,
+      env: { RATLC_NO_VISIBLE_LIVENESS_GRACE_MS: String(GRACE_MS) },
+      script: (send) => { for (const t of [100, 400, 700, 1000]) setTimeout(() => send({ type: 'thinking_delta', text: 'reasoning… ' }), t); } });
+    const n = findTimeoutNotice(r.events);
+    console.log('S13 thinking-keeps-alive (expect gap ~%dms = 1000+grace):', 1000 + GRACE_MS, n);
+    check('S13 notice fired', !!n, 'no proxy_notice seen');
+    check('S13 reports GAP window (ceiling retired by thinking)', n && n.withinMs === GRACE_MS, `withinMs=${n && n.withinMs} (CEILING ${CEILING_MS} would mean thinking did not reset the gap)`);
+    check('S13 gap RESET by thinking (fired after last frame+grace, not earlier/ceiling)', n && n.t >= 1000 + GRACE_MS - 200 && n.t < CEILING_MS, `t=${n && n.t}`);
+  }
+
   console.log('');
   if (failures === 0) { console.log('liveness-watchdog-test: OK'); process.exit(0); }
   else { console.log(`liveness-watchdog-test: FAIL (${failures} checks)`); process.exit(1); }

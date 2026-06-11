@@ -124,7 +124,8 @@ the children + api-server).
 | `POOL_GROUPS` | `modelA:N,modelB:M,...` | unset | Extra **named groups** at boot. Each `model:N` declares a group of N channels pinned to that Cursor model. Channels are partitioned across groups; per-request `body.model` picks which group serves. Groups can also be added/removed at runtime via `ratlc add-group`/`remove-group`. **Equivalent** to putting the same entries in CSV-form `POOL_MODEL` — the two are merged identically. |
 | `POOL_GROUP_WAIT_MS` | milliseconds | `5000` | When a request names a known group whose channels are all opening/busy, wait this long for one to surface before falling back to the default group. Set to `0` for immediate fallback. |
 | `POOL_REINJECT_THINKING` | `0` \| `1` | `0` | Captures the model's `thinking_delta` per `convKey`; on the next turn for the same conversation, prepends `<thinking>…</thinking>` text into the outbound prompt. Pool-side symmetry with `server.js`'s `CURSOR_REINJECT_THINKING`. See [§ Thinking continuity](#thinking-continuity) below. |
-| `POOL_PROXY_THINKING_BLOCKS` | `0` \| `1` | `0` | Streams Cursor's real current-turn `thinking_delta` to Claude Code as proxy-local `thinking` blocks with `proxy-local-thinking-v1.*` signatures. UI-only; not Anthropic-signed and not prompt reinjection. |
+| `POOL_PROXY_THINKING_BLOCKS` | `0` \| `1` | code `0`, **shipped `launch.yaml` `1`** | Streams Cursor's real current-turn `thinking_delta` to Claude Code as proxy-local `thinking` blocks (`proxy-local-thinking-v1.*` signatures) → live reasoning UI, **visual parity with Cursor**. Not Anthropic-signed (such sessions can't be resumed against `api.anthropic.com` directly) and separate from prompt reinjection. Coupling: once reasoning is visible, a post-thinking hang surfaces as a clean error + reap, not a silent replay. Interleaved thinking/text and a per-turn byte cap (`POOL_PROXY_THINKING_MAX_BYTES`) are handled. E2E: `proxy-thinking-forward-test.mjs`. |
+| `POOL_PROXY_THINKING_MAX_BYTES` | int | `262144` | Cap on reasoning forwarded to the client per turn when `POOL_PROXY_THINKING_BLOCKS=1` (further thinking is still captured upstream). `<=0` → unlimited. |
 | `POOL_REINJECT_THINKING_MAX_BYTES_PER_TURN` | int | `4096` | Cap on captured bytes per assistant turn (truncates further deltas in the same turn). Matches server.js's default. |
 | `POOL_REINJECT_THINKING_MAX_TURNS` | int | `5` | Number of past assistant turns kept per `convKey`; FIFO-evicts older. |
 | `POOL_REINJECT_THINKING_DEBUG` | `1` | unset | Exposes `/v1/_debug/thinking_buffer` and `/v1/_debug/render` for buffer inspection. Off in normal operation. |
@@ -416,11 +417,17 @@ existing wire constraints (Cursor's transport strips signed extended-
 thinking blocks regardless of source — see `DEVLOG.md` "Proxy-side
 thinking re-injection" for that constraint).
 
-`POOL_PROXY_THINKING_BLOCKS=1` is separate. It does not feed thinking back to
-Cursor; it only wraps the current turn's real upstream `thinking_delta` in
-Claude-compatible `thinking` SSE blocks so the client can display the thinking
-UI. The generated signatures are explicitly proxy-local and are stripped from
-full-context prompt rendering.
+`POOL_PROXY_THINKING_BLOCKS=1` (enabled in the shipped `launch.yaml`) is
+separate. It does not feed thinking back to Cursor; it only wraps the current
+turn's real upstream `thinking_delta` in Claude-compatible `thinking` SSE blocks
+so the client can display the reasoning live (visual parity with Cursor IDE).
+The generated signatures are explicitly proxy-local and are stripped from
+full-context prompt rendering (so combining it with `POOL_REINJECT_THINKING`
+does not double-feed the model). It also makes thinking count as channel
+liveness in the watchdog: an actively-reasoning channel is never reaped, but a
+post-thinking silence is caught — and because the reasoning is already visible,
+that case surfaces a clean error + channel reap rather than a transparent replay
+(which would duplicate the shown thinking). See `proxy-thinking-forward-test.mjs`.
 
 ### How conversations are identified
 

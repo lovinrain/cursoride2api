@@ -54,6 +54,10 @@ const STATE_COLOR = {
   dead: '\x1b[31m',      // red
 };
 const RESET = '\x1b[0m';
+const CYAN = '\x1b[36m';
+// A busy channel with a forward-progress frame within this window is actively
+// producing output → "thinking"; busy with a longer gap is "busy" (silent).
+const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < 3000;
 
 function printStatus(snapshot) {
   if (!snapshot || !snapshot.pool) {
@@ -61,7 +65,9 @@ function printStatus(snapshot) {
     return;
   }
   const { pool, config } = snapshot;
-  const counts = `ready=${pool.readyCount} busy=${pool.busyCount} opening=${pool.openingCount} dead=${pool.deadCount}`;
+  const thinkingCount = (pool.channels || []).filter(isThinking).length;
+  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount);
+  const counts = `ready=${pool.readyCount} thinking=${thinkingCount} busy=${busySilent} opening=${pool.openingCount} dead=${pool.deadCount}`;
   console.log(`Pool: ${pool.actualSize}/${pool.configuredSize} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const modeStr = `mode=${config.toolMode || 'contract'}`;
   const contractStr = config.toolMode === 'translate'
@@ -81,7 +87,9 @@ function printStatus(snapshot) {
     const color = STATE_COLOR[ch.state] || '';
     const row = [
       ch.id,
-      `${color}${ch.state}${RESET}`,
+      isThinking(ch) ? `${CYAN}thinking${RESET}`
+        : ch.state === 'busy' ? `${STATE_COLOR.busy}busy${RESET}`
+        : `${color}${ch.state}${RESET}`,
       String(ch.pid || '-'),
       String(ch.openAttempts || 0),
       fmtTimeAgo(ch.openedAt),
