@@ -10,6 +10,7 @@
 //   shutdown            — shut down the pool manager
 
 import net from 'node:net';
+import { resolveWatchdog, stateLabel, silentCell, countSplit } from './tui-format.mjs';
 
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 
@@ -46,41 +47,8 @@ function fmtTimeAgo(ts) {
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
-const STATE_COLOR = {
-  ready: '\x1b[32m',     // green
-  busy: '\x1b[33m',      // yellow
-  opening: '\x1b[36m',   // cyan
-  spawning: '\x1b[36m',
-  dead: '\x1b[31m',      // red
-};
-const RESET = '\x1b[0m';
-const CYAN = '\x1b[36m';
-const BLUE = '\x1b[34m';
-// A busy channel with a forward-progress frame within this window is actively
-// producing output → "thinking"; busy with a longer gap is "busy" (silent).
-const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < 3000;
-// A busy channel parked on an outstanding tool_use is WAITING for the client to
-// run the tool — a normal between-requests wait, not the silent-timeout.
-const isWaitTool = (ch) => ch.state === 'busy' && Array.isArray(ch.pendingToolUseIds) && ch.pendingToolUseIds.length > 0;
-// SILENT cell: for a busy channel, silence since the last useful frame (or busy
-// start if none) vs the silent-timeout threshold — the "retry coming" countdown.
-// wait-tool channels show a calm "tool Ns" (red only if nearing the reap).
-function fmtSilent(ch, gapThr, reapMs) {
-  if (ch.state !== 'busy') return '-';
-  const since = ch.lastProgressAt || ch.busyAt;
-  if (!since) return '·';
-  const silentMs = Date.now() - since;
-  if (silentMs < 3000) return `${CYAN}live${RESET}`;
-  const s = Math.round(silentMs / 1000);
-  if (isWaitTool(ch)) {
-    const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
-    return `${near ? STATE_COLOR.dead : BLUE}tool ${s}s${near ? '!' : ''}${RESET}`;
-  }
-  if (!gapThr) return `${STATE_COLOR.busy}${s}s${RESET}`;
-  const ratio = silentMs / gapThr;
-  const c = ratio >= 0.85 ? STATE_COLOR.dead : STATE_COLOR.busy;
-  return `${c}${s}s/${Math.round(gapThr / 1000)}s${ratio >= 1 ? '!' : ''}${RESET}`;
-}
+// STATE/SILENT formatting + isThinking/isWaitTool/resolveWatchdog/countSplit live
+// in ./tui-format.mjs — the single source of truth shared with ratlc.mjs.
 
 function printStatus(snapshot) {
   if (!snapshot || !snapshot.pool) {
@@ -88,19 +56,16 @@ function printStatus(snapshot) {
     return;
   }
   const { pool, config } = snapshot;
-  const thinkingCount = (pool.channels || []).filter(isThinking).length;
-  const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
-  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
-  const counts = `ready=${pool.readyCount} thinking=${thinkingCount} wait-tool=${waitToolCount} busy=${busySilent} opening=${pool.openingCount} dead=${pool.deadCount}`;
+  const { thinking, waitTool, busy } = countSplit(pool.channels, pool.busyCount);
+  const counts = `ready=${pool.readyCount} thinking=${thinking} wait-tool=${waitTool} busy=${busy} opening=${pool.openingCount} dead=${pool.deadCount}`;
   console.log(`Pool: ${pool.actualSize}/${pool.configuredSize} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const modeStr = `mode=${config.toolMode || 'contract'}`;
   const contractStr = config.toolMode === 'translate'
     ? 'translate (Cursor defaults)'
     : (config.poolToolsContractCount === null ? 'unset' : `${config.poolToolsContractCount} tools`);
   console.log(`Model: ${config.model}  ${modeStr}  contract=${contractStr}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min`);
-  const gapThr = (config && config.watchdog && config.watchdog.livenessGapMs) || 0;
-  const reapMs = (config && config.watchdog && config.watchdog.busyStuckMs) || 0;
-  if (gapThr) console.log(`SILENT n/${Math.round(gapThr / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap at ${Math.round(reapMs / 1000)}s`);
+  const wd = resolveWatchdog(config);
+  if (wd.livenessGapMs) console.log(`SILENT n/${Math.round(wd.livenessGapMs / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap at ${Math.round((wd.busyStuckMs || 0) / 1000)}s`);
   console.log('');
   if (!pool.channels || pool.channels.length === 0) {
     console.log('  (no channels)');
@@ -111,14 +76,10 @@ function printStatus(snapshot) {
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
   console.log('─'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
-    const color = STATE_COLOR[ch.state] || '';
     const row = [
       ch.id,
-      isThinking(ch) ? `${CYAN}thinking${RESET}`
-        : isWaitTool(ch) ? `${BLUE}wait-tool${RESET}`
-        : ch.state === 'busy' ? `${STATE_COLOR.busy}busy${RESET}`
-        : `${color}${ch.state}${RESET}`,
-      fmtSilent(ch, gapThr, reapMs),
+      stateLabel(ch),
+      silentCell(ch, wd),
       String(ch.pid || '-'),
       String(ch.openAttempts || 0),
       fmtTimeAgo(ch.openedAt),

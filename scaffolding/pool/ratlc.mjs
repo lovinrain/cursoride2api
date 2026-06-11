@@ -32,6 +32,7 @@ import path from 'node:path';
 import { spawn, exec } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { isThinking, isWaitTool, resolveWatchdog, stateLabel, silentCell, countSplit } from './tui-format.mjs';
 const execp = promisify(exec);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -57,21 +58,9 @@ const ANSI = {
   altScreen: '\x1b[?1049h', restoreScreen: '\x1b[?1049l',
 };
 function color(s, c) { return c + s + ANSI.reset; }
-const STATE_COLOR = {
-  ready: ANSI.green, busy: ANSI.yellow,
-  opening: ANSI.cyan, spawning: ANSI.cyan,
-  dead: ANSI.red,
-};
-// A busy channel whose last forward-progress frame (text/thinking/tool/progress)
-// landed within this window is actively producing output → shown as "thinking";
-// busy with a longer gap is "busy" (silent — the truly-suspect state).
-const THINK_GAP_MS = 3000;
-const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < THINK_GAP_MS;
-// A busy channel parked on an outstanding tool_use is WAITING for the client to
-// run the tool and return the result — a normal between-requests wait, NOT the
-// silent-timeout the SILENT countdown tracks. Distinguish it so it doesn't read
-// as a suspect hang.
-const isWaitTool = (ch) => ch.state === 'busy' && Array.isArray(ch.pendingToolUseIds) && ch.pendingToolUseIds.length > 0;
+// STATE_COLOR, isThinking, isWaitTool, resolveWatchdog, stateLabel, silentCell,
+// and countSplit moved to ./tui-format.mjs — the single source of truth shared
+// with ratlc-ctl.mjs so the three views can never drift apart.
 
 // ── IPC: ask the pool for status ─────────────────────────────────────────
 function poolRequest(obj, timeoutMs = 5000) {
@@ -217,9 +206,7 @@ function fmtAgo(ts) {
 function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
-  const thinkingCount = (pool.channels || []).filter(isThinking).length;
-  const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
-  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
+  const { thinking: thinkingCount, waitTool: waitToolCount, busy: busySilent } = countSplit(pool.channels, pool.busyCount);
   const counts = [
     `ready=${color(pool.readyCount, ANSI.green)}`,
     `thinking=${color(thinkingCount, ANSI.cyan)}`,
@@ -231,8 +218,8 @@ function printStatus(snap) {
   console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const groupCount = (pool.groups || []).length;
   console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}`);
-  const wd0 = config && config.watchdog;
-  if (wd0 && wd0.livenessGapMs) console.log(color(`SILENT n/${Math.round(wd0.livenessGapMs / 1000)}s = upstream silent → retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap ${Math.round((wd0.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
+  const wd0 = resolveWatchdog(config);
+  if (wd0.livenessGapMs) console.log(color(`SILENT n/${Math.round(wd0.livenessGapMs / 1000)}s = upstream silent → retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap ${Math.round((wd0.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
   if (pool.groups?.length) {
     console.log('');
     const ghdr = ['GROUP', 'TARGET', 'READY', 'BUSY', 'OPEN', 'DEAD', 'ROUNDS'];
@@ -260,32 +247,8 @@ function printStatus(snap) {
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
   console.log('-'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
-    const stateCell = isThinking(ch) ? color('thinking', ANSI.cyan)
-      : isWaitTool(ch) ? color('wait-tool', ANSI.blue)
-      : ch.state === 'busy' ? color('busy', ANSI.yellow)
-      : (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
-    let silentCell = color('-', ANSI.gray);
-    if (ch.state === 'busy') {
-      const since = ch.lastProgressAt || ch.busyAt;
-      if (!since) silentCell = color('·', ANSI.gray);
-      else {
-        const silentMs = Date.now() - since;
-        const s = Math.round(silentMs / 1000);
-        if (silentMs < THINK_GAP_MS) silentCell = color('live', ANSI.cyan);
-        else if (isWaitTool(ch)) {
-          const reapMs = (wd0 && wd0.busyStuckMs) || 0;
-          const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
-          silentCell = color(`tool ${s}s${near ? '!' : ''}`, near ? ANSI.red : ANSI.blue);
-        } else {
-          const gapThr = (wd0 && wd0.livenessGapMs) || 0;
-          silentCell = gapThr > 0
-            ? color(`${s}s/${Math.round(gapThr / 1000)}s${silentMs >= gapThr ? '!' : ''}`, silentMs >= 0.85 * gapThr ? ANSI.red : ANSI.yellow)
-            : color(`${s}s`, ANSI.yellow);
-        }
-      }
-    }
     const row = [
-      ch.id, stateCell, silentCell, ch.group || '-', String(ch.pid || '-'),
+      ch.id, stateLabel(ch), silentCell(ch, wd0), ch.group || '-', String(ch.pid || '-'),
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
@@ -469,9 +432,7 @@ async function cmdTui() {
     const { pool, config } = snap;
     // Split busy into actively-thinking (frames flowing) vs busy-silent (the
     // truly-suspect state). thinking + busy = pool.busyCount.
-    const thinkingCount = (pool.channels || []).filter(isThinking).length;
-    const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
-    const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
+    const { thinking: thinkingCount, waitTool: waitToolCount, busy: busySilent } = countSplit(pool.channels, pool.busyCount);
     const counts = [
       'ready=' + color(pool.readyCount, ANSI.green),
       'thinking=' + color(thinkingCount, ANSI.cyan),
@@ -488,7 +449,7 @@ async function cmdTui() {
     } else {
       out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
     }
-    const wd = config.watchdog || {};
+    const wd = resolveWatchdog(config);
     if (wd.livenessGapMs) {
       out.push(color(`SILENT n/${Math.round(wd.livenessGapMs / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); pool reaps at ${Math.round((wd.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
     }
@@ -566,16 +527,7 @@ async function cmdTui() {
       const hdr = ['CHANNEL', 'STATE', 'TOK', 'BUSY', 'SILENT', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
 
       function emitRow(ch) {
-        // STATE cell: split busy into "thinking" (frames flowing, cyan) vs
-        // "busy" (silent ≥ THINK_GAP_MS, yellow). Other states keep STATE_COLOR.
-        let stateCell;
-        if (ch.state === 'busy') {
-          stateCell = isThinking(ch) ? color('thinking', ANSI.cyan)
-            : isWaitTool(ch) ? color('wait-tool', ANSI.blue)
-            : color('busy', ANSI.yellow);
-        } else {
-          stateCell = (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
-        }
+        const stateCell = stateLabel(ch);
         // BUSY column: time in current turn. Colored yellow at >3 min, red
         // at >4 min (busy-watchdog default kill threshold).
         let busyTxt = '-';
@@ -586,39 +538,8 @@ async function cmdTui() {
           else if (busyMs > 180_000) busyTxt = color(fmt, ANSI.yellow);
           else busyTxt = fmt;
         }
-        // SILENT column: for a busy channel, how long since the last useful frame
-        // (or since it went busy if none arrived yet) vs the silent-timeout
-        // threshold — the "abnormal wait, retry coming" countdown. Ramps yellow→red
-        // as it nears the threshold; thinking channels (frames flowing) show "live".
-        let silentTxt = color('-', ANSI.gray);
-        if (ch.state === 'busy') {
-          const since = ch.lastProgressAt || ch.busyAt;
-          if (!since) {
-            silentTxt = color('·', ANSI.gray);
-          } else {
-            const silentMs = Date.now() - since;
-            if (silentMs < THINK_GAP_MS) {
-              silentTxt = color('live', ANSI.cyan);
-            } else if (isWaitTool(ch)) {
-              // Waiting on the client to run a tool — the silent-timeout doesn't
-              // apply here (it's between requests). Calm (blue); flips red only
-              // if it nears the pool busy-watchdog reap (the real outer limit).
-              const s = Math.round(silentMs / 1000);
-              const reapMs = (config.watchdog && config.watchdog.busyStuckMs) || 0;
-              const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
-              silentTxt = color(`tool ${s}s${near ? '!' : ''}`, near ? ANSI.red : ANSI.blue);
-            } else {
-              const s = Math.round(silentMs / 1000);
-              const gapThr = (config.watchdog && config.watchdog.livenessGapMs) || 0;
-              if (gapThr > 0) {
-                const ratio = silentMs / gapThr;
-                silentTxt = color(`${s}s/${Math.round(gapThr / 1000)}s${ratio >= 1 ? '!' : ''}`, ratio >= 0.85 ? ANSI.red : ANSI.yellow);
-              } else {
-                silentTxt = color(`${s}s`, ANSI.yellow);
-              }
-            }
-          }
-        }
+        // SILENT column — see tui-format.mjs silentCell (single source of truth).
+        const silentTxt = silentCell(ch, wd);
         return [
           rpad(ch.id, w[0]),
           rpad(stateCell, w[1]),
