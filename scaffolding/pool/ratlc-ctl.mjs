@@ -58,6 +58,20 @@ const CYAN = '\x1b[36m';
 // A busy channel with a forward-progress frame within this window is actively
 // producing output → "thinking"; busy with a longer gap is "busy" (silent).
 const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < 3000;
+// SILENT cell: for a busy channel, silence since the last useful frame (or busy
+// start if none) vs the silent-timeout threshold — the "retry coming" countdown.
+function fmtSilent(ch, gapThr) {
+  if (ch.state !== 'busy') return '-';
+  const since = ch.lastProgressAt || ch.busyAt;
+  if (!since) return '·';
+  const silentMs = Date.now() - since;
+  if (silentMs < 3000) return `${CYAN}live${RESET}`;
+  const s = Math.round(silentMs / 1000);
+  if (!gapThr) return `${STATE_COLOR.busy}${s}s${RESET}`;
+  const ratio = silentMs / gapThr;
+  const c = ratio >= 0.85 ? STATE_COLOR.dead : STATE_COLOR.busy;
+  return `${c}${s}s/${Math.round(gapThr / 1000)}s${ratio >= 1 ? '!' : ''}${RESET}`;
+}
 
 function printStatus(snapshot) {
   if (!snapshot || !snapshot.pool) {
@@ -74,13 +88,15 @@ function printStatus(snapshot) {
     ? 'translate (Cursor defaults)'
     : (config.poolToolsContractCount === null ? 'unset' : `${config.poolToolsContractCount} tools`);
   console.log(`Model: ${config.model}  ${modeStr}  contract=${contractStr}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min`);
+  const gapThr = (config && config.watchdog && config.watchdog.livenessGapMs) || 0;
+  if (gapThr) console.log(`SILENT n/${Math.round(gapThr / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); reap at ${Math.round(((config.watchdog && config.watchdog.busyStuckMs) || 0) / 1000)}s`);
   console.log('');
   if (!pool.channels || pool.channels.length === 0) {
     console.log('  (no channels)');
     return;
   }
-  const headers = ['CHANNEL', 'STATE', 'PID', 'OPEN_ATT', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
-  const widths = [10, 9, 7, 9, 8, 8, 8, 22, 40];
+  const headers = ['CHANNEL', 'STATE', 'SILENT', 'PID', 'OPEN_ATT', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
+  const widths = [10, 9, 11, 7, 9, 8, 8, 8, 22, 40];
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
   console.log('─'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
@@ -90,6 +106,7 @@ function printStatus(snapshot) {
       isThinking(ch) ? `${CYAN}thinking${RESET}`
         : ch.state === 'busy' ? `${STATE_COLOR.busy}busy${RESET}`
         : `${color}${ch.state}${RESET}`,
+      fmtSilent(ch, gapThr),
       String(ch.pid || '-'),
       String(ch.openAttempts || 0),
       fmtTimeAgo(ch.openedAt),

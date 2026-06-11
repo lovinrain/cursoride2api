@@ -453,6 +453,10 @@ async function cmdTui() {
     } else {
       out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
     }
+    const wd = config.watchdog || {};
+    if (wd.livenessGapMs) {
+      out.push(color(`SILENT n/${Math.round(wd.livenessGapMs / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); pool reaps at ${Math.round((wd.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
+    }
     if (pool.readyCount >= 1) {
       out.push(color('▶ READY — you can run: ratlc claude', ANSI.green + ANSI.bold));
     } else if (pool.openingCount > 0) {
@@ -523,8 +527,8 @@ async function cmdTui() {
     if (pool.channels?.length) {
       // Channel table — sectioned by group when there's more than one group,
       // flat (today's behavior) when only one.
-      const w = [10, 10, 5, 7, 8, 9, 8, 8, 7, 22];
-      const hdr = ['CHANNEL', 'STATE', 'TOK', 'BUSY', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
+      const w = [10, 10, 5, 7, 11, 8, 9, 8, 8, 7, 18];
+      const hdr = ['CHANNEL', 'STATE', 'TOK', 'BUSY', 'SILENT', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT'];
 
       function emitRow(ch) {
         // STATE cell: split busy into "thinking" (frames flowing, cyan) vs
@@ -545,17 +549,43 @@ async function cmdTui() {
           else if (busyMs > 180_000) busyTxt = color(fmt, ANSI.yellow);
           else busyTxt = fmt;
         }
+        // SILENT column: for a busy channel, how long since the last useful frame
+        // (or since it went busy if none arrived yet) vs the silent-timeout
+        // threshold — the "abnormal wait, retry coming" countdown. Ramps yellow→red
+        // as it nears the threshold; thinking channels (frames flowing) show "live".
+        let silentTxt = color('-', ANSI.gray);
+        if (ch.state === 'busy') {
+          const since = ch.lastProgressAt || ch.busyAt;
+          if (!since) {
+            silentTxt = color('·', ANSI.gray);
+          } else {
+            const silentMs = Date.now() - since;
+            if (silentMs < THINK_GAP_MS) {
+              silentTxt = color('live', ANSI.cyan);
+            } else {
+              const s = Math.round(silentMs / 1000);
+              const gapThr = (config.watchdog && config.watchdog.livenessGapMs) || 0;
+              if (gapThr > 0) {
+                const ratio = silentMs / gapThr;
+                silentTxt = color(`${s}s/${Math.round(gapThr / 1000)}s${ratio >= 1 ? '!' : ''}`, ratio >= 0.85 ? ANSI.red : ANSI.yellow);
+              } else {
+                silentTxt = color(`${s}s`, ANSI.yellow);
+              }
+            }
+          }
+        }
         return [
           rpad(ch.id, w[0]),
           rpad(stateCell, w[1]),
           rpad(String(ch.tokenIdx ?? 0), w[2]),
           rpad(busyTxt, w[3]),
-          rpad(String(ch.pid || '-'), w[4]),
-          rpad(String(ch.openAttempts || 0), w[5]),
-          rpad(fmtAgo(ch.openedAt), w[6]),
-          rpad(fmtAgo(ch.lastActivityAt), w[7]),
-          rpad(String(ch.roundsServed || 0), w[8]),
-          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-', w[9]),
+          rpad(silentTxt, w[4]),
+          rpad(String(ch.pid || '-'), w[5]),
+          rpad(String(ch.openAttempts || 0), w[6]),
+          rpad(fmtAgo(ch.openedAt), w[7]),
+          rpad(fmtAgo(ch.lastActivityAt), w[8]),
+          rpad(String(ch.roundsServed || 0), w[9]),
+          rpad(ch.currentRequestId ? ch.currentRequestId.slice(0, 16) : '-', w[10]),
         ].join(' ');
       }
 

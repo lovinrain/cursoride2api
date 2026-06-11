@@ -1478,6 +1478,14 @@ function statusSnapshot() {
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,
       poolToolsSignature: toolsSignature.slice(0, 80),
+      // Watchdog thresholds (same env the api-server reads) so the TUI can render
+      // a silence countdown against them. livenessGapMs is the silent-timeout the
+      // SILENT column counts toward; busyStuckMs is the pool-side reap backstop.
+      watchdog: {
+        livenessGapMs: Math.max(0, parseInt(process.env.RATLC_NO_VISIBLE_LIVENESS_GRACE_MS || '0', 10)),
+        ceilingMs: Math.max(5000, parseInt(process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000', 10)),
+        busyStuckMs: parseInt(process.env.RATLC_BUSY_STUCK_TIMEOUT_MS || '240000', 10),
+      },
     },
   };
 }
