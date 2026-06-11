@@ -10,6 +10,8 @@ import net from 'node:net';
 import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { cursorToAnthropic, isInternalTool } from './tool-translator.mjs';
+import { isFastModel, typeThresholdMs } from './model-utils.mjs';
+import * as latencyMetrics from './latency-metrics.mjs';
 import { getPoolLocalToolDecision, isPoolLocalToolName, runPoolLocalTool } from './local-tool-executor.mjs';
 import {
   consumeClientToolResult,
@@ -150,8 +152,18 @@ function finishRequestLog(requestId, patch = {}) {
   if (entry.firstByteAt && entry.firstByteMs == null) {
     entry.firstByteMs = entry.firstByteAt - entry.startedAt;
   }
+  // Single accumulation hook for per-model latency metrics (both the graceful
+  // and hard-error finish paths funnel through here). Never let it break a turn.
+  try { latencyMetrics.record(entry); } catch { /* metrics are best-effort */ }
   return entry;
 }
+
+// ── Per-model-type watchdog thresholds + adaptive timeouts ──────────────────
+// Fast models (the `-fast` accelerator) can use a different silent-timeout than
+// non-fast ones. RATLC_<KEY>_FAST / RATLC_<KEY>_SLOW override the global
+// RATLC_<KEY>; an explicit "" or unset falls through to the global, then dflt.
+const ADAPTIVE_TIMEOUTS = process.env.RATLC_ADAPTIVE_TIMEOUTS === '1';
+const ADAPTIVE_MIN_GAP_MS = Math.max(1000, parseInt(process.env.RATLC_ADAPTIVE_MIN_GAP_MS || '10000', 10));
 
 function normalizeModelForRouting(model) {
   return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
@@ -930,10 +942,9 @@ async function handleMessagesRequest(req, res) {
   let messageStarted = false;
   let visibleUpstreamEventSeen = false;
   let noVisibleEventTimer = null;
-  const NO_VISIBLE_EVENT_TIMEOUT_MS = Math.max(5_000, parseInt(
-    process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000',
-    10,
-  ));
+  // Per-served-model-type (fast vs non-fast). Initialized from the REQUESTED
+  // model; recomputed from the SERVED model at arm time (resolveWatchdogThresholds).
+  let noVisibleCeilingMs = typeThresholdMs(routingModel, 'NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
   // Option B — liveness-gated patience. The no-visible timer above is the
   // ABSOLUTE CEILING (max total wait for the first visible event, even while
   // upstream frames keep arriving). This second timer is the LIVENESS GAP: it
@@ -944,10 +955,7 @@ async function handleMessagesRequest(req, res) {
   // same retry/notice path. Default 0 = disabled → pure ceiling behavior
   // (Option A). See project_channel_timeout_stack memory + UPSTREAM_RETRY_DESIGN.md.
   let livenessGapTimer = null;
-  const NO_VISIBLE_LIVENESS_GRACE_MS = Math.max(0, parseInt(
-    process.env.RATLC_NO_VISIBLE_LIVENESS_GRACE_MS || '0',
-    10,
-  ));
+  let noVisibleGraceMs = typeThresholdMs(routingModel, 'NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
   // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
   //
   // In theory the primary finalize signal during a tool_use turn is
@@ -1001,7 +1009,7 @@ async function handleMessagesRequest(req, res) {
     if (noVisibleEventTimer) { clearTimeout(noVisibleEventTimer); noVisibleEventTimer = null; }
     if (livenessGapTimer) { clearTimeout(livenessGapTimer); livenessGapTimer = null; }
     if (done || visibleUpstreamEventSeen) return;
-    const waitedMs = source === 'liveness_gap' ? NO_VISIBLE_LIVENESS_GRACE_MS : NO_VISIBLE_EVENT_TIMEOUT_MS;
+    const waitedMs = source === 'liveness_gap' ? noVisibleGraceMs : noVisibleCeilingMs;
     // If the client has already seen real reasoning forwarded as thinking
     // (POOL_PROXY_THINKING_BLOCKS) — or any other visible bytes — a transparent
     // replay would re-stream that output on a fresh channel, duplicating what
@@ -1032,24 +1040,43 @@ async function handleMessagesRequest(req, res) {
     stopReason = 'end_turn';
     finishMessage();
   }
+  // Resolve the silent-timeout thresholds from the SERVED model's type (fast vs
+  // non-fast) at arm time — routedTo is known by route_decision; falls back to
+  // the requested model. With RATLC_ADAPTIVE_TIMEOUTS=1 the GAP is instead
+  // derived from the current time-of-day regime's observed first-byte p99 for
+  // this (model, payload-size), clamped to [ADAPTIVE_MIN_GAP_MS, ceiling].
+  function resolveWatchdogThresholds() {
+    const m = routedTo || routingModel;
+    noVisibleCeilingMs = typeThresholdMs(m, 'NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
+    noVisibleGraceMs = typeThresholdMs(m, 'NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
+    if (ADAPTIVE_TIMEOUTS && noVisibleGraceMs > 0) {
+      let sug = null;
+      try { sug = latencyMetrics.suggestGapMs(m, reqLog && reqLog.contentBytes); } catch { sug = null; }
+      if (sug && Number.isFinite(sug.gapMs)) {
+        noVisibleGraceMs = Math.min(noVisibleCeilingMs, Math.max(ADAPTIVE_MIN_GAP_MS, sug.gapMs));
+        if (reqLog) { reqLog.adaptiveGapMs = noVisibleGraceMs; reqLog.adaptiveRegime = sug.regime; }
+      }
+    }
+  }
   // Liveness-gap timer (Option B): clears + re-sets on each call. Re-armed by
-  // the `progress` handler so it only fires after NO_VISIBLE_LIVENESS_GRACE_MS
-  // of true wire silence. No-op when disabled (grace<=0) → ceiling-only.
+  // the `progress` handler so it only fires after noVisibleGraceMs of true wire
+  // silence. No-op when disabled (grace<=0) → ceiling-only.
   function armLivenessGapTimer() {
-    if (NO_VISIBLE_LIVENESS_GRACE_MS <= 0 || done || visibleUpstreamEventSeen) return;
+    if (noVisibleGraceMs <= 0 || done || visibleUpstreamEventSeen) return;
     if (livenessGapTimer) clearTimeout(livenessGapTimer);
     livenessGapTimer = setTimeout(() => {
       livenessGapTimer = null;
       _fireSilentTimeout('liveness_gap');
-    }, NO_VISIBLE_LIVENESS_GRACE_MS);
+    }, noVisibleGraceMs);
   }
   function armNoVisibleEventTimer() {
     if (done || visibleUpstreamEventSeen) return;
+    resolveWatchdogThresholds();   // pick per-type / adaptive values for the served model
     if (!noVisibleEventTimer) {
       noVisibleEventTimer = setTimeout(() => {
         noVisibleEventTimer = null;
         _fireSilentTimeout('ceiling');
-      }, NO_VISIBLE_EVENT_TIMEOUT_MS);
+      }, noVisibleCeilingMs);
     }
     // Arm the liveness-gap clock alongside the ceiling (no-op when disabled).
     armLivenessGapTimer();
@@ -2832,6 +2859,23 @@ function handleModels(req, res) {
   }));
 }
 
+// GET /v1/_stats — per-model latency percentiles (first-byte + total) bucketed
+// by payload size, with time-of-day regime classification and a suggested
+// silent-timeout for the current regime. Backs `ratlc stats` and the TUI.
+function handleStats(req, res) {
+  let snap;
+  // adaptiveMinGapMs: the floor the api-server actually enforces on the adaptive
+  // gap. The per-bucket suggestion is floored at only 1s internally, so under
+  // adaptive the UI must clamp the displayed gap to this to match enforcement (M2).
+  try { snap = latencyMetrics.snapshot(); snap.adaptiveTimeouts = ADAPTIVE_TIMEOUTS; snap.adaptiveMinGapMs = ADAPTIVE_MIN_GAP_MS; }
+  catch (e) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(snap));
+}
+
 function handleMetrics(req, res) {
   // Prometheus-style text exposition. Pull from pool's status snapshot,
   // augment with api-server-local counters (TODO).
@@ -3108,6 +3152,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && path === '/health') return handleHealth(req, res);
   if (req.method === 'GET' && path === '/requests') return handleRequests(req, res);
   if (req.method === 'GET' && path === '/metrics') return handleMetrics(req, res);
+  if (req.method === 'GET' && path === '/v1/_stats') return handleStats(req, res);
   if (req.method === 'GET' && path === '/v1/_debug/thinking_buffer') return handleThinkingBufferDebug(req, res);
   if (req.method === 'POST' && path === '/v1/_debug/render') return handleRenderDebug(req, res);
   if (req.method === 'HEAD') { res.writeHead(200); return res.end(); }
@@ -3120,5 +3165,9 @@ server.listen(PORT, HOST, () => {
   log(`pool socket: ${POOL_SOCK}`);
 });
 
-process.on('SIGINT', () => { try { server.close(); } catch { /* ignore */ } process.exit(0); });
-process.on('SIGTERM', () => { try { server.close(); } catch { /* ignore */ } process.exit(0); });
+// Latency-metrics persistence: reload history at boot, flush periodically + on exit.
+try { latencyMetrics.restore(); } catch { /* fresh start on corrupt/missing */ }
+const _statsPersistTimer = setInterval(() => { try { latencyMetrics.persist(); } catch { /* ignore */ } }, 30_000);
+if (_statsPersistTimer.unref) _statsPersistTimer.unref();
+process.on('SIGINT', () => { try { latencyMetrics.persist(); } catch { /* ignore */ } try { server.close(); } catch { /* ignore */ } process.exit(0); });
+process.on('SIGTERM', () => { try { latencyMetrics.persist(); } catch { /* ignore */ } try { server.close(); } catch { /* ignore */ } process.exit(0); });

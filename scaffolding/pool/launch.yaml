@@ -172,6 +172,37 @@ RATLC_NO_VISIBLE_LIVENESS_GRACE_MS: 90000      # liveness-gap: hung if NO frame 
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)
 # POOL_TOOL_USE_WATCHDOG_MS: 1000              # parallel-tools finalize watchdog (default 1000)
 RATLC_BUSY_STUCK_TIMEOUT_MS: 360000            # busy-watchdog reap threshold (6min) — MUST exceed NO_VISIBLE ceiling (5min) above, else it SIGTERMs the slow-but-alive channel at 4min before first byte (default was 240000)
+
+# ── Per-model-type watchdog thresholds (fast vs non-fast) ───────────────────
+# "fast" = the `-fast` accelerator in the model name (both current models are
+# fast). RATLC_<KEY>_FAST / RATLC_<KEY>_SLOW override the global RATLC_<KEY> for
+# that type (?? global ?? hardcoded default). Fast models keep the current tight
+# values; non-fast get a looser tier (placeholder until you add one + tune via
+# `ratlc stats`). INVARIANT per type: BUSY_STUCK_*_<T> MUST exceed the ceiling.
+RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS_FAST: 300000   # fast first-byte ceiling (= current 5min)
+RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS_SLOW: 600000   # non-fast ceiling (looser, 10min)
+RATLC_NO_VISIBLE_LIVENESS_GRACE_MS_FAST: 90000   # fast silent-timeout gap (= current 90s)
+RATLC_NO_VISIBLE_LIVENESS_GRACE_MS_SLOW: 150000  # non-fast gap (looser, 150s)
+RATLC_BUSY_STUCK_TIMEOUT_MS_FAST: 360000         # fast reap (> fast ceiling)
+RATLC_BUSY_STUCK_TIMEOUT_MS_SLOW: 660000         # non-fast reap (> slow ceiling)
+
+# ── Adaptive timeouts (opt-in) + latency stats ─────────────────────────────
+# Per-model latency (first-byte + total) accumulates into t-digests keyed by
+# (model, payload-size bucket, hour-of-day) and persists to RATLC_STATS_FILE.
+# `ratlc stats` (and TUI view 5) show per-model percentiles, the learned
+# time-of-day regimes (fast/med/slow = terciles of the 24 hours by median TTFB),
+# and a suggested silent-timeout for the CURRENT regime — use it to tune the
+# *_FAST/_SLOW values above. With RATLC_ADAPTIVE_TIMEOUTS=1 the gap is instead
+# derived live from the current regime's first-byte p99 × margin, clamped to
+# [RATLC_ADAPTIVE_MIN_GAP_MS, the per-type ceiling]. Default OFF (static per-type).
+# RATLC_ADAPTIVE_TIMEOUTS: 1                      # 0=static per-type (default); 1=regime-derived gap
+# RATLC_ADAPTIVE_MIN_GAP_MS: 10000               # safety floor for the adaptive gap
+# RATLC_ADAPTIVE_FB_MARGIN: 1.5                  # suggested/adaptive gap = first-byte p99 × this
+# RATLC_STATS_FILE: /tmp/ratlc-stats.json        # latency history persistence path
+# RATLC_STATS_HOUR_OFFSET: 0                     # hour-of-day key offset from UTC (display only)
+# RATLC_STATS_MIN_HOUR_SAMPLES: 20               # min samples for an hour to join regime ranking
+# RATLC_STATS_MIN_SUGGEST_SAMPLES: 30            # min samples before a suggested gap is computed
+# RATLC_STATS_DISABLE: 1                          # turn off all latency recording
 # RATLC_TOKEN_DEATH_THRESHOLD: 3               # strikes before a token gets marked dead on `other_error`
 # LOG_REQUEST_TOOLS: 1                         # log incoming /v1/messages tools list
 # POOL_REINJECT_THINKING_DEBUG: 1              # enables POST /v1/_debug/render endpoint used by test_render.sh

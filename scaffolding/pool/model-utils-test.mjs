@@ -1,0 +1,17 @@
+import { isFastModel, modelType } from './model-utils.mjs';
+let fail = 0;
+const a = (n, c) => { console.log((c ? '  ✓ ' : '  ✗ ') + n); if (!c) fail++; };
+a('claude-opus-4-8-thinking-max-fast → fast', isFastModel('claude-opus-4-8-thinking-max-fast'));
+a('claude-4.6-opus-max-thinking-fast → fast', isFastModel('claude-4.6-opus-max-thinking-fast'));
+a('composer-2-fast → fast', isFastModel('composer-2-fast'));
+a('x-fast-v2 → fast (accelerator token)', isFastModel('x-fast-v2'));
+a('claude-opus-4-8-max → NOT fast', !isFastModel('claude-opus-4-8-max'));
+a('claude-opus-4-8-max-thinking → NOT fast', !isFastModel('claude-opus-4-8-max-thinking'));
+a('x-fastish → NOT fast (mid-word)', !isFastModel('x-fastish'));
+a('empty → NOT fast', !isFastModel(''));
+a('null → NOT fast', !isFastModel(null));
+a('undefined → NOT fast', !isFastModel(undefined));
+a('modelType fast', modelType('claude-opus-4-8-thinking-max-fast') === 'fast');
+a('modelType slow', modelType('claude-opus-4-8-max') === 'slow');
+console.log(fail === 0 ? '\nmodel-utils-test: OK' : `\nmodel-utils-test: FAIL (${fail})`);
+process.exit(fail === 0 ? 0 : 1);

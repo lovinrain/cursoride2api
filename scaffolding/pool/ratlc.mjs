@@ -99,6 +99,17 @@ async function getHealth() {
   });
 }
 
+async function getStats() {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), 5000);
+    http.get(API_URL + '/v1/_stats', (res) => {
+      let buf = '';
+      res.on('data', (c) => { buf += c.toString(); });
+      res.on('end', () => { clearTimeout(t); try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
+    }).on('error', (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 // ── process management ───────────────────────────────────────────────────
 async function isProcAlive(pidFile) {
   try {
@@ -203,6 +214,72 @@ function fmtAgo(ts) {
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
+// ── latency-stats rendering (shared by `ratlc stats` and the TUI 'stats' view) ─
+function fmtMsDur(ms) {
+  if (ms == null) return '-';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  return `${(ms / 60_000).toFixed(1)}m`;
+}
+function padAnsi(s, n) { const raw = String(s).replace(/\x1b\[[0-9;]*m/g, ''); return s + ' '.repeat(Math.max(0, n - raw.length)); }
+const STATS_W = [9, 6, 7, 7, 7, 7, 7, 7, 6, 8];
+const STATS_HDR = ['BUCKET', 'N', 'FBp50', 'FBp90', 'FBp99', 'TOp50', 'TOp90', 'TOp99', 'err%', 'sugGap'];
+function statRow(b, opts = {}) {
+  const thin = (b.count || 0) < 5;
+  const errC = b.errPct >= 5 ? ANSI.red : b.errPct > 0 ? ANSI.yellow : ANSI.gray;
+  // sugGap column: when adaptive enforcement is ON, show the value the api-server
+  // would actually arm (clamped up to adaptiveMinGapMs) so the display matches
+  // enforcement (M2). When OFF, show the raw data-driven suggestion (advisory for
+  // manually tuning the *_FAST/_SLOW thresholds).
+  let sug = color('-', ANSI.gray);
+  if (b.currentRegimeSuggestGapMs != null) {
+    const eff = opts.adaptive ? Math.max(opts.minGapMs || 0, b.currentRegimeSuggestGapMs) : b.currentRegimeSuggestGapMs;
+    sug = color(fmtMsDur(eff), ANSI.cyan);
+  }
+  return [
+    padAnsi(b.bucket, STATS_W[0]),
+    padAnsi(String(b.count), STATS_W[1]),
+    padAnsi(fmtMsDur(b.fb.p50), STATS_W[2]),
+    padAnsi(fmtMsDur(b.fb.p90), STATS_W[3]),
+    padAnsi(color(fmtMsDur(b.fb.p99), thin ? ANSI.dim : ANSI.bold), STATS_W[4]),
+    padAnsi(fmtMsDur(b.total.p50), STATS_W[5]),
+    padAnsi(fmtMsDur(b.total.p90), STATS_W[6]),
+    padAnsi(fmtMsDur(b.total.p99), STATS_W[7]),
+    padAnsi(color(String(b.errPct), errC), STATS_W[8]),
+    padAnsi(sug, STATS_W[9]),
+  ].join(' ');
+}
+function formatStatsLines(stats) {
+  const out = [];
+  if (!stats) { out.push(color('stats unavailable — is the api-server up? (GET /v1/_stats)', ANSI.red)); return out; }
+  const reg = { fast: ANSI.green, medium: ANSI.yellow, slow: ANSI.red };
+  const cr = stats.currentRegime || '?';
+  const adaptive = stats.adaptiveTimeouts
+    ? color('ADAPTIVE on', ANSI.green + ANSI.bold) + color(' (gap≥' + fmtMsDur(stats.adaptiveMinGapMs || 0) + ', ≤ceiling)', ANSI.dim)
+    : color('adaptive off', ANSI.dim);
+  out.push('Latency  regime=' + color(cr, (reg[cr] || ANSI.bold) + ANSI.bold)
+    + '  hour=' + stats.currentHour + ' (UTC' + (stats.hourOffset >= 0 ? '+' : '') + stats.hourOffset + ')  '
+    + (stats.regimesLearned ? color('regimes:learned', ANSI.green) : color('regimes:learning…', ANSI.dim))
+    + '  ' + adaptive + '  fb-margin=×' + stats.fbMargin);
+  let clock = '';
+  for (let h = 0; h < 24; h++) {
+    const rg = (stats.regimeOf || {})[h] || 'medium';
+    clock += color(h === stats.currentHour ? '▮' : (rg === 'fast' ? '▁' : rg === 'medium' ? '▄' : '█'), reg[rg] || ANSI.gray);
+  }
+  out.push('  ' + clock + '  ' + color('hours 0-23 · ▁fast ▄med █slow ▮now', ANSI.dim));
+  if (!stats.models || !stats.models.length) { out.push(''); out.push(color('  (no requests recorded yet — make some, then check back)', ANSI.dim)); return out; }
+  for (const m of stats.models) {
+    out.push('');
+    out.push(color('▸ ' + m.model, ANSI.cyan + ANSI.bold) + ' ' + color('[' + m.type + ']', m.type === 'fast' ? ANSI.green : ANSI.yellow)
+      + color('  N=' + m.overall.count + '  err=' + m.overall.errPct + '%  timeouts=' + m.overall.timeouts + '  retried=' + m.overall.retried, ANSI.dim));
+    out.push('  ' + STATS_HDR.map((h, i) => color(padAnsi(h, STATS_W[i]), ANSI.bold)).join(' '));
+    for (const b of m.buckets) out.push('  ' + statRow(b, { adaptive: stats.adaptiveTimeouts, minGapMs: stats.adaptiveMinGapMs }));
+    out.push('  ' + color(statRow({ bucket: 'all', count: m.overall.count, errPct: m.overall.errPct, fb: m.overall.fb, total: m.overall.total, currentRegimeSuggestGapMs: null }), ANSI.dim));
+  }
+  return out;
+}
+
 function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
@@ -282,7 +359,7 @@ async function cmdTui() {
   const apiLines = [];
   const poolLines = [];
   let dirty = true;
-  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status'
+  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats'
   let cmdMode = false;           // vim-style ':' command input
   let cmdBuffer = '';
   let cmdHistory = [];
@@ -411,6 +488,7 @@ async function cmdTui() {
     if (key === '2') { viewMode = 'api'; dirty = true; return; }
     if (key === '3') { viewMode = 'pool'; dirty = true; return; }
     if (key === '4') { viewMode = 'status'; dirty = true; return; }
+    if (key === '5') { viewMode = 'stats'; dirty = true; return; }
     if (key === 'r') { poolRequest({ type: 'ramp_up', count: 1 }).then(() => { cmdResult = '✓ ramp +1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp+1: ' + e.message; dirty = true; }); return; }
     if (key === 'R') { poolRequest({ type: 'ramp_down', count: 1 }).then(() => { cmdResult = '✓ ramp -1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp-1: ' + e.message; dirty = true; }); return; }
     if (key === 'k') {
@@ -599,7 +677,7 @@ async function cmdTui() {
     };
     return [
       color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
-      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') +
+      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') +
       '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[q]', ANSI.cyan) + ' quit',
       color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
     ];
@@ -651,6 +729,12 @@ async function cmdTui() {
     }
     if (viewMode === 'pool') {
       for (const l of logPaneLines(poolLines, '/tmp/ratlc-pool.log', rows - hdr.length - cmdBarLines)) console.log(l);
+      drawCmdBar(cols); return;
+    }
+    if (viewMode === 'stats') {
+      let stats = null;
+      try { stats = await getStats(); } catch { stats = null; }
+      for (const l of formatStatsLines(stats)) console.log(l);
       drawCmdBar(cols); return;
     }
     // split
@@ -786,6 +870,14 @@ async function cmdMetrics() {
   }
 }
 
+async function cmdStats(args = []) {
+  let stats;
+  try { stats = await getStats(); }
+  catch (e) { console.error(color('stats unavailable: ' + e.message + ' (is the api-server up?)', ANSI.red)); process.exit(1); }
+  if (args.includes('--json')) { console.log(JSON.stringify(stats, null, 2)); return; }
+  for (const line of formatStatsLines(stats)) console.log(line);
+}
+
 // ── claude wrapper ──────────────────────────────────────────────────────
 async function cmdClaude(args) {
   // Pull out --model X (or --model=X) from the args we forward. If
@@ -871,6 +963,7 @@ const [, , cmd, ...rest] = process.argv;
       case 'ramp': return await cmdRamp(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
+      case 'stats': return await cmdStats(rest);
       case 'groups': return await cmdGroups();
       case 'add-group': return await cmdAddGroup(rest);
       case 'remove-group': return await cmdRemoveGroup(rest);
@@ -887,6 +980,7 @@ const [, , cmd, ...rest] = process.argv;
   ratlc ramp <±N> [--group=M]   Add/remove channels on group M (default group if omitted)
   ratlc restart [<ch>]        Restart specific channel (or any stuck one)
   ratlc metrics               JSON metrics
+  ratlc stats [--json]        Per-model latency percentiles + time-of-day regimes
   ratlc groups                Per-group breakdown
   ratlc add-group <model> <N> Register a new model group with target N channels
   ratlc remove-group <model>  Drain & remove a non-default model group

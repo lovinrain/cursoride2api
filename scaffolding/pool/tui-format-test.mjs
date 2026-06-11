@@ -72,5 +72,36 @@ console.log('=== SLIP 5: worst realistic widths fit the 11-col SILENT budget ===
 const longest = [silentCell(ch({ busyAt: now - 390000, lastProgressAt: now - 390000 }), WD), silentCell(toolNear, WD)].map(strip);
 ok('longest realistic SILENT (post-reap ~390s) ≤ 11 chars', longest.every((x) => x.length <= 11), JSON.stringify(longest.map((x) => [x, x.length])));
 
+console.log('=== per-type SILENT threshold (fast vs non-fast model) ===');
+{
+  const WD2 = { fast: { livenessGapMs: 45000, busyStuckMs: 120000 }, slow: { livenessGapMs: 90000, busyStuckMs: 360000 } };
+  const fastCh = ch({ group: 'claude-opus-4-8-thinking-max-fast', busyAt: now - 40000, lastProgressAt: now - 40000 });
+  const slowCh = ch({ group: 'claude-opus-4-8-max', busyAt: now - 40000, lastProgressAt: now - 40000 });
+  eq('fast model channel → 40s/45s (fast tier)', silentCell(fastCh, WD2), '40s/45s');
+  eq('non-fast model channel → 40s/90s (slow tier)', silentCell(slowCh, WD2), '40s/90s');
+  ok('fast 40/45 (>=0.85) is red', silentCell(fastCh, WD2).includes('\x1b[31m'), 'not red');
+  ok('slow 40/90 (<0.85) is NOT red', !silentCell(slowCh, WD2).includes('\x1b[31m'), 'unexpectedly red');
+  // flat wd (back-compat) still works regardless of model.
+  eq('flat wd → both types same', silentCell(fastCh, { livenessGapMs: 90000 }), '40s/90s');
+}
+
+console.log('=== adaptive SILENT: dynamic gap → `~` not a fixed countdown (H2) ===');
+{
+  // Under adaptive the gap is derived live per request; the TUI must NOT show a
+  // fixed /Ns denominator (it would lie). Show elapsed + `~`, red near ceiling.
+  const WDA = { adaptive: true, fast: { livenessGapMs: 90000, ceilingMs: 300000, busyStuckMs: 360000 }, slow: { livenessGapMs: 150000, ceilingMs: 600000, busyStuckMs: 660000 } };
+  const aCh = ch({ group: 'claude-opus-4-8-thinking-max-fast', busyAt: now - 40000, lastProgressAt: now - 40000 });
+  eq('adaptive → 40s~ (no /denominator)', silentCell(aCh, WDA), '40s~');
+  ok('adaptive 40s (<<ceiling) is yellow not red', !silentCell(aCh, WDA).includes('\x1b[31m'), 'unexpectedly red');
+  const aNear = ch({ group: 'claude-opus-4-8-thinking-max-fast', busyAt: now - 280000, lastProgressAt: now - 280000 });
+  eq('adaptive near ceiling → 280s~!', silentCell(aNear, WDA), '280s~!');
+  ok('adaptive near ceiling is red', silentCell(aNear, WDA).includes('\x1b[31m'), 'not red near ceiling');
+  // resolveWatchdog carries the adaptive flag from the snapshot…
+  ok('resolveWatchdog passes snapshot adaptive flag', resolveWatchdog({ watchdog: { adaptive: true, fast: { livenessGapMs: 1 }, slow: { livenessGapMs: 1 } } }).adaptive === true, 'adaptive flag dropped');
+  // …and from env when the snapshot omits it.
+  ok('resolveWatchdog reads adaptive from env', (() => { process.env.RATLC_ADAPTIVE_TIMEOUTS = '1'; const r = resolveWatchdog({}); delete process.env.RATLC_ADAPTIVE_TIMEOUTS; return r.adaptive === true; })(), 'env adaptive not read');
+  ok('default (no flag, no env) → not adaptive', resolveWatchdog({ watchdog: { livenessGapMs: 90000 } }).adaptive === false, 'spuriously adaptive');
+}
+
 console.log(fail === 0 ? '\ntui-format-test: OK' : `\ntui-format-test: FAIL (${fail})`);
 process.exit(fail === 0 ? 0 : 1);

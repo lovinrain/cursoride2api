@@ -18,6 +18,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { defaultTranslateModeTools } from './tool-translator.mjs';
+import { isFastModel, typeThresholds } from './model-utils.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1031,13 +1032,16 @@ setInterval(() => {
 // Default 240 s: well above any legitimate single-turn latency we've
 // observed (600k-token NIAH inferences top out around 40 s plus
 // streaming). Tune via RATLC_BUSY_STUCK_TIMEOUT_MS.
-const BUSY_STUCK_TIMEOUT_MS = parseInt(process.env.RATLC_BUSY_STUCK_TIMEOUT_MS || '240000', 10);
+// Per-model-type (fast vs non-fast). RATLC_BUSY_STUCK_TIMEOUT_MS_{FAST,SLOW}
+// override the global RATLC_BUSY_STUCK_TIMEOUT_MS.
+const BUSY_STUCK = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
 setInterval(() => {
   const now = Date.now();
   for (const ch of channels.values()) {
     if (ch.state !== 'busy') continue;
     const idleMs = now - (ch.lastActivityAt || 0);
-    if (idleMs < BUSY_STUCK_TIMEOUT_MS) continue;
+    const threshold = isFastModel(ch.group) ? BUSY_STUCK.fast : BUSY_STUCK.slow;
+    if (idleMs < threshold) continue;
     log(`busy-watchdog: ${ch.id} (group=${ch.group}) stuck busy ${Math.floor(idleMs / 1000)}s reqId=${ch.currentRequestId} — killing for respawn`);
     if (ch.currentRequestId) {
       const client = requestClient.get(ch.currentRequestId);
@@ -1481,11 +1485,25 @@ function statusSnapshot() {
       // Watchdog thresholds (same env the api-server reads) so the TUI can render
       // a silence countdown against them. livenessGapMs is the silent-timeout the
       // SILENT column counts toward; busyStuckMs is the pool-side reap backstop.
-      watchdog: {
-        livenessGapMs: Math.max(0, parseInt(process.env.RATLC_NO_VISIBLE_LIVENESS_GRACE_MS || '0', 10)),
-        ceilingMs: Math.max(5000, parseInt(process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000', 10)),
-        busyStuckMs: parseInt(process.env.RATLC_BUSY_STUCK_TIMEOUT_MS || '240000', 10),
-      },
+      watchdog: (() => {
+        const gap = typeThresholds('NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
+        const ceil = typeThresholds('NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
+        const busy = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
+        return {
+          // Flat values = the "slow"/global tier (back-compat for any reader that
+          // ignores model type; equals the global when no _FAST/_SLOW are set).
+          livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow,
+          // Per-model-type, so the TUI SILENT countdown uses the right threshold
+          // for each channel (fast channels can have a tighter silent-timeout).
+          fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast },
+          slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow },
+          // When the api-server runs RATLC_ADAPTIVE_TIMEOUTS=1 the silent-timeout
+          // gap is derived live (regime p99 × margin) and changes per request, so
+          // a fixed countdown denominator would mislead — the TUI shows the gap as
+          // dynamic (`~`) instead. Same env both processes read under launch.sh.
+          adaptive: process.env.RATLC_ADAPTIVE_TIMEOUTS === '1',
+        };
+      })(),
     },
   };
 }

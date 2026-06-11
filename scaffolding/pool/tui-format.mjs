@@ -3,6 +3,8 @@
 // `ratlc status`, and `ratlc-ctl status` can never drift apart (the repeated
 // 3-copy divergence is what kept slipping). Emits raw ANSI; callers pad using
 // ANSI-stripped width math.
+import { isFastModel, typeThresholds } from './model-utils.mjs';
+
 const C = {
   green: '\x1b[32m', yellow: '\x1b[33m', red: '\x1b[31m',
   blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m', reset: '\x1b[0m',
@@ -31,13 +33,33 @@ export const isWaitTool = (ch) => !!ch && ch.state === 'busy' && Array.isArray(c
 // pool-manager's own defaults/clamps.
 export function resolveWatchdog(config) {
   const wd = config && config.watchdog;
-  if (wd && wd.livenessGapMs != null) return wd;
-  const n = (k, d) => { const v = parseInt(process.env[k] || '', 10); return Number.isFinite(v) ? v : d; };
+  // adaptive: the api-server derives the gap live (regime p99 × margin) so there's
+  // no fixed countdown denominator. Trust the snapshot's flag; else read this
+  // process's env (same RATLC_ADAPTIVE_TIMEOUTS under launch.sh).
+  const adaptive = (wd && typeof wd.adaptive === 'boolean') ? wd.adaptive : (process.env.RATLC_ADAPTIVE_TIMEOUTS === '1');
+  if (wd && wd.fast && wd.slow) return { ...wd, adaptive };  // snapshot already per-type
+  if (wd && wd.livenessGapMs != null) {              // older pool: flat → both types
+    const flat = { livenessGapMs: wd.livenessGapMs, ceilingMs: wd.ceilingMs, busyStuckMs: wd.busyStuckMs };
+    return { ...flat, fast: flat, slow: flat, adaptive };
+  }
+  // Fall back to this process's env (launch.sh exports launch.yaml), per type.
+  const gap = typeThresholds('NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
+  const ceil = typeThresholds('NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
+  const busy = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
   return {
-    livenessGapMs: Math.max(0, n('RATLC_NO_VISIBLE_LIVENESS_GRACE_MS', 0)),
-    busyStuckMs: Math.max(0, n('RATLC_BUSY_STUCK_TIMEOUT_MS', 240000)),
-    ceilingMs: Math.max(5000, n('RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS', 25000)),
+    livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow,
+    fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast },
+    slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow },
+    adaptive,
   };
+}
+
+// Pick the threshold set for a channel's model type. Accepts a per-type wd
+// (with .fast/.slow) or a flat wd (back-compat) and returns a {livenessGapMs,
+// busyStuckMs, ceilingMs}-shaped object.
+function pickWd(ch, wd) {
+  if (wd && wd.fast && wd.slow) return isFastModel(ch && ch.group) ? wd.fast : wd.slow;
+  return wd || {};
 }
 
 // Silence of the CURRENT turn: time since its last frame, or since it went busy
@@ -67,12 +89,21 @@ export function silentCell(ch, wd) {
   const ms = silenceMs(ch);
   if (ms == null) return C.gray + '·' + C.reset;
   const s = Math.round(ms / 1000);
+  const t = pickWd(ch, wd);   // per-model-type threshold (fast vs non-fast)
   if (isWaitTool(ch)) {
-    const reapMs = (wd && wd.busyStuckMs) || 0;
+    const reapMs = (t && t.busyStuckMs) || 0;
     const near = reapMs > 0 && ms >= 0.85 * reapMs;
     return (near ? C.red : C.blue) + `tool ${s}s${near ? '!' : ''}` + C.reset;
   }
-  const gapThr = (wd && wd.livenessGapMs) || 0;
+  if (wd && wd.adaptive) {
+    // Adaptive gap is dynamic (regime p99 × margin, recomputed per request) — no
+    // fixed denominator to show. Render elapsed silence + `~`; ramp red only near
+    // the absolute ceiling, the upper bound that still holds under adaptive.
+    const ceilMs = (t && t.ceilingMs) || 0;
+    const near = ceilMs > 0 && ms >= 0.85 * ceilMs;
+    return (near ? C.red : C.yellow) + `${s}s~${near ? '!' : ''}` + C.reset;
+  }
+  const gapThr = (t && t.livenessGapMs) || 0;
   if (gapThr > 0) {
     const ratio = ms / gapThr;
     return (ratio >= 0.85 ? C.red : C.yellow) + `${s}s/${Math.round(gapThr / 1000)}s${ratio >= 1 ? '!' : ''}` + C.reset;
