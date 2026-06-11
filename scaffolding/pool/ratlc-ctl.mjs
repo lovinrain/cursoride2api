@@ -55,18 +55,27 @@ const STATE_COLOR = {
 };
 const RESET = '\x1b[0m';
 const CYAN = '\x1b[36m';
+const BLUE = '\x1b[34m';
 // A busy channel with a forward-progress frame within this window is actively
 // producing output → "thinking"; busy with a longer gap is "busy" (silent).
 const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < 3000;
+// A busy channel parked on an outstanding tool_use is WAITING for the client to
+// run the tool — a normal between-requests wait, not the silent-timeout.
+const isWaitTool = (ch) => ch.state === 'busy' && Array.isArray(ch.pendingToolUseIds) && ch.pendingToolUseIds.length > 0;
 // SILENT cell: for a busy channel, silence since the last useful frame (or busy
 // start if none) vs the silent-timeout threshold — the "retry coming" countdown.
-function fmtSilent(ch, gapThr) {
+// wait-tool channels show a calm "tool Ns" (red only if nearing the reap).
+function fmtSilent(ch, gapThr, reapMs) {
   if (ch.state !== 'busy') return '-';
   const since = ch.lastProgressAt || ch.busyAt;
   if (!since) return '·';
   const silentMs = Date.now() - since;
   if (silentMs < 3000) return `${CYAN}live${RESET}`;
   const s = Math.round(silentMs / 1000);
+  if (isWaitTool(ch)) {
+    const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
+    return `${near ? STATE_COLOR.dead : BLUE}tool ${s}s${near ? '!' : ''}${RESET}`;
+  }
   if (!gapThr) return `${STATE_COLOR.busy}${s}s${RESET}`;
   const ratio = silentMs / gapThr;
   const c = ratio >= 0.85 ? STATE_COLOR.dead : STATE_COLOR.busy;
@@ -80,8 +89,9 @@ function printStatus(snapshot) {
   }
   const { pool, config } = snapshot;
   const thinkingCount = (pool.channels || []).filter(isThinking).length;
-  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount);
-  const counts = `ready=${pool.readyCount} thinking=${thinkingCount} busy=${busySilent} opening=${pool.openingCount} dead=${pool.deadCount}`;
+  const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
+  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
+  const counts = `ready=${pool.readyCount} thinking=${thinkingCount} wait-tool=${waitToolCount} busy=${busySilent} opening=${pool.openingCount} dead=${pool.deadCount}`;
   console.log(`Pool: ${pool.actualSize}/${pool.configuredSize} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const modeStr = `mode=${config.toolMode || 'contract'}`;
   const contractStr = config.toolMode === 'translate'
@@ -89,7 +99,8 @@ function printStatus(snapshot) {
     : (config.poolToolsContractCount === null ? 'unset' : `${config.poolToolsContractCount} tools`);
   console.log(`Model: ${config.model}  ${modeStr}  contract=${contractStr}  idle_ping=${(config.idlePingMs / 60000).toFixed(0)}min`);
   const gapThr = (config && config.watchdog && config.watchdog.livenessGapMs) || 0;
-  if (gapThr) console.log(`SILENT n/${Math.round(gapThr / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); reap at ${Math.round(((config.watchdog && config.watchdog.busyStuckMs) || 0) / 1000)}s`);
+  const reapMs = (config && config.watchdog && config.watchdog.busyStuckMs) || 0;
+  if (gapThr) console.log(`SILENT n/${Math.round(gapThr / 1000)}s = upstream silent → auto-retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap at ${Math.round(reapMs / 1000)}s`);
   console.log('');
   if (!pool.channels || pool.channels.length === 0) {
     console.log('  (no channels)');
@@ -104,9 +115,10 @@ function printStatus(snapshot) {
     const row = [
       ch.id,
       isThinking(ch) ? `${CYAN}thinking${RESET}`
+        : isWaitTool(ch) ? `${BLUE}wait-tool${RESET}`
         : ch.state === 'busy' ? `${STATE_COLOR.busy}busy${RESET}`
         : `${color}${ch.state}${RESET}`,
-      fmtSilent(ch, gapThr),
+      fmtSilent(ch, gapThr, reapMs),
       String(ch.pid || '-'),
       String(ch.openAttempts || 0),
       fmtTimeAgo(ch.openedAt),

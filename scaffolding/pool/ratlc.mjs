@@ -67,6 +67,11 @@ const STATE_COLOR = {
 // busy with a longer gap is "busy" (silent — the truly-suspect state).
 const THINK_GAP_MS = 3000;
 const isThinking = (ch) => ch.state === 'busy' && ch.progressGapMs != null && ch.progressGapMs < THINK_GAP_MS;
+// A busy channel parked on an outstanding tool_use is WAITING for the client to
+// run the tool and return the result — a normal between-requests wait, NOT the
+// silent-timeout the SILENT countdown tracks. Distinguish it so it doesn't read
+// as a suspect hang.
+const isWaitTool = (ch) => ch.state === 'busy' && Array.isArray(ch.pendingToolUseIds) && ch.pendingToolUseIds.length > 0;
 
 // ── IPC: ask the pool for status ─────────────────────────────────────────
 function poolRequest(obj, timeoutMs = 5000) {
@@ -437,10 +442,12 @@ async function cmdTui() {
     // Split busy into actively-thinking (frames flowing) vs busy-silent (the
     // truly-suspect state). thinking + busy = pool.busyCount.
     const thinkingCount = (pool.channels || []).filter(isThinking).length;
-    const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount);
+    const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
+    const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
     const counts = [
       'ready=' + color(pool.readyCount, ANSI.green),
       'thinking=' + color(thinkingCount, ANSI.cyan),
+      'wait-tool=' + color(waitToolCount, ANSI.blue),
       'busy=' + color(busySilent, ANSI.yellow),
       'opening=' + color(pool.openingCount, ANSI.cyan),
       'dead=' + color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray),
@@ -535,7 +542,9 @@ async function cmdTui() {
         // "busy" (silent ≥ THINK_GAP_MS, yellow). Other states keep STATE_COLOR.
         let stateCell;
         if (ch.state === 'busy') {
-          stateCell = isThinking(ch) ? color('thinking', ANSI.cyan) : color('busy', ANSI.yellow);
+          stateCell = isThinking(ch) ? color('thinking', ANSI.cyan)
+            : isWaitTool(ch) ? color('wait-tool', ANSI.blue)
+            : color('busy', ANSI.yellow);
         } else {
           stateCell = (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
         }
@@ -562,6 +571,14 @@ async function cmdTui() {
             const silentMs = Date.now() - since;
             if (silentMs < THINK_GAP_MS) {
               silentTxt = color('live', ANSI.cyan);
+            } else if (isWaitTool(ch)) {
+              // Waiting on the client to run a tool — the silent-timeout doesn't
+              // apply here (it's between requests). Calm (blue); flips red only
+              // if it nears the pool busy-watchdog reap (the real outer limit).
+              const s = Math.round(silentMs / 1000);
+              const reapMs = (config.watchdog && config.watchdog.busyStuckMs) || 0;
+              const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
+              silentTxt = color(`tool ${s}s${near ? '!' : ''}`, near ? ANSI.red : ANSI.blue);
             } else {
               const s = Math.round(silentMs / 1000);
               const gapThr = (config.watchdog && config.watchdog.livenessGapMs) || 0;
