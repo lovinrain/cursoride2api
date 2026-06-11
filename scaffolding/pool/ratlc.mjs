@@ -217,15 +217,22 @@ function fmtAgo(ts) {
 function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
+  const thinkingCount = (pool.channels || []).filter(isThinking).length;
+  const waitToolCount = (pool.channels || []).filter((c) => isWaitTool(c) && !isThinking(c)).length;
+  const busySilent = Math.max(0, (pool.busyCount || 0) - thinkingCount - waitToolCount);
   const counts = [
     `ready=${color(pool.readyCount, ANSI.green)}`,
-    `busy=${color(pool.busyCount, ANSI.yellow)}`,
+    `thinking=${color(thinkingCount, ANSI.cyan)}`,
+    `wait-tool=${color(waitToolCount, ANSI.blue)}`,
+    `busy=${color(busySilent, ANSI.yellow)}`,
     `opening=${color(pool.openingCount, ANSI.cyan)}`,
     `dead=${color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray)}`,
   ].join('  ');
   console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const groupCount = (pool.groups || []).length;
   console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}`);
+  const wd0 = config && config.watchdog;
+  if (wd0 && wd0.livenessGapMs) console.log(color(`SILENT n/${Math.round(wd0.livenessGapMs / 1000)}s = upstream silent → retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap ${Math.round((wd0.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
   if (pool.groups?.length) {
     console.log('');
     const ghdr = ['GROUP', 'TARGET', 'READY', 'BUSY', 'OPEN', 'DEAD', 'ROUNDS'];
@@ -248,16 +255,37 @@ function printStatus(snap) {
   }
   console.log('');
   if (!pool.channels?.length) { console.log(color('  (no channels)', ANSI.dim)); return; }
-  const headers = ['CHANNEL', 'STATE', 'GROUP', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
-  const widths = [10, 9, 36, 7, 9, 8, 8, 8, 22, 30];
+  const headers = ['CHANNEL', 'STATE', 'SILENT', 'GROUP', 'PID', 'ATTEMPTS', 'AGE', 'IDLE', 'ROUNDS', 'CURRENT', 'ERROR'];
+  const widths = [10, 9, 11, 36, 7, 9, 8, 8, 8, 22, 30];
   console.log(headers.map((h, i) => h.padEnd(widths[i])).join('  '));
   console.log('-'.repeat(widths.reduce((a, b) => a + b + 2, 0)));
   for (const ch of pool.channels) {
     const stateCell = isThinking(ch) ? color('thinking', ANSI.cyan)
+      : isWaitTool(ch) ? color('wait-tool', ANSI.blue)
       : ch.state === 'busy' ? color('busy', ANSI.yellow)
       : (STATE_COLOR[ch.state] || '') + ch.state + ANSI.reset;
+    let silentCell = color('-', ANSI.gray);
+    if (ch.state === 'busy') {
+      const since = ch.lastProgressAt || ch.busyAt;
+      if (!since) silentCell = color('·', ANSI.gray);
+      else {
+        const silentMs = Date.now() - since;
+        const s = Math.round(silentMs / 1000);
+        if (silentMs < THINK_GAP_MS) silentCell = color('live', ANSI.cyan);
+        else if (isWaitTool(ch)) {
+          const reapMs = (wd0 && wd0.busyStuckMs) || 0;
+          const near = reapMs > 0 && silentMs >= 0.85 * reapMs;
+          silentCell = color(`tool ${s}s${near ? '!' : ''}`, near ? ANSI.red : ANSI.blue);
+        } else {
+          const gapThr = (wd0 && wd0.livenessGapMs) || 0;
+          silentCell = gapThr > 0
+            ? color(`${s}s/${Math.round(gapThr / 1000)}s${silentMs >= gapThr ? '!' : ''}`, silentMs >= 0.85 * gapThr ? ANSI.red : ANSI.yellow)
+            : color(`${s}s`, ANSI.yellow);
+        }
+      }
+    }
     const row = [
-      ch.id, stateCell, ch.group || '-', String(ch.pid || '-'),
+      ch.id, stateCell, silentCell, ch.group || '-', String(ch.pid || '-'),
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
