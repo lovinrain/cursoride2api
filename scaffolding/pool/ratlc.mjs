@@ -280,6 +280,40 @@ function formatStatsLines(stats) {
   return out;
 }
 
+// Compact latency band for the default (split) view + `ratlc stats --compact`:
+// one regime line (with the 24h clock) + one line per model (N, first-byte
+// p50/p99, suggested gap, err). The full per-bucket table lives in view 5.
+// Returns [] when stats are unreachable/disabled so the default view stays clean.
+function formatStatsCompact(stats) {
+  const out = [];
+  if (!stats || !Array.isArray(stats.models)) return out;
+  const reg = { fast: ANSI.green, medium: ANSI.yellow, slow: ANSI.red };
+  const cr = stats.currentRegime || '?';
+  let clock = '';
+  for (let h = 0; h < 24; h++) {
+    const rg = (stats.regimeOf || {})[h] || 'medium';
+    clock += color(h === stats.currentHour ? '▮' : (rg === 'fast' ? '▁' : rg === 'medium' ? '▄' : '█'), reg[rg] || ANSI.gray);
+  }
+  out.push(color('Latency', ANSI.bold) + ' regime=' + color(cr, (reg[cr] || ANSI.bold) + ANSI.bold)
+    + ' ' + clock + ' '
+    + (stats.adaptiveTimeouts ? color('adaptive', ANSI.green + ANSI.bold) : color('static', ANSI.dim))
+    + color('  [5] detail', ANSI.dim));
+  if (!stats.models.length) { out.push(color('  (no latency recorded yet — learning…)', ANSI.dim)); return out; }
+  for (const m of stats.models) {
+    const o = m.overall;
+    let sug = m.suggestedGapMs;
+    if (sug != null && stats.adaptiveTimeouts) sug = Math.max(stats.adaptiveMinGapMs || 0, sug);
+    const errC = o.errPct >= 5 ? ANSI.red : o.errPct > 0 ? ANSI.yellow : ANSI.gray;
+    out.push('  ' + color('▸ ' + m.model, ANSI.cyan) + ' ' + color('[' + m.type + ']', m.type === 'fast' ? ANSI.green : ANSI.yellow)
+      + color(' N=', ANSI.dim) + o.count
+      + color('  FB ', ANSI.dim) + fmtMsDur(o.fb.p50) + color('/', ANSI.dim) + color(fmtMsDur(o.fb.p99), ANSI.bold)
+      + color('  sug ', ANSI.dim) + (sug != null ? color(fmtMsDur(sug), ANSI.cyan) : color('—', ANSI.gray))
+      + color('  err ', ANSI.dim) + color(o.errPct + '%', errC)
+      + (o.timeouts ? color('  t/o ' + o.timeouts, ANSI.red) : ''));
+  }
+  return out;
+}
+
 function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
@@ -737,8 +771,13 @@ async function cmdTui() {
       for (const l of formatStatsLines(stats)) console.log(l);
       drawCmdBar(cols); return;
     }
-    // split
+    // split — status panel + a compact latency band (always visible by default;
+    // full per-bucket table is view 5) + the api log tail.
     const statusLines = buildStatusLines(snap);
+    let splitStats = null;
+    try { splitStats = await getStats(); } catch { splitStats = null; }
+    const compact = formatStatsCompact(splitStats);
+    if (compact.length) { statusLines.push(color('─'.repeat(Math.max(1, Math.min(cols, 60)) - 1), ANSI.dim)); for (const l of compact) statusLines.push(l); }
     const minStatusHeight = Math.max(statusLines.length, 12);
     for (let i = 0; i < minStatusHeight; i++) console.log(statusLines[i] ?? '');
     console.log(color('─'.repeat(Math.max(1, cols - 1)), ANSI.dim));
@@ -875,7 +914,8 @@ async function cmdStats(args = []) {
   try { stats = await getStats(); }
   catch (e) { console.error(color('stats unavailable: ' + e.message + ' (is the api-server up?)', ANSI.red)); process.exit(1); }
   if (args.includes('--json')) { console.log(JSON.stringify(stats, null, 2)); return; }
-  for (const line of formatStatsLines(stats)) console.log(line);
+  const lines = args.includes('--compact') ? formatStatsCompact(stats) : formatStatsLines(stats);
+  for (const line of lines) console.log(line);
 }
 
 // ── claude wrapper ──────────────────────────────────────────────────────
@@ -980,7 +1020,8 @@ const [, , cmd, ...rest] = process.argv;
   ratlc ramp <±N> [--group=M]   Add/remove channels on group M (default group if omitted)
   ratlc restart [<ch>]        Restart specific channel (or any stuck one)
   ratlc metrics               JSON metrics
-  ratlc stats [--json]        Per-model latency percentiles + time-of-day regimes
+  ratlc stats [--json|--compact]  Per-model latency percentiles + time-of-day regimes
+                             (--compact = the one-line-per-model band shown in tui)
   ratlc groups                Per-group breakdown
   ratlc add-group <model> <N> Register a new model group with target N channels
   ratlc remove-group <model>  Drain & remove a non-default model group

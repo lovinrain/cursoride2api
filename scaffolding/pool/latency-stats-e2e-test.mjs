@@ -72,9 +72,9 @@ function getJSON(p) {
     http.get({ host: '127.0.0.1', port: PORT, path: p }, (res) => { let b = ''; res.on('data', (c) => b += c); res.on('end', () => { clearTimeout(t); try { resolve(JSON.parse(b)); } catch (e) { reject(e); } }); }).on('error', (e) => { clearTimeout(t); reject(e); });
   });
 }
-function runRatlcStats() {
+function runRatlcStats(extra = []) {
   return new Promise((resolve) => {
-    const proc = spawn(process.execPath, [path.join(HERE, 'ratlc.mjs'), 'stats'], { cwd: REPO_ROOT, env: { ...process.env, RATLC_API_URL: `http://127.0.0.1:${PORT}` } });
+    const proc = spawn(process.execPath, [path.join(HERE, 'ratlc.mjs'), 'stats', ...extra], { cwd: REPO_ROOT, env: { ...process.env, RATLC_API_URL: `http://127.0.0.1:${PORT}` } });
     let out = ''; proc.stdout.on('data', (d) => out += d); proc.stderr.on('data', (d) => out += d);
     proc.on('exit', () => resolve(out.replace(/\x1b\[[0-9;]*m/g, '')));
   });
@@ -100,6 +100,8 @@ try {
   a('adaptiveTimeouts=true surfaced', snap.adaptiveTimeouts === true, snap.adaptiveTimeouts);
   a('currentRegime present', typeof snap.currentRegime === 'string', snap.currentRegime);
   a('suggested gap present (>=5 samples)', b && Number.isFinite(b.currentRegimeSuggestGapMs), b && b.currentRegimeSuggestGapMs);
+  a('per-model suggestedGapMs present (compact band)', m && Number.isFinite(m.suggestedGapMs), m && m.suggestedGapMs);
+  a('adaptiveMinGapMs surfaced', Number.isFinite(snap.adaptiveMinGapMs), snap.adaptiveMinGapMs);
   a('regimeOf has 24 hours', snap.regimeOf && Object.keys(snap.regimeOf).length === 24, snap.regimeOf && Object.keys(snap.regimeOf).length);
 
   console.log('=== ratlc stats (rendered) ===');
@@ -109,6 +111,14 @@ try {
   a('renders FBp50 header', /FBp50/.test(rendered), 'no header');
   a('renders a regime line', /regime=/.test(rendered), 'no regime line');
   a('renders the <=8KB bucket row', /<=8KB/.test(rendered), 'no bucket row');
+
+  console.log('=== ratlc stats --compact (the default-view band) ===');
+  const compact = await runRatlcStats(['--compact']);
+  console.log(compact.split('\n').slice(0, 4).join('\n'));
+  a('compact renders regime line', /regime=/.test(compact), 'no regime line');
+  a('compact renders the model one-liner', compact.includes(MODEL) && /FB /.test(compact), 'no model line');
+  a('compact shows a per-model suggested gap', /sug /.test(compact), 'no sug');
+  a('compact is short (≤ 6 lines, no bucket table)', compact.trim().split('\n').length <= 6 && !/FBp50/.test(compact), `lines=${compact.trim().split('\n').length}`);
 } catch (e) { console.log('  ✗ harness error:', e.message); fail++; }
 try { api.kill('SIGKILL'); } catch {}
 await new Promise((r) => pool.close(r));

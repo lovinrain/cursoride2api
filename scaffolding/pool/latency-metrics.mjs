@@ -246,11 +246,24 @@ export function snapshot() {
       });
     }
     if (oCount === 0) continue;
+    // Per-model suggested gap (current regime, all payload sizes) — one
+    // payload-agnostic number for the compact default-view band. Falls back to
+    // all-hours fb when the current regime is thin.
+    let suggestedGapMs = null;
+    {
+      const regimeFb = allBucketsRegimeMerged(model, cr, 'fb');
+      const anyFb = dsize(regimeFb) > 0 ? regimeFb : mergeDigests(overallFb);
+      if (dsize(anyFb) > 0 && anyFb.n >= MIN_SUGGEST_SAMPLES) {
+        const p99 = anyFb.percentile(0.99);
+        if (Number.isFinite(p99)) suggestedGapMs = Math.max(1000, Math.round(p99 * FB_MARGIN));
+      }
+    }
     models.push({
       model, type: isFastModel(model) ? 'fast' : 'slow',
       overall: { count: oCount, errors: oErr, timeouts: oTimeout, retried: oRetry,
         errPct: oCount ? Math.round((oErr / oCount) * 1000) / 10 : 0,
         fb: statBlock(mergeDigests(overallFb)), total: statBlock(mergeDigests(overallTotal)) },
+      suggestedGapMs,
       buckets,
     });
   }
