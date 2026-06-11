@@ -183,6 +183,7 @@ function startConversation(token, options = {}) {
     onStepCompleted,
     onTurnEnded,
     onError,
+    onProgress,
   } = options;
 
   const currentCallbacks = {
@@ -194,11 +195,16 @@ function startConversation(token, options = {}) {
     onStepCompleted: onStepCompleted || (() => {}),
     onTurnEnded: onTurnEnded || (() => {}),
     onError: onError || (() => {}),
+    // Liveness breadcrumb: fires on raw upstream frames (incl. non-visible
+    // control/kv frames) before the first visible event. Lets the proxy
+    // watchdog distinguish slow-but-alive from genuinely hung. See
+    // markUsefulFrame below + project_channel_timeout_stack memory.
+    onProgress: onProgress || (() => {}),
   };
 
   function setCallbacks(newCallbacks) {
     if (!newCallbacks || typeof newCallbacks !== 'object') return;
-    for (const k of ['onTextDelta', 'onThinkingDelta', 'onThinkingCompleted', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError']) {
+    for (const k of ['onTextDelta', 'onThinkingDelta', 'onThinkingCompleted', 'onMcpCall', 'onServerToolUse', 'onStepCompleted', 'onTurnEnded', 'onError', 'onProgress']) {
       if (typeof newCallbacks[k] === 'function') {
         currentCallbacks[k] = newCallbacks[k];
       }
@@ -245,6 +251,7 @@ function startConversation(token, options = {}) {
   let _turnTextDeltaCount = 0;
   let _turnThinkingDeltaCount = 0;
   let _bytesInAtLastUsefulFrame = 0;
+  let _lastProgressEmitAt = 0;
   let watchdog = null;
   let heartbeat = null;
   let retryAttempts = 0;
@@ -272,6 +279,17 @@ function startConversation(token, options = {}) {
     }
     lastUsefulFrameAt = now;
     _bytesInAtLastUsefulFrame = streamBytesIn;
+    // Liveness breadcrumb for the proxy's silent-timeout watchdog. Only
+    // meaningful BEFORE the first visible event (after that the proxy's
+    // no-visible timer is already disarmed), and throttled to <=1/sec to
+    // keep IPC noise negligible. This is the same signal the HTTP stall
+    // detector trusts, surfaced one layer up so the proxy waits on
+    // slow-but-alive channels instead of SIGTERM-ing them at 25s.
+    if (!hasEmittedContent && now - _lastProgressEmitAt >= 1000) {
+      _lastProgressEmitAt = now;
+      try { currentCallbacks.onProgress && currentCallbacks.onProgress({ kind: 'upstream_frame' }); }
+      catch { /* ignore */ }
+    }
   }
   function dumpStreamSummary(reason, code) {
     if (streamSummaryEmitted) return;

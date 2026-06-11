@@ -541,6 +541,17 @@ function attachLiveCallbacks() {
       lastActivityAt = Date.now();
       send({ type: 'text_delta', channelId: CHANNEL_ID, requestId: currentRequestId, text: t });
     },
+    // Liveness breadcrumb (Option B): raw upstream frames arriving before the
+    // first visible event. Bumping lastActivityAt keeps the pool busy-watchdog
+    // from reaping an alive-but-slow-to-first-byte channel; forwarding the
+    // `progress` IPC lets the api-server reset its liveness-gap timer instead
+    // of SIGTERM-ing the channel. cursor-agent-h1 already throttles these to
+    // <=1/sec and stops once content flows.
+    onProgress: (info) => {
+      if (currentRequestId == null) return;
+      lastActivityAt = Date.now();
+      send({ type: 'progress', channelId: CHANNEL_ID, requestId: currentRequestId, kind: info?.kind || 'upstream_frame' });
+    },
     // Forward thinking deltas via IPC so pool-manager + api-server can
     // buffer them for proxy-side re-injection on subsequent turns
     // (mirrors src/thinking-history.js + CURSOR_REINJECT_THINKING in

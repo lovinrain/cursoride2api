@@ -622,11 +622,20 @@ function handleWorkerMessage(ch, msg) {
       }
       break;
 
+    case 'progress':
+      // Liveness breadcrumb (Option B): a raw upstream frame arrived before
+      // the first visible event. Treat it as channel activity so the
+      // busy-watchdog (RATLC_BUSY_STUCK_TIMEOUT_MS) doesn't reap a channel
+      // that's slow-to-first-byte but demonstrably alive, then forward it so
+      // the api-server can reset its liveness-gap timer.
+      ch.lastActivityAt = Date.now();
+      forwardToClient(ch, msg);
+      break;
+
     case 'text_delta':
     case 'thinking_delta':
     case 'thinking_completed':
     case 'server_tool_use':
-    case 'progress':
     case 'tool_use':
     case 'yield':
     case 'step_completed':

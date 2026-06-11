@@ -67,9 +67,9 @@ RATLC_API_HOST: 0.0.0.0
 # UPSTREAM_RETRY_DESIGN.md for the full design + cost model.
 #
 # upstream_silent_timeout — pool routed, Cursor accepted the bidi frame, then
-#   >25s passed with no text/thinking/tool_use/yield/error. Usually transient
-#   (unknown exec message, slow Cursor). A fresh channel typically succeeds.
-#   Retry cancels the stuck channel + replays the original payload.
+#   RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS passed with no text/thinking/tool_use/
+#   yield/error. Usually transient (unknown exec message, slow Cursor). A fresh
+#   channel typically succeeds. Retry cancels the stuck channel + replays.
 #
 # empty_assistant_turn — Cursor cleanly ended the turn but the model produced
 #   zero visible content. Retry overrides sessionKey to force a different
@@ -81,7 +81,50 @@ RATLC_API_HOST: 0.0.0.0
 # turn worth of quota and adds NO_VISIBLE_EVENT_TIMEOUT_MS to worst-case
 # client latency. Recommended starting values: SILENT=2, EMPTY=1.
 RATLC_RETRY_UPSTREAM_SILENT_MAX: 2             # 0=off, N=up to N retries on silent timeout
-RATLC_RETRY_EMPTY_TURN_MAX: 1                  # 0=off, N=up to N retries on empty turn
+RATLC_RETRY_EMPTY_TURN_MAX: 3                  # 0=off, N=up to N retries on empty turn (raised 1→3 2026-06-07: empty turns recur under load; the breadcrumb no longer fools the empty-check so the budget is now actually usable, and exhaustion shows a clear "retries exhausted" message instead of a bare "auto-retrying" line)
+# upstream_abort — transient upstream error (Cursor "Response error: aborted",
+# stale channel death, NGHTTP2 reset) BEFORE any client-visible content. Left
+# unhandled it surfaces to claude-code as "API returned an empty or malformed
+# response (HTTP 200)" or a manual-retry notice. Retry replays on a FRESH
+# channel (sessionKey nulled to dodge the stale sticky). Only fires before
+# content + for transient errors (never auth/quota/rate-limit). Common during
+# Cursor throttle storms. 0=off.
+RATLC_RETRY_UPSTREAM_ABORT_MAX: 2              # 0=off, N=up to N retries on pre-content upstream abort
+# continue_after_abort — upstream aborts mid-TEXT (after some text was already
+# shown). Can't replay (would duplicate shown text), so instead self-drive a
+# CONTINUATION: keep the SSE message open, ask a fresh channel to continue from
+# the partial, stream it into the same message. Replaces the "Send a new message
+# to continue" notice with seamless continuation. 0=off. (Quality note: the
+# continuation is a fresh generation conditioned on the partial — usually
+# seamless, but may occasionally re-phrase the join; set 0 if undesirable.)
+RATLC_RETRY_CONTINUE_AFTER_ABORT_MAX: 2        # 0=off, N=up to N self-driven continuations per turn
+
+# ── Time-to-first-byte patience (Option A: wait-and-reuse over kill-and-retry) ─
+# This watchdog is a TIME-TO-FIRST-BYTE gate, NOT a generation cap — it disarms
+# permanently on the first visible event, so raising it only gives slow-STARTING
+# turns room (huge full-mode payloads on a throttled backend routinely take >25s
+# to first token). The upstream HTTP stall layer already tolerates 10min pre-
+# content / 30min post (CURSOR_STALL_TIMEOUT_MS, set in translate mode), and the
+# keep-alive ping below feeds the client's read timer, so a multi-minute wait is
+# viable end-to-end. A channel that finally returns is NOT killed — it goes back
+# to the ready pool for reuse, which matters because opens are very expensive
+# under throttle (200+ attempts / ~8min observed). Cost: a GENUINELY hung channel
+# now blocks for the full window before retry; worst-case hung latency is
+# window × (SILENT_MAX+1) = 5min × 3 = 15min with SILENT=2. The forthcoming
+# liveness gate (Option B, RATLC_NO_VISIBLE_LIVENESS_GRACE_MS) abandons channels
+# that are truly silent at the socket early, so the long ceiling only applies to
+# channels showing signs of life — deploy A+B together, or drop SILENT to 1 if
+# running A alone. (was default 25000)
+RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS: 300000      # first-byte patience CEILING (5min) — max total wait even while upstream frames keep arriving
+# Option B (liveness gate): abandon early if NO raw upstream frame arrives for
+# this long, regardless of the ceiling above. The worker emits a `progress`
+# breadcrumb on every raw upstream frame (the same signal the HTTP stall
+# detector trusts) before the first visible event; this timer resets on each
+# one and fires only after true wire silence. So a slow-but-alive channel is
+# waited on (up to the 5min ceiling) and reused, while a genuinely hung channel
+# is reaped at ~90s. Worst-case hung latency ≈ grace × (SILENT_MAX+1) ≈ 270s.
+# Set 0 to disable → pure ceiling behavior (Option A).
+RATLC_NO_VISIBLE_LIVENESS_GRACE_MS: 90000      # liveness-gap: hung if no raw frame for 90s
 # RATLC_RETRY_DELAY_MS: 500                    # backoff between retries
 # RATLC_RETRY_EMIT_NOTICE: 1                   # tell client (one notice) on first retry
 # stale tool_result recovery: when the client (re)sends a tool_result the pool
@@ -107,7 +150,7 @@ RATLC_RETRY_EMPTY_TURN_MAX: 1                  # 0=off, N=up to N retries on emp
 # CURSOR_LOG_NATIVE_EXEC: 1                    # log every ExecServerMessage case
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)
 # POOL_TOOL_USE_WATCHDOG_MS: 1000              # parallel-tools finalize watchdog (default 1000)
-# RATLC_BUSY_STUCK_TIMEOUT_MS: 240000          # busy-watchdog reap threshold (default 240s)
+RATLC_BUSY_STUCK_TIMEOUT_MS: 360000            # busy-watchdog reap threshold (6min) — MUST exceed NO_VISIBLE ceiling (5min) above, else it SIGTERMs the slow-but-alive channel at 4min before first byte (default was 240000)
 # RATLC_TOKEN_DEATH_THRESHOLD: 3               # strikes before a token gets marked dead on `other_error`
 # LOG_REQUEST_TOOLS: 1                         # log incoming /v1/messages tools list
 # POOL_REINJECT_THINKING_DEBUG: 1              # enables POST /v1/_debug/render endpoint used by test_render.sh

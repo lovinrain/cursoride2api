@@ -296,6 +296,29 @@ const RETRY_EMIT_NOTICE = (process.env.RATLC_RETRY_EMIT_NOTICE || '1') === '1';
 // ON (1) because the dead-end is strictly worse; set 0 to restore the notice.
 const STALE_TOOL_RESULT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_STALE_TOOL_RESULT_MAX || '1', 10));
 
+// upstream_abort — a transient upstream error (e.g. Cursor "Response error:
+// aborted", a channel that died, an NGHTTP2 reset) arrived BEFORE any
+// client-visible content. Without recovery this dead-ends as either an
+// "empty or malformed response (HTTP 200)" (the clean-error path) or a
+// manual-retry notice (the softened path). Retrying the original payload on a
+// FRESH channel (sessionKey nulled, to dodge a stale sticky channel) recovers
+// it transparently. Default 0 (opt-in). Only fires before content + for
+// transient errors (never auth/quota/rate-limit). See isRetryableUpstreamAbort.
+const UPSTREAM_ABORT_RETRY_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_UPSTREAM_ABORT_MAX || '0', 10));
+
+// continue_after_abort — when the upstream aborts mid-TEXT (after some visible
+// text was already streamed to the client), we can't replay from scratch
+// (that would duplicate the shown text). Instead, self-drive a CONTINUATION:
+// keep the SSE message open, ask a fresh channel to continue seamlessly from
+// the partial text, and stream the continuation into the same message — so the
+// user never sees "send a new message to continue". Default 0 (opt-in).
+const CONTINUE_AFTER_ABORT_MAX = Math.max(0, parseInt(process.env.RATLC_RETRY_CONTINUE_AFTER_ABORT_MAX || '0', 10));
+const CONTINUE_AFTER_ABORT_INSTRUCTION =
+  'Your previous reply (shown immediately above as the assistant turn) was cut off mid-stream by an upstream connection error. ' +
+  'Continue it seamlessly from the exact point where it stopped. Do NOT repeat, re-summarize, or rephrase any text already written; ' +
+  'do NOT restart from the beginning; do NOT add any preamble, greeting, apology, or meta-comment about the interruption. ' +
+  'Output only the remaining continuation text, as if no interruption had occurred.';
+
 // ── Keep-alive ping cadence ────────────────────────────────────────────────
 // After message_start we may sit silent for many seconds waiting on Cursor's
 // first token (large `full`-mode payloads are slow to first-byte). The wire
@@ -827,6 +850,14 @@ async function handleMessagesRequest(req, res) {
   let thinkingAdapter = null;
   let emittedTextForDetection = '';
   let emittedThinkingForDetection = '';
+  // True once GENUINE upstream visible content (model text or a server tool
+  // use) has been forwarded — as opposed to proxy-injected notices, which also
+  // go through emitTextDelta and bump outputTokens/textBlockOpen. The empty-
+  // assistant-turn detection keys off THIS, not outputTokens, so that emitting
+  // the "auto-retrying" breadcrumb doesn't fool the check into thinking the
+  // next (still-empty) turn produced content — which previously capped the
+  // retry at 1 and left the bare breadcrumb as the whole reply.
+  let realVisibleEmitted = false;
   let thinkingCompletedCount = 0;
   let thinkingDurationMs = null;
   let rescuedHitCount = 0;
@@ -855,6 +886,8 @@ async function handleMessagesRequest(req, res) {
   let silentRetryCount = 0;
   let emptyTurnRetryCount = 0;
   let staleToolResultRetryCount = 0;
+  let abortRetryCount = 0;
+  let continueRetryCount = 0;
   let pendingRetryTimer = null;
   let keepalivePingTimer = null;
   // Set true by cancelForClientDisconnect before it calls finishMessage(), so
@@ -873,6 +906,20 @@ async function handleMessagesRequest(req, res) {
   let noVisibleEventTimer = null;
   const NO_VISIBLE_EVENT_TIMEOUT_MS = Math.max(5_000, parseInt(
     process.env.RATLC_NO_VISIBLE_EVENT_TIMEOUT_MS || '25000',
+    10,
+  ));
+  // Option B — liveness-gated patience. The no-visible timer above is the
+  // ABSOLUTE CEILING (max total wait for the first visible event, even while
+  // upstream frames keep arriving). This second timer is the LIVENESS GAP: it
+  // resets every time the worker forwards a `progress` event (a raw upstream
+  // frame — the same signal the HTTP stall detector trusts), and fires if no
+  // such frame arrives for the grace window, i.e. the channel has gone silent
+  // at the wire and is treated as hung. Whichever fires first triggers the
+  // same retry/notice path. Default 0 = disabled → pure ceiling behavior
+  // (Option A). See project_channel_timeout_stack memory + UPSTREAM_RETRY_DESIGN.md.
+  let livenessGapTimer = null;
+  const NO_VISIBLE_LIVENESS_GRACE_MS = Math.max(0, parseInt(
+    process.env.RATLC_NO_VISIBLE_LIVENESS_GRACE_MS || '0',
     10,
   ));
   // Parallel-tool-calls fix: after each tool_use, arm a *watchdog* timer.
@@ -921,31 +968,59 @@ async function handleMessagesRequest(req, res) {
       toolUseFinishTimer = null;
     }
   }
+  // Shared fire path for both the absolute-ceiling timer and the liveness-gap
+  // timer. `source` is 'ceiling' | 'liveness_gap' for the log line. Clears the
+  // sibling timer so only one fires, then runs the existing retry/notice path.
+  function _fireSilentTimeout(source) {
+    if (noVisibleEventTimer) { clearTimeout(noVisibleEventTimer); noVisibleEventTimer = null; }
+    if (livenessGapTimer) { clearTimeout(livenessGapTimer); livenessGapTimer = null; }
+    if (done || visibleUpstreamEventSeen) return;
+    // Auto-retry hook: try once before giving up. Returns true if a retry
+    // was scheduled (in which case we just return — the replay will re-arm
+    // this watchdog). Returns false if retry is disabled, exhausted, or
+    // not safe (content already emitted).
+    if (tryRetryRequest('upstream_silent_timeout')) return;
+    const waitedMs = source === 'liveness_gap' ? NO_VISIBLE_LIVENESS_GRACE_MS : NO_VISIBLE_EVENT_TIMEOUT_MS;
+    log(`  → no visible upstream event timeout (${source} @${waitedMs}ms) requestId=${requestId}${silentRetryCount ? ` (retries exhausted ${silentRetryCount}/${UPSTREAM_SILENT_RETRY_MAX})` : ''}`);
+    finalStatusOverride = 'upstream_no_visible_event_timeout';
+    finalErrorMessage = `No visible Cursor event (${source}) within ${waitedMs}ms after routing`;
+    emitTextDelta(
+      `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${waitedMs}ms. ` +
+      'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
+    );
+    stopReason = 'end_turn';
+    finishMessage();
+  }
+  // Liveness-gap timer (Option B): clears + re-sets on each call. Re-armed by
+  // the `progress` handler so it only fires after NO_VISIBLE_LIVENESS_GRACE_MS
+  // of true wire silence. No-op when disabled (grace<=0) → ceiling-only.
+  function armLivenessGapTimer() {
+    if (NO_VISIBLE_LIVENESS_GRACE_MS <= 0 || done || visibleUpstreamEventSeen) return;
+    if (livenessGapTimer) clearTimeout(livenessGapTimer);
+    livenessGapTimer = setTimeout(() => {
+      livenessGapTimer = null;
+      _fireSilentTimeout('liveness_gap');
+    }, NO_VISIBLE_LIVENESS_GRACE_MS);
+  }
   function armNoVisibleEventTimer() {
-    if (noVisibleEventTimer || done || visibleUpstreamEventSeen) return;
-    noVisibleEventTimer = setTimeout(() => {
-      noVisibleEventTimer = null;
-      if (done || visibleUpstreamEventSeen) return;
-      // Auto-retry hook: try once before giving up. Returns true if a retry
-      // was scheduled (in which case we just return — the replay will re-arm
-      // this watchdog). Returns false if retry is disabled, exhausted, or
-      // not safe (content already emitted).
-      if (tryRetryRequest('upstream_silent_timeout')) return;
-      log(`  → no visible upstream event timeout @${NO_VISIBLE_EVENT_TIMEOUT_MS}ms requestId=${requestId}${silentRetryCount ? ` (retries exhausted ${silentRetryCount}/${UPSTREAM_SILENT_RETRY_MAX})` : ''}`);
-      finalStatusOverride = 'upstream_no_visible_event_timeout';
-      finalErrorMessage = `No visible Cursor event within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms after routing`;
-      emitTextDelta(
-        `[proxy_notice] Cursor upstream accepted the request but did not emit text, thinking, tool_use, yield, or error within ${NO_VISIBLE_EVENT_TIMEOUT_MS}ms. ` +
-        'The RATLC channel was likely waiting on an unrecognized Cursor exec message. Please retry after the channel is recycled.\n'
-      );
-      stopReason = 'end_turn';
-      finishMessage();
-    }, NO_VISIBLE_EVENT_TIMEOUT_MS);
+    if (done || visibleUpstreamEventSeen) return;
+    if (!noVisibleEventTimer) {
+      noVisibleEventTimer = setTimeout(() => {
+        noVisibleEventTimer = null;
+        _fireSilentTimeout('ceiling');
+      }, NO_VISIBLE_EVENT_TIMEOUT_MS);
+    }
+    // Arm the liveness-gap clock alongside the ceiling (no-op when disabled).
+    armLivenessGapTimer();
   }
   function disarmNoVisibleEventTimer() {
     if (noVisibleEventTimer) {
       clearTimeout(noVisibleEventTimer);
       noVisibleEventTimer = null;
+    }
+    if (livenessGapTimer) {
+      clearTimeout(livenessGapTimer);
+      livenessGapTimer = null;
     }
   }
   function markVisibleUpstreamEvent() {
@@ -1011,25 +1086,30 @@ async function handleMessagesRequest(req, res) {
       ? UPSTREAM_SILENT_RETRY_MAX
       : symptom === 'stale_tool_result'
       ? STALE_TOOL_RESULT_RETRY_MAX
+      : symptom === 'upstream_abort'
+      ? UPSTREAM_ABORT_RETRY_MAX
       : EMPTY_TURN_RETRY_MAX;
     if (budget <= 0) return false;
     const counterBefore = symptom === 'upstream_silent_timeout'
       ? silentRetryCount
       : symptom === 'stale_tool_result'
       ? staleToolResultRetryCount
+      : symptom === 'upstream_abort'
+      ? abortRetryCount
       : emptyTurnRetryCount;
     if (counterBefore >= budget) return false;
     const counterAfter = counterBefore + 1;
     if (symptom === 'upstream_silent_timeout') silentRetryCount = counterAfter;
     else if (symptom === 'stale_tool_result') staleToolResultRetryCount = counterAfter;
+    else if (symptom === 'upstream_abort') abortRetryCount = counterAfter;
     else emptyTurnRetryCount = counterAfter;
     log(`  → retry: ${symptom} attempt ${counterAfter}/${budget} action=${replayAction} requestId=${requestId}`);
     patchRequest(requestId, {
-      retryCount: silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount,
+      retryCount: silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount + abortRetryCount,
       lastRetrySymptom: symptom,
       lastRetryAt: Date.now(),
     });
-    if (RETRY_EMIT_NOTICE && (silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount) === 1) {
+    if (RETRY_EMIT_NOTICE && (silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount + abortRetryCount) === 1) {
       // Only emit on the first overall retry so the client gets ONE breadcrumb,
       // not a wall of notices on repeated retries.
       emitTextDelta(`[proxy_notice] ${symptom} — auto-retrying through a fresh channel...\n`);
@@ -1037,9 +1117,11 @@ async function handleMessagesRequest(req, res) {
     // For upstream_silent_timeout: cancel kills the stuck channel, releasing
     // it for recycling. For empty_assistant_turn: the channel is fine but we
     // want to break affinity, so we cancel anyway (no-op on already-finished
-    // request) and override sessionKey in the replay.
+    // request) and override sessionKey in the replay. For upstream_abort: the
+    // channel already died/aborted (cancel is a no-op cleanup), and we null
+    // sessionKey so routing avoids re-picking the same stale sticky channel.
     poolWrite({ type: 'cancel_request', requestId, reason: `retry:${symptom}` });
-    const replayPayload = symptom === 'empty_assistant_turn'
+    const replayPayload = (symptom === 'empty_assistant_turn' || symptom === 'upstream_abort')
       ? { ...lastPoolRetryPayload, sessionKey: null }
       : lastPoolRetryPayload;
     // Reset per-request state so the new attempt looks like a fresh route.
@@ -1062,6 +1144,76 @@ async function handleMessagesRequest(req, res) {
       if (done) return;  // client disconnected during delay
       log(`  → retry: ${symptom} firing replay requestId=${requestId} attempt=${counterAfter} action=${replayAction}`);
       poolWrite(replayPayload);
+      armNoVisibleEventTimer();
+    }, RETRY_DELAY_MS);
+    return true;
+  }
+
+  // Self-driven continuation after a mid-TEXT upstream abort. The partial text
+  // is already on the client's screen, so we can't replay from scratch (that
+  // would duplicate it). Instead we keep the SSE message OPEN, hand a fresh
+  // channel the full conversation + the partial assistant text + an
+  // instruction to continue from exactly where it stopped, and stream that
+  // continuation into the same text block. Returns true if a continuation was
+  // scheduled (caller must NOT finishMessage), false to fall back to the notice.
+  function tryContinueAfterAbort() {
+    if (clientGone || done) return false;
+    if (CONTINUE_AFTER_ABORT_MAX <= 0) return false;
+    if (continueRetryCount >= CONTINUE_AFTER_ABORT_MAX) return false;
+    const partial = (emittedTextForDetection || '').trim();
+    if (!partial) return false;  // nothing shown to continue from → use the notice
+    let continuationPayload;
+    try {
+      // Render: [full history] + [assistant: partial so far] + [user: continue].
+      // The model treats the partial as its own prior turn and continues it.
+      const contMessages = [
+        ...messages,
+        { role: 'assistant', content: partial },
+        { role: 'user', content: CONTINUE_AFTER_ABORT_INSTRUCTION },
+      ];
+      const thinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+      const content = buildFullContextCursorMcpContent({ messages: contMessages, system, tools, thinkingTurns });
+      continuationPayload = {
+        type: 'request', requestId, action: 'send_user_message',
+        model: routingModel || null,
+        requestedModel: model || null,
+        text: cursorMcpContentToText(content),
+        content,
+        system: extractSystemPrompt(system),
+        tools: tools || [],
+        sessionKey: null,           // fresh channel — the aborted one is dead
+        contextMode: 'full',
+        hybridReason: 'continue-after-abort',
+      };
+    } catch (e) {
+      log(`  ↪ continue-after-abort build failed: ${e.message || e}`);
+      return false;
+    }
+    continueRetryCount++;
+    log(`  → continue-after-abort attempt ${continueRetryCount}/${CONTINUE_AFTER_ABORT_MAX} requestId=${requestId} partialChars=${partial.length}`);
+    patchRequest(requestId, {
+      retryCount: silentRetryCount + emptyTurnRetryCount + staleToolResultRetryCount + abortRetryCount + continueRetryCount,
+      lastRetrySymptom: 'continue_after_abort',
+      lastRetryAt: Date.now(),
+    });
+    // Keep the message OPEN and preserve emitted content (textBlockOpen,
+    // blockIdx, outputTokens). Clear only the error/watchdog state. Point the
+    // silent-timeout retry payload at the CONTINUATION so a silent continuation
+    // re-continues (instead of replaying the original → duplication).
+    finalStatusOverride = null;
+    finalErrorMessage = null;
+    stopReason = null;
+    lastPoolRetryPayload = continuationPayload;
+    poolWrite({ type: 'cancel_request', requestId, reason: 'continue_after_abort' });
+    disarmNoVisibleEventTimer();
+    disarmToolUseFinalizer();
+    visibleUpstreamEventSeen = false;
+    if (pendingRetryTimer) clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = setTimeout(() => {
+      pendingRetryTimer = null;
+      if (done) return;  // client disconnected during delay
+      log(`  → continue-after-abort firing replay requestId=${requestId} attempt=${continueRetryCount}`);
+      poolWrite(continuationPayload);
       armNoVisibleEventTimer();
     }, RETRY_DELAY_MS);
     return true;
@@ -1471,6 +1623,21 @@ async function handleMessagesRequest(req, res) {
     return added;
   }
 
+  // Is this pool error a TRANSIENT upstream failure worth retrying on a fresh
+  // channel? Used by the before-content abort-retry. Conservative: returns
+  // false for anything that looks persistent (auth / quota / rate-limit / no
+  // ready channel — retrying those amplifies the problem or can't help), and
+  // true only for known transient transport/stream failures. Default false.
+  function isRetryableUpstreamAbort(message, code) {
+    const t = String(message || '');
+    // Persistent — never retry (would hammer the upstream or loop forever).
+    if (/not.?logged.?in|unauthor|auth[_ ]?error|forbidden|quota|resource_exhausted|rate.?limit|payment|unpaid|insufficient|no ready RATLC channel|\b40[13]\b|\b429\b/i.test(t)) {
+      return false;
+    }
+    // Transient transport/stream failures that left no usable content.
+    return /abort|reset|ECONNRESET|EPIPE|socket hang ?up|nghttp2|stall|no longer alive|channel .* died|busy-watchdog|unhandled Cursor exec|ERR_STREAM|stream error|premature|unexpected_turn_ended/i.test(t);
+  }
+
   function classifySoftenedPoolError(message, code) {
     const text = String(message || '');
     if (code === 'no_ready_timeout' || /no ready RATLC channel/i.test(text)) {
@@ -1537,7 +1704,7 @@ async function handleMessagesRequest(req, res) {
     // turn looks "empty" only because we never got to stream it, and there's
     // no open socket to deliver a replay into — retrying would burn a fresh
     // channel + quota for output nobody reads.
-    if (!clientGone && !toolUseEmitted && outputTokens === 0 && !textBlockOpen && EMPTY_TURN_RETRY_MAX > 0) {
+    if (!clientGone && !toolUseEmitted && !realVisibleEmitted && EMPTY_TURN_RETRY_MAX > 0) {
       if (tryRetryRequest('empty_assistant_turn')) {
         // tryRetryRequest already reset done=false and scheduled the replay.
         // Do NOT proceed with the rest of finishMessage — let the replay take
@@ -1554,8 +1721,15 @@ async function handleMessagesRequest(req, res) {
     disarmToolUseFinalizer();
     disarmNoVisibleEventTimer();
     disarmKeepalivePing();
-    if (!toolUseEmitted && outputTokens === 0 && !textBlockOpen) {
-      emitTextDelta('[proxy_notice] Cursor ended this turn without visible text or tool calls. Any upstream thinking was captured for the next request, but there is no assistant-visible content to display.\n');
+    if (!toolUseEmitted && !realVisibleEmitted) {
+      if (emptyTurnRetryCount > 0) {
+        // We retried on fresh channels and still got nothing. Replace the bare
+        // "auto-retrying" breadcrumb (which misleadingly implies we're still
+        // trying) with a clear, actionable exhaustion message.
+        emitTextDelta(`\n[proxy_notice] The model returned an empty response ${emptyTurnRetryCount + 1} times in a row — auto-retry exhausted after ${emptyTurnRetryCount} fresh-channel attempt(s). This is usually transient under load; please send your message again to retry.\n`);
+      } else {
+        emitTextDelta('[proxy_notice] Cursor ended this turn without visible text or tool calls. Any upstream thinking was captured for the next request, but there is no assistant-visible content to display.\n');
+      }
     }
     const trailing = hallucinationFilter.flush();
     if (trailing) emitTextDelta(trailing);
@@ -1643,6 +1817,7 @@ async function handleMessagesRequest(req, res) {
         }
         completeOpenServerTools('Cursor backend WebSearch result was consumed by the model; result metadata was not exposed on this transport.');
         emittedTextForDetection += msg.text || '';
+        if ((msg.text || '').length) realVisibleEmitted = true;
         const forwardedText = hallucinationFilter.feed(msg.text || '');
         if (forwardedText) emitTextDelta(forwardedText);
         // Re-arm the tool_use watchdog on any model-originated stream
@@ -1695,13 +1870,16 @@ async function handleMessagesRequest(req, res) {
           reqLog.firstByteMs = reqLog.firstByteAt - reqLog.startedAt;
         }
         reqLog.status = 'server_tool';
+        realVisibleEmitted = true;
         emitServerToolUseEvent(msg);
       } else if (msg.type === 'progress') {
         if (done) return;
-        if (noVisibleEventTimer) {
-          disarmNoVisibleEventTimer();
-          armNoVisibleEventTimer();
-        }
+        // Liveness breadcrumb: the channel is alive at the wire. Reset ONLY
+        // the liveness-gap timer (Option B) — leave the absolute ceiling
+        // running so a channel that emits frames forever without ever
+        // producing a visible event still gives up eventually. No-op when
+        // liveness gating is disabled (grace<=0) → pure ceiling behavior.
+        if (noVisibleEventTimer && !visibleUpstreamEventSeen) armLivenessGapTimer();
         patchRequest(requestId, {
           status: 'upstream_progress',
           upstreamProgressKind: msg.kind || null,
@@ -2074,6 +2252,21 @@ async function handleMessagesRequest(req, res) {
         stopReason = toolUseEmitted ? 'tool_use' : 'end_turn';
         finishMessage();
       } else if (msg.type === 'error') {
+        // Transparent recovery for a transient upstream error that arrived
+        // BEFORE any client-visible content (e.g. Cursor "Response error:
+        // aborted" or a stale sticky channel dying during a throttle storm).
+        // Left unhandled, this dead-ends as "empty or malformed response
+        // (HTTP 200)" (clean-error path) or a manual-retry notice (softened
+        // path); instead we replay on a fresh channel — same mechanism as the
+        // silent-timeout retry. Guards: not already retrying (a stale post-
+        // cancel error must not double-fire), before-content (never duplicate
+        // shown output — an abort AFTER partial content falls through to the
+        // preserve-shown-output path below), and transient-only.
+        if (!pendingRetryTimer && !textBlockOpen && !toolUseEmitted && outputTokens === 0
+            && isRetryableUpstreamAbort(msg.message, msg.code)
+            && tryRetryRequest('upstream_abort')) {
+          return;
+        }
         markVisibleUpstreamEvent();
         completeOpenServerTools('The response ended with an error before Cursor exposed WebSearch result metadata.');
         const softened = classifySoftenedPoolError(msg.message, msg.code);
@@ -2113,11 +2306,20 @@ async function handleMessagesRequest(req, res) {
         // message_delta + message_stop, so the SSE stays well-formed.
         if (textBlockOpen || toolUseEmitted || outputTokens > 0) {
           log(`  → upstream error AFTER partial content requestId=${requestId}; finalizing gracefully to preserve shown output: ${String(msg.message || '').slice(0, 140)}`);
-          finalStatusOverride = 'error_after_partial_content';
-          finalErrorMessage = msg.message || null;
           if (toolUseEmitted) {
+            // Tool_use turn: the emitted tool_use blocks are intact, so the
+            // client continues automatically by executing them. No notice.
+            finalStatusOverride = 'error_after_partial_content';
+            finalErrorMessage = msg.message || null;
             stopReason = 'tool_use';
+          } else if (tryContinueAfterAbort()) {
+            // Text turn cut off mid-response: self-drive a continuation into the
+            // same open message instead of dead-ending. Message stays open; the
+            // continuation streams in and finishMessage runs on its yield.
+            return;
           } else {
+            finalStatusOverride = 'error_after_partial_content';
+            finalErrorMessage = msg.message || null;
             emitTextDelta('\n\n[proxy_notice] Upstream connection dropped mid-response — the answer above may be incomplete. Send a new message to continue.\n');
             stopReason = 'end_turn';
           }
@@ -2198,13 +2400,83 @@ async function handleMessagesRequest(req, res) {
     }
 
     if (clientBridgeToolResults.length > 0 && regularToolResults.length > 0) {
-      log(`  → reject mixed client-bridge/regular tool_result batch requestId=${requestId} bridged=${clientBridgeToolResults.length} regular=${regularToolResults.length}`);
-      finalStatusOverride = 'error';
-      finalErrorMessage = 'mixed client-bridge and regular tool_result batch';
-      startMsg();
-      emitTextDelta('[proxy_error] Mixed client-bridge and regular tool results arrived in one batch. Send these tool results in separate turns.\n');
-      stopReason = 'end_turn';
-      finishMessage();
+      // Mixed batch: the assistant turn emitted PARALLEL tool calls spanning
+      // BOTH a client-bridge MCP tool (executed by claude-code — e.g. a
+      // playwright browser tool) AND a regular pool tool, so claude-code
+      // returns all of their results in one user turn. Both kinds were emitted
+      // by the SAME assistant turn → the SAME pool channel, and both serialize
+      // to identical `send_tool_results` entries ({anthropic_tool_use_id,
+      // content}), so we MERGE them into a single batch — which is exactly what
+      // the channel is waiting for. (Rejecting instead dead-ended the client
+      // AND stranded the channel holding a partial tool_result batch until the
+      // busy-watchdog reaped it.)
+      //
+      // Exception: a SYNTHETIC regular result (a textual "[Tool call]" marker
+      // with no real pending execId) needs the full-context rebuild path
+      // (send_user_message), which can't be merged with real bridged execIds —
+      // so that rare combination is still rejected.
+      const syntheticRegular = regularToolResults.filter((r) => isSyntheticToolUseId(r.tool_use_id));
+      if (syntheticRegular.length > 0) {
+        log(`  → reject mixed client-bridge/synthetic tool_result batch requestId=${requestId} bridged=${clientBridgeToolResults.length} synthetic=${syntheticRegular.length} regular=${regularToolResults.length}`);
+        finalStatusOverride = 'error';
+        finalErrorMessage = 'mixed client-bridge and synthetic tool_result batch';
+        startMsg();
+        emitTextDelta('[proxy_error] Mixed client-bridge and synthetic tool results arrived in one batch. Retry the last request so the proxy can rebuild the turn from full message history.\n');
+        stopReason = 'end_turn';
+        finishMessage();
+        return;
+      }
+      const bridgedResults = clientBridgeToolResults.map(({ result, entry }) => ({
+        anthropic_tool_use_id: entry.poolToolUseId,
+        content: buildPoolToolResultContentFromClientResult(result),
+      }));
+      // Same enrichment as the regular send_tool_results path (spoof-result
+      // injection + error/normalization), so a regular result inside a mixed
+      // batch is handled identically to one in a homogeneous batch.
+      const enrichedRegular = await Promise.all(regularToolResults.map(async (r) => {
+        const injected = await consumeSpoofResult(r.tool_use_id);
+        if (injected) {
+          log(`  ↪ spoof-result injection: tool_use_id=${r.tool_use_id} replacing ${r.text ? r.text.length + 'B ack' : 'empty ack'} with ${injected.length}B search payload`);
+          return { anthropic_tool_use_id: r.tool_use_id, content: injected };
+        }
+        if (r.isError) return { anthropic_tool_use_id: r.tool_use_id, content: { error: r.text || 'Tool failed' } };
+        return { anthropic_tool_use_id: r.tool_use_id, content: normalizeAnthropicContentForCursorMcp(r.content === undefined ? r.text : r.content) };
+      }));
+      const merged = [...bridgedResults, ...enrichedRegular];
+      // Retry snapshot (parity with the regular path): a full-context
+      // send_user_message fallback in case this batch silent-times-out.
+      try {
+        const retryThinkingTurns = POOL_REINJECT_THINKING ? thinkingBuffer.getForConvKey(convKey) : [];
+        const retryContent = buildFullContextCursorMcpContent({ messages, system, tools, thinkingTurns: retryThinkingTurns });
+        lastPoolRetryPayload = {
+          type: 'request', requestId, action: 'send_user_message',
+          model: routingModel || null,
+          requestedModel: model || null,
+          text: cursorMcpContentToText(retryContent),
+          content: retryContent,
+          system: extractSystemPrompt(system),
+          tools: tools || [],
+          sessionKey: null,
+          contextMode: 'full',
+          hybridReason: 'retry-fallback-from-mixed-tool-results',
+        };
+      } catch (e) {
+        log(`  ↪ retry fallback build failed (mixed batch): ${e.message || e}`);
+        lastPoolRetryPayload = null;
+      }
+      log(`  → pool merged client-bridge+regular tool_results requestId=${requestId} bridged=${bridgedResults.length} regular=${enrichedRegular.length} ids=[${merged.map(r => r.anthropic_tool_use_id).join(', ')}]`);
+      patchRequest(requestId, {
+        status: 'forwarded_mixed_tool_result',
+        forwardedAt: Date.now(),
+        toolResultCount: merged.length,
+        toolResultIds: merged.map((r) => r.anthropic_tool_use_id),
+      });
+      poolWrite({
+        type: 'request', requestId, action: 'send_tool_results',
+        model: routingModel || null,
+        requestedModel: model || null,
+        results: merged,
+      });
       return;
     }
 
