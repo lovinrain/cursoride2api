@@ -336,7 +336,7 @@ async function main() {
     const full = r.events.map((e) => e.text).join('');
     console.log('S12 empty-exhausted (expect 3 reqs + clear exhaustion msg):', r.requestCount, { exhausted: full.includes('auto-retry exhausted') });
     check('S12 used the full budget (3 pool requests = 1 + 2 retries)', r.requestCount === 3, `requestCount=${r.requestCount}`);
-    check('S12 showed a CLEAR exhaustion message', full.includes('auto-retry exhausted') && full.includes('send your message again'), `full=${JSON.stringify(full).slice(0,160)}`);
+    check('S12 showed a CLEAR exhaustion message', full.includes('auto-retry exhausted') && full.includes('rate-limited or not provisioned'), `full=${JSON.stringify(full).slice(0,160)}`);
   }
 
   // S13: thinking frames keep the channel alive (Workstream C). A thinking_delta

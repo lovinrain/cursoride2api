@@ -165,6 +165,25 @@ function finishRequestLog(requestId, patch = {}) {
 const ADAPTIVE_TIMEOUTS = process.env.RATLC_ADAPTIVE_TIMEOUTS === '1';
 const ADAPTIVE_MIN_GAP_MS = Math.max(1000, parseInt(process.env.RATLC_ADAPTIVE_MIN_GAP_MS || '10000', 10));
 
+// Upstream rate-limit awareness. Cursor throttles per-model quota (e.g. a new/
+// premium model like Fable 5 on accounts without allowance): the run errors with
+// "resource_exhausted … rate limit", or the channel accepts the turn but returns
+// nothing. Without this, the former surfaced as a generic api_error and the
+// latter as "empty response N times" — both hiding the real cause. We (a) tag a
+// rate-limit error as a proper rate_limit_error to the client, and (b) remember
+// which models were just rate-limited so a subsequent empty turn on the same
+// model is reported as a rate-limit (and not retried into the same wall).
+const RATE_LIMIT_MEMORY_MS = Math.max(10_000, parseInt(process.env.RATLC_RATE_LIMIT_MEMORY_MS || '90000', 10));
+const _rateLimitedModelAt = new Map(); // model → last rate-limit ms
+function isUpstreamRateLimit(message) {
+  return /resource_exhausted|rate[ _-]?limit|RATE_LIMITED|reached the rate limit|API usage limit|too many computers/i.test(String(message || ''));
+}
+function noteUpstreamRateLimit(model) { if (model) _rateLimitedModelAt.set(String(model), Date.now()); }
+function recentlyRateLimited(model) {
+  const t = _rateLimitedModelAt.get(String(model || ''));
+  return t != null && (Date.now() - t) < RATE_LIMIT_MEMORY_MS;
+}
+
 function normalizeModelForRouting(model) {
   return String(model || '').trim().replace(/\[[^\]]+\]$/g, '');
 }
@@ -1814,7 +1833,8 @@ async function handleMessagesRequest(req, res) {
     // turn looks "empty" only because we never got to stream it, and there's
     // no open socket to deliver a replay into — retrying would burn a fresh
     // channel + quota for output nobody reads.
-    if (!clientGone && !toolUseEmitted && !realVisibleEmitted && EMPTY_TURN_RETRY_MAX > 0) {
+    if (!clientGone && !toolUseEmitted && !realVisibleEmitted && EMPTY_TURN_RETRY_MAX > 0
+        && !recentlyRateLimited(routedTo || routingModel)) {  // a rate-limited model won't fill on retry — don't burn channels/quota
       if (tryRetryRequest('empty_assistant_turn')) {
         // tryRetryRequest already reset done=false and scheduled the replay.
         // Do NOT proceed with the rest of finishMessage — let the replay take
@@ -1832,11 +1852,17 @@ async function handleMessagesRequest(req, res) {
     disarmNoVisibleEventTimer();
     disarmKeepalivePing();
     if (!toolUseEmitted && !realVisibleEmitted) {
-      if (emptyTurnRetryCount > 0) {
+      const emptyModel = routedTo || routingModel || '';
+      if (recentlyRateLimited(emptyModel)) {
+        // We just saw this model rate-limited upstream; an empty turn now is the
+        // same throttle wearing a different hat. Report it as such (not "empty").
+        emitTextDelta(`\n[proxy_notice] Model "${emptyModel}" is being rate-limited upstream by Cursor (recent resource_exhausted on this model) — it accepted the request but returned no content. This is a per-model quota on the Cursor account(s) behind the proxy, not a proxy error. Wait and retry, or switch to a model that has quota (e.g. your opus/4.6 groups).\n`);
+      } else if (emptyTurnRetryCount > 0) {
         // We retried on fresh channels and still got nothing. Replace the bare
         // "auto-retrying" breadcrumb (which misleadingly implies we're still
-        // trying) with a clear, actionable exhaustion message.
-        emitTextDelta(`\n[proxy_notice] The model returned an empty response ${emptyTurnRetryCount + 1} times in a row — auto-retry exhausted after ${emptyTurnRetryCount} fresh-channel attempt(s). This is usually transient under load; please send your message again to retry.\n`);
+        // trying) with a clear, actionable exhaustion message — and name the most
+        // common real cause for a brand-new/premium model.
+        emitTextDelta(`\n[proxy_notice] The model returned an empty response ${emptyTurnRetryCount + 1} times in a row (auto-retry exhausted after ${emptyTurnRetryCount} fresh-channel attempt(s)). For a new or premium model (e.g. Fable 5) this usually means it is rate-limited or not provisioned on the upstream Cursor account — check \`ratlc tui\` token-health, try a different model, or resend if it was just transient load.\n`);
       } else {
         emitTextDelta('[proxy_notice] Cursor ended this turn without visible text or tool calls. Any upstream thinking was captured for the next request, but there is no assistant-visible content to display.\n');
       }
@@ -2454,13 +2480,21 @@ async function handleMessagesRequest(req, res) {
         // with nothing streamed to lose, we emit the error event, close the
         // stream, and skip finishMessage.
         writeHeadersOnce({ 'x-ratlc-fallback': '0' });
+        // An upstream rate-limit (per-model Cursor quota) is NOT a generic
+        // api_error — tag it as rate_limit_error so the client backs off, and
+        // remember the model so a follow-up empty turn on it reads as rate-limit.
+        const rateLimited = isUpstreamRateLimit(msg.message);
+        const rlModel = routedTo || routingModel || 'this model';
+        if (rateLimited) noteUpstreamRateLimit(routedTo || routingModel);
         finishRequestLog(requestId, {
-          status: 'error',
+          status: rateLimited ? 'upstream_rate_limit' : 'error',
           error: msg.message,
           stopReason: 'error',
           outputTokens,
         });
-        sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: msg.message } });
+        sseWrite(res, 'error', rateLimited
+          ? { type: 'error', error: { type: 'rate_limit_error', message: `Upstream Cursor rate limit for model ${rlModel}: ${String(msg.message || '').replace(/^Connect error\s*/i, '')}. This is a per-model quota on the Cursor account(s) behind the proxy, not a proxy error — wait and retry, or switch to a model that has quota (e.g. your opus/4.6 groups).` } }
+          : { type: 'error', error: { type: 'api_error', message: msg.message } });
         done = true;
         disarmToolUseFinalizer();
         stopThinkingBlock();
