@@ -82,6 +82,7 @@ function startApiServer(sockPath, port, extraEnv) {
     RATLC_RETRY_EMPTY_TURN_MAX: '0',
     RATLC_KEEPALIVE_PING_MS: '0',
     POOL_REINJECT_THINKING: '0',
+    RATLC_STATS_DISABLE: '1',   // isolate: never record into production /tmp/ratlc-stats.json
     ...extraEnv,
   };
   const proc = spawn(process.execPath, [API_SERVER], { cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
