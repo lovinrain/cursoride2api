@@ -134,9 +134,15 @@ glance. The **SILENT** column on a `wait-tool` channel tells you what it's block
 | `1/3 120s` | a 3-tool parallel batch, 1 result back, 2 pending — **watch the count climb = progressing** |
 | `0/5 1650s!` | 5 pending, **nothing returned** for 27 min — almost always an abandoned client (red `!` = near the reap ceiling) |
 
-A dead channel's **ERROR** column shows *why* it died: `reap:wait-tool@361s`,
-`reap:busy@250s`, or `worker:quota_exhausted` (red). The header shows
-`⚠tok-dead=N/total` when tokens are quota-dead (your main capacity limiter).
+The **ERROR** column is dual-use: on a dead channel it shows *why* it died
+(`reap:wait-tool@361s`, `reap:busy@250s`, `worker:quota_exhausted`, red); on a
+live `wait-tool` channel with a **multi-tool batch** it names the outstanding
+tools (`waiting: Read, Bash`) — because the narrow SILENT cell only has room for
+the count (`0/2`). A *lone* pending tool is already named in SILENT (`Bash 12s`).
+What it CANNOT show: the tool's args (which file / command) or the client's
+execution — a wait-tool channel is idle, blocked on claude-code running the tool,
+which is opaque to the proxy. The header shows `⚠tok-dead=N/total` when tokens are
+quota-dead (your main capacity limiter).
 
 - **`ratlc failures [N]`** — recent not-ok requests (rate-limit, empty turn, stale
   tool_result, errors) straight from `/requests`, so you don't tail `api.log`.

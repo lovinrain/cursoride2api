@@ -413,9 +413,21 @@ function printStatus(snap) {
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
-      (ch.state === 'dead' && ch.deathReason)
-        ? color((ch.deathReason + (ch.error ? ' ' + String(ch.error).slice(0, 12) : '')).slice(0, 28), ANSI.red)
-        : (ch.error ? String(ch.error).slice(0, 28) : ''),
+      (() => {
+        if (ch.state === 'dead' && ch.deathReason) return color((ch.deathReason + (ch.error ? ' ' + String(ch.error).slice(0, 12) : '')).slice(0, 28), ANSI.red);
+        if (ch.error) return String(ch.error).slice(0, 28);
+        // wait-tool: the SILENT cell only fits the count (0/2) for a batch — name
+        // the outstanding tools HERE (the ERROR column is otherwise blank for a
+        // live channel) so you can see WHAT it's blocked on, not just how many.
+        const pt = Array.isArray(ch.pendingTools) ? ch.pendingTools : null;
+        if (pt && pt.length > 1) {
+          const missing = pt.filter((t) => !t.provided).map((t) => t.toolName || '?');
+          let label = 'waiting: ' + missing.join(', ');
+          if (label.length > 28) label = label.slice(0, 27) + '…';
+          return color(label, ANSI.blue);
+        }
+        return '';
+      })(),
     ];
     const out = row.map((v, i) => {
       const raw = String(v).replace(/\x1b\[[0-9;]*m/g, '');
