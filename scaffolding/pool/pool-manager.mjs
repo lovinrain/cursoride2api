@@ -179,6 +179,14 @@ function getPendingToolsForChannel(channelId) {
     if (toolName === 'Task' && entry && entry.args && entry.args.subagent_type) {
       out.subagentType = entry.args.subagent_type;
     }
+    // Short arg preview (the Bash command / Read path / Grep pattern) so an
+    // operator can see WHAT the outstanding tool is, not just its name. Used by
+    // `ratlc inspect`. Kept short; full args stay client-side.
+    const a = entry && entry.args;
+    if (a && typeof a === 'object') {
+      const v = a.command || a.file_path || a.path || a.pattern || a.query || a.url || a.description;
+      if (typeof v === 'string' && v) out.argPreview = v.length > 60 ? v.slice(0, 57) + '…' : v;
+    }
     return out;
   });
 }
@@ -639,16 +647,26 @@ function handleWorkerMessage(ch, msg) {
       // dead row in the TUI tells a uniform story (and gets the red treatment),
       // not just watchdog reaps.
       if (msg.state === 'dead') {
-        // Classify the death so the ERROR column is unambiguous. An "Upstream
-        // stalled — no progress for Ns" exit (the bridge-worker's own stall
-        // detector — Cursor went silent) reads as `stall:upstream@Ns`, distinct
-        // from auth/quota worker deaths (`worker:quota_exhausted`) and from a
-        // pool-side `reap:wait-tool@Ns`. These three are very different stories.
+        // Classify the death so the ERROR column is unambiguous (4 stories):
+        //   worker:quota_exhausted  — auth/quota worker death
+        //   reap:wait-tool@Ns       — pool gave up waiting on the client (busy-watchdog)
+        //   reap:client-wait@Ns     — the BRIDGE stall fired while a client tool_result
+        //                             was still outstanding. In translate mode the
+        //                             1800s post-content ceiling IS the client-tool-wait
+        //                             ceiling, so "Upstream stalled" is a MISLABEL — the
+        //                             client never returned the result, Cursor wasn't at
+        //                             fault. (See DEVLOG / stall-thresholds.js:196.)
+        //   stall:upstream@Ns       — a real Cursor stall: silent with NO tool outstanding.
         const errStr = String(msg.error || '');
         const secs = (errStr.match(/(\d+)\s*s\b/) || [])[1];
-        ch.deathReason = /stall|no progress/i.test(errStr)
-          ? `stall:upstream${secs ? '@' + secs + 's' : ''}`
-          : `worker:${msg.errorKind || 'error'}`;
+        const at = secs ? `@${secs}s` : '';
+        if (/stall|no progress/i.test(errStr)) {
+          const waitingOnClient = getPendingToolUseIdsForChannel(ch.id).length > 0;
+          ch.deathReason = waitingOnClient ? `reap:client-wait${at}` : `stall:upstream${at}`;
+          if (waitingOnClient) ch.error = `Client tool_result never returned — gave up after ${secs || '?'}s (Cursor idle)`;
+        } else {
+          ch.deathReason = `worker:${msg.errorKind || 'error'}`;
+        }
         ch.deathAt = Date.now();
         ch.deathRequestId = ch.currentRequestId || null;
       }

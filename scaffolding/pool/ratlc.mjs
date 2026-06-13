@@ -983,6 +983,36 @@ async function cmdFailures(args) {
   }
 }
 
+// ratlc inspect <ch> — "why is THIS channel stuck right now": joins the pool
+// snapshot + /requests + token into one dump, incl. the outstanding tools' args.
+async function cmdInspect(args) {
+  const id = args[0];
+  if (!id) { console.error('usage: ratlc inspect <ch-id>'); process.exit(1); }
+  let snap;
+  try { snap = await getStatus(); } catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
+  const ch = (snap.pool?.channels || []).find((c) => c.id === id);
+  if (!ch) { console.error(`channel ${id} not present (respawned?)`); process.exit(1); }
+  let reqs; try { reqs = await getRequests(500); } catch { reqs = { items: [] }; }
+  const req = (reqs.items || []).find((r) => r.requestId === ch.currentRequestId);
+  const tok = (snap.pool?.tokens || [])[ch.tokenIdx];
+  const s = (ms) => ms == null ? '-' : Math.round(ms / 1000) + 's';
+  console.log(color(ch.id, ANSI.bold) + `  ${stateLabel(ch)}  silent=${s(ch.progressGapMs)}  busy=${s(ch.busyForMs)}  age=${s(ch.openedAgoMs)}  group=${ch.group}`);
+  if (ch.deathReason) console.log('  death: ' + color(ch.deathReason, ANSI.red) + (ch.error ? '  (' + String(ch.error).slice(0, 80) + ')' : ''));
+  const pt = ch.pendingTools || [];
+  if (pt.length) {
+    console.log(`  waiting on ${color(String(pt.length), ANSI.blue)} tool_result(s):`);
+    for (const t of pt) console.log(`    ${t.provided ? color('✓', ANSI.green) : color('·', ANSI.yellow)} ${t.toolName}${t.subagentType ? ':' + t.subagentType : ''}${t.argPreview ? '  ' + color(t.argPreview, ANSI.dim) : ''}`);
+  }
+  if (req) {
+    const mb = req.textBytes ? (req.textBytes / 1048576).toFixed(1) + 'MB' : '-';
+    const trouble = (req.retryCount > 0 || req.lastRetrySymptom) ? color(`retries=${req.retryCount || 0}${req.lastRetrySymptom ? ' (' + req.lastRetrySymptom + ')' : ''}`, ANSI.yellow) : `retries=0`;
+    console.log(`  request ${req.requestId}: status=${req.status} ${trouble} payload=${mb} firstByte=${s(req.firstByteMs)} reinject=${req.reinjectTurns || 0}`);
+  } else if (ch.currentRequestId) {
+    console.log(`  request ${ch.currentRequestId}: (not in recent /requests window)`);
+  }
+  if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
+}
+
 async function cmdRestart(args) {
   const id = args[0];
   if (!id) {
@@ -1164,6 +1194,7 @@ const [, , cmd, ...rest] = process.argv;
       case 'ramp': return await cmdRamp(rest);
       case 'subagent': case 'subagents': return await cmdSubagent(rest);
       case 'failures': case 'requests': return await cmdFailures(rest);
+      case 'inspect': return await cmdInspect(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
       case 'stats': return await cmdStats(rest);
