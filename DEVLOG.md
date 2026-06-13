@@ -13,6 +13,7 @@ A working notebook of what we learned reverse-engineering Cursor's `agent.v1.Age
 7. `McpToolDefinition.input_schema` and `McpArgs.args` (map values) changed from `bytes` to `google.protobuf.Value` between Cursor proto versions. The proxy now passes a `Value` *object* on encode and unwraps `Value` *objects* on decode (instead of relying on `bytes`), which works under both definitions. See "Vendored proto regen" entry for the silent-drop failure mode and "decodeMcpArgs" entry for the inbound mirror.
 8. `convKey`/`bridgeKey` derive from claude-code's `x-claude-code-session-id` header (with `firstUserText` + `toolHash` salt) when present, so parallel claude-code sessions with identical prompts don't alias their bridges, and a session's WebSearch/Task subagent doesn't collide with its parent. Fallback to the older circumstantial-hash scheme for non-claude-code callers. See "convKey collision fix" + "convKey v2 subagent regression" entries.
 9. **WebFetch through the proxy works end-to-end.** **WebSearch does not** — claude-code's WebSearch is an Anthropic-server-side tool that bypasses the model's tool-use path; with `ANTHROPIC_BASE_URL=our-proxy` it has no reachable backend. Use an MCP web-search server (Brave/SerpAPI/etc.) if you need real search through this stack.
+10. **Sub-agents (claude-code `Task`) work through the proxy but are OFF by default.** Cursor's native subagent frame (`subagent_args=28`) is normalized to a client-valid `Task` call in `buildSubagentToolArgsFromWire` (`subagent_type`→`general-purpose`, Cursor model slug dropped — else claude-code throws `Invalid tool parameters`). `RATLC_SUBAGENT_SUPPORT=0` (launch.yaml default) makes the proxy reject the frame so the model works inline; toggle live with `ratlc subagent on/off`, `./launch.sh subagent`, or the TUI `[g]` key. A `wait-tool` channel gets its own reap ceiling (`RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS`) so a slow client tool / sub-agent isn't SIGTERMed mid-run, and its SILENT cell names what it's waiting on (`Task 280s` / `1/3 120s`). See "Sub-agent (Task) support …" entry.
 
 ---
 
@@ -2465,6 +2466,47 @@ storm itself; that's the token-refresh problem (without it you'll still see
   (`→ upstream error AFTER partial content … finalizing gracefully`) → ended
   with `message_stop`. **All 6 ended with message_stop, zero bare error
   events.**
+
+---
+
+## Sub-agent (Task) support, wait-tool watchdog split, and pool observability (2026-06-13)
+
+Shipped together in commit `f1fc4bf` on `feat/ratlc-mvp`.
+
+### 1. Sub-agents were rejected client-side with "Invalid tool parameters"
+
+Symptom: a claude-code user behind the proxy asks for a multi-agent team; every `Task` launch fails with `Invalid tool parameters` and no sub-agent starts.
+
+Root cause: in `POOL_TOOL_MODE=translate` the model IS Cursor, using Cursor's *native* sub-agent. When it spawns one, Cursor emits a native subagent frame (`ExecServerMessage` field 28 = `subagent_args`). `handleExecMessage` (`src/cursor-agent.js`) decodes it and forwards a `Task` tool_use to claude-code — but it copied Cursor's OWN `subagent_type` (e.g. `explore`) and `model` (a backend slug like `composer-2.5-fast`) **verbatim**. claude-code validates `Task.input` against ITS schema — `model` is `enum(["sonnet","opus","haiku"]).optional()` (verified against the installed `cli.js` v2.1.107), `subagent_type` must resolve to a registered agent — so the raw Cursor values fail *before* the sub-agent runs. Same class as the "Round 2: decodeMcpArgs" bug: the proxy emitted a value the client's validator rejects.
+
+Fix: normalize in `buildSubagentToolArgsFromWire` (`src/cursor-agent.js`), the single builder shared by h1/h2/pool. `subagent_type` → clamped to `general-purpose` (the agent type present in every install; env `RATLC_SUBAGENT_TYPE_MAP="explore=Explore,…"` restores fidelity). `model` → kept only if it is a real client keyword (sonnet/opus/haiku; **not** `fable` — verified absent from the enum), else dropped so the child inherits the parent. `resume` dropped unless `RATLC_SUBAGENT_FORWARD_RESUME=1` (an unknown prop is itself a validation-failure vector). Verified e2e: a real `claude -p` parent→child→parent loop returned the child's sentinel; pool log shows `subagent passthrough type:explore→general-purpose model:composer-2.5-fast→(inherit)`.
+
+### 2. Parent-model pin (optional, off by default)
+
+Dropping `model` makes claude-code *inherit* — but that's the client's behaviour, and in a multi-group pool the child's fresh request can route elsewhere. `RATLC_SUBAGENT_INHERIT_PARENT_MODEL=1` pins it at the proxy: each session's first (main-agent) model is remembered, and any sub-agent turn in that session (same `x-claude-code-session-id`, distinct `convKey`, carrying tools) is re-routed to that model/group before the pool routes. `scaffolding/pool/subagent-model-pin.mjs`.
+
+### 3. Sub-agent support toggle (OFF by default)
+
+`RATLC_SUBAGENT_SUPPORT` gates the feature. `0` → `handleExecMessage` takes the rejection path even with passthrough on, so the Cursor model gets "sub-agents disabled" and does the work INLINE (no Task reaches the client → no orphaned wait-tool — cleaner than the original bug, which left the parent hanging). `opts.subagentSupport` accepts a boolean OR a `()=>bool` getter, so the bridge-worker passes a live getter and the pool-manager flips it at runtime via a `set_subagent_support` IPC broadcast (also written into the fork env so respawns inherit). Surfaces: `ratlc subagent on|off|status`, `./launch.sh subagent …`, the TUI `[g]` key, `subagent=on/off/?` in the status header. **`launch.yaml` defaults it to `0`.**
+
+### 4. Wait-tool watchdog split
+
+The busy-watchdog (`pool-manager.mjs`) reaps any `state==='busy'` channel after `RATLC_BUSY_STUCK_TIMEOUT_MS` (360s). But a channel BLOCKED on the client returning tool_results (a Task sub-agent, or a slow Bash) is internally `busy` — so the watchdog was SIGTERMing the parent mid-sub-agent (observed: ch-723 reaped "stuck busy 361s" while its child was still working). There is no stuck UPSTREAM to detect there, so wait-tool now gets its own ceiling `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS` (code default 30 min; `0` = never), gated on `getPendingToolUseIdsForChannel(ch.id).length > 0`. `launch.yaml` sets 10 min (with sub-agents off there are no legit long waits).
+
+### 5. Observability — self-diagnose stuck channels without a log grep
+
+Driven by a multi-agent audit + adversarial review (verdict: accept-with-fixes) after repeated incidents (ch-723/871/879, later ch-256/260/282) where every diagnostic fact lived only in the 236 MB pool.log. All small field-plumbing of data that already existed one layer down:
+- wait-tool SILENT cell NAMES the tool: `Task 280s` (lone) / `1/3 120s` (provided-of-total, climbs = progress) — new `pendingTools` snapshot field (`toolName` from `toolUseIndex`, `provided` from `heldToolResultsByChannel.providedById`). `scaffolding/pool/tui-format.mjs`.
+- `ratlc failures [N]` — recent not-ok requests from the existing `/requests` endpoint (finished-only: requires `endedAt != null`, else mid-stream transient statuses false-positive under load).
+- reap/death reason on dead channels: `reap:wait-tool@Ns` / `worker:quota_exhausted`, red in the ERROR column.
+- dead-token tally `tok-dead=N/total` in the status header (was buried in the token sub-table).
+- TUI `?` opens a full keymap overlay.
+
+### Diagnostic pattern (reusable)
+
+A channel parked in wait-tool for many minutes showing `0/N <s>!` (or `Task <s>`) with every pendingTool `provided:false` = the **claude-code client abandoned the conversation mid-tool-batch** (closed / Ctrl-C'd after the model emitted its tools). The proxy correctly holds it until the wait-tool ceiling. Clear with `ratlc restart ch-N` (or TUI `k`).
+
+Tests: `tests/src/forward-compatible-exec-test.js` (normalizer + toggle), `tests/pool/subagent-model-pin-test.mjs`, `scaffolding/pool/tui-format-test.mjs`.
 
 ---
 

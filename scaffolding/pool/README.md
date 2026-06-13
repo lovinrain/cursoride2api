@@ -19,7 +19,7 @@ the rest of each channel's lifetime.
 | **`pool-manager.mjs`** | Forks N `bridge-worker` children, maintains the pool, pings idle channels every 20 min, auto-respawns dead ones. Listens on `/tmp/ratlc-pool.sock`. | High — restarting loses all warm channels |
 | **`bridge-worker.mjs`** *(child)* | Owns one Cursor `RunSSE` stream + matching `BidiAppend` POSTs. Managed by the pool. | Auto-respawn |
 | **`api-server.mjs`** | HTTP `:4242` serving `/v1/messages` (Anthropic format). Stateless. | **Free** — restart anytime, pool stays up |
-| **`ratlc`** (unified CLI) | Single entry point: `up`, `down`, `status`, `watch`, `tui`, `ramp`, `restart`, `claude`, `tail`, `metrics`, `logs` | n/a |
+| **`ratlc`** (unified CLI) | Single entry point: `up`, `down`, `status`, `watch`, `tui`, `ramp`, `restart`, `subagent on\|off\|status`, `failures [N]`, `claude`, `tail`, `metrics`, `logs` | n/a |
 
 ## Recommended launch (for claude-code use)
 
@@ -121,6 +121,32 @@ is re-routed to that model/group *before* the pool routes. So multi-agent always
 runs on your strong model instead of Cursor's cheap Composer default, even across
 groups. Tool-less background calls (title/topic/quota) are left untouched. Default
 off; the `subagent-model-pin: X → Y` log line shows each override.
+
+## Diagnosing stuck channels (no log grep)
+
+`ratlc status` / `ratlc tui` are meant to answer "what is this channel doing?" at a
+glance. The **SILENT** column on a `wait-tool` channel tells you what it's blocked on:
+
+| SILENT cell | meaning |
+|---|---|
+| `Bash 12s` / `Read 8s` | one client tool outstanding, named (fast tools — should clear quickly) |
+| `Task 280s` | blocked on a sub-agent (Task) for 280s |
+| `1/3 120s` | a 3-tool parallel batch, 1 result back, 2 pending — **watch the count climb = progressing** |
+| `0/5 1650s!` | 5 pending, **nothing returned** for 27 min — almost always an abandoned client (red `!` = near the reap ceiling) |
+
+A dead channel's **ERROR** column shows *why* it died: `reap:wait-tool@361s`,
+`reap:busy@250s`, or `worker:quota_exhausted` (red). The header shows
+`⚠tok-dead=N/total` when tokens are quota-dead (your main capacity limiter).
+
+- **`ratlc failures [N]`** — recent not-ok requests (rate-limit, empty turn, stale
+  tool_result, errors) straight from `/requests`, so you don't tail `api.log`.
+- **`ratlc tui` → press `?`** — full keymap overlay.
+
+**Most common stuck pattern:** a channel parked in `wait-tool` for minutes with
+`0/N` and nothing returned = the **claude-code client abandoned the conversation
+mid-tool-batch** (closed / Ctrl-C'd after the model emitted tool calls). The proxy
+correctly holds it until `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS`. Clear it now with
+`ratlc restart ch-N` (or the TUI `k` key).
 
 ## Testing toolchain
 
