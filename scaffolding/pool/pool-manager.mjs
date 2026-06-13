@@ -639,7 +639,16 @@ function handleWorkerMessage(ch, msg) {
       // dead row in the TUI tells a uniform story (and gets the red treatment),
       // not just watchdog reaps.
       if (msg.state === 'dead') {
-        ch.deathReason = `worker:${msg.errorKind || 'error'}`;
+        // Classify the death so the ERROR column is unambiguous. An "Upstream
+        // stalled — no progress for Ns" exit (the bridge-worker's own stall
+        // detector — Cursor went silent) reads as `stall:upstream@Ns`, distinct
+        // from auth/quota worker deaths (`worker:quota_exhausted`) and from a
+        // pool-side `reap:wait-tool@Ns`. These three are very different stories.
+        const errStr = String(msg.error || '');
+        const secs = (errStr.match(/(\d+)\s*s\b/) || [])[1];
+        ch.deathReason = /stall|no progress/i.test(errStr)
+          ? `stall:upstream${secs ? '@' + secs + 's' : ''}`
+          : `worker:${msg.errorKind || 'error'}`;
         ch.deathAt = Date.now();
         ch.deathRequestId = ch.currentRequestId || null;
       }
