@@ -49,6 +49,13 @@ RATLC_CONSTANT_INTERVAL_MS: 500                # interval between attempts in co
 # back to the spoof / confabulation path. Always keep this on.
 RATLC_PASSTHROUGH_NATIVE: 1
 
+# ── Sub-agent (Task) support ────────────────────────────────────────────────
+# 0 = OFF by default: the proxy rejects Cursor's native sub-agent frames so the
+# model does the work INLINE in the main agent (no Task reaches claude-code, no
+# orphaned wait-tool channel, no extra channel/token burn). Flip at runtime with
+# `./launch.sh subagent on|off|status`, the TUI [g] key, or `ratlc subagent on`.
+RATLC_SUBAGENT_SUPPORT: 0
+
 # Emit a visible `[Cursor WebSearch] <query>` text delta in the SSE stream so
 # you can see in claude-code's TUI when Cursor backend ran a search. Set to 0
 # to keep the SSE clean and rely on the `server_tool_use` content block alone.
@@ -172,6 +179,14 @@ RATLC_NO_VISIBLE_LIVENESS_GRACE_MS: 90000      # liveness-gap: hung if NO frame 
 # CURSOR_LOG_INTERACTION: 1                    # log every InteractionQuery decision (approve/reject/abandon)
 # POOL_TOOL_USE_WATCHDOG_MS: 1000              # parallel-tools finalize watchdog (default 1000)
 RATLC_BUSY_STUCK_TIMEOUT_MS: 360000            # busy-watchdog reap threshold (6min) — MUST exceed NO_VISIBLE ceiling (5min) above, else it SIGTERMs the slow-but-alive channel at 4min before first byte (default was 240000)
+
+# wait-tool reap: a channel BLOCKED on the client returning tool_results gets its
+# OWN (longer) ceiling, separate from BUSY_STUCK (no stuck upstream to detect).
+# Code default is 30min (protects slow sub-agents). With sub-agents OFF there are
+# no legitimate long waits, so 10min reclaims abandoned-client channels (observed:
+# ch-256/260/282 parked 10-27min after a claude-code session was closed mid-batch)
+# while still covering a long Bash/WebFetch. Raise it if you re-enable sub-agents.
+RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS: 600000       # 10min; 0 = never reap while waiting on the client
 
 # ── Per-model-type watchdog thresholds (fast vs non-fast) ───────────────────
 # "fast" = the `-fast` accelerator in the model name (both current models are

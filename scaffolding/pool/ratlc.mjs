@@ -122,6 +122,27 @@ async function getStats() {
   });
 }
 
+// Recent request log (already collected by the api-server: status/error/model/
+// routeModel/clientSessionId). Mirrors getStats's strict non-2xx handling.
+async function getRequests(limit = 200) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), 5000);
+    http.get(API_URL + '/requests?limit=' + limit, (res) => {
+      let buf = '';
+      res.on('data', (c) => { buf += c.toString(); });
+      res.on('end', () => {
+        clearTimeout(t);
+        if ((res.statusCode || 0) >= 300) { reject(new Error('HTTP ' + res.statusCode)); return; }
+        try {
+          const j = JSON.parse(buf);
+          if (!j || typeof j !== 'object' || j.error) { reject(new Error(String((j && j.error) || 'bad requests body'))); return; }
+          resolve(j);
+        } catch (e) { reject(e); }
+      });
+    }).on('error', (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 // ── process management ───────────────────────────────────────────────────
 async function isProcAlive(pidFile) {
   try {
@@ -343,6 +364,7 @@ function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
   const { thinking: thinkingCount, waitTool: waitToolCount, busy: busySilent } = countSplit(pool.channels, pool.busyCount);
+  const deadToks = (pool.tokens || []).filter((t) => t.dead).length;
   const counts = [
     `ready=${color(pool.readyCount, ANSI.green)}`,
     `thinking=${color(thinkingCount, ANSI.cyan)}`,
@@ -350,10 +372,13 @@ function printStatus(snap) {
     `busy=${color(busySilent, ANSI.yellow)}`,
     `opening=${color(pool.openingCount, ANSI.cyan)}`,
     `dead=${color(pool.deadCount, pool.deadCount ? ANSI.red : ANSI.gray)}`,
-  ].join('  ');
-  console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
+  ];
+  // A dead token will fail every channel that rotates onto it — surface it in the
+  // header so token exhaustion is visible at a glance, not buried in the token table.
+  if (deadToks) counts.push(color(`⚠tok-dead=${deadToks}/${pool.tokens.length}`, ANSI.red));
+  console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts.join('  ')}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const groupCount = (pool.groups || []).length;
-  console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}`);
+  console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}  subagent=${config.subagentSupport == null ? color('?', ANSI.gray) : (config.subagentSupport ? color('on', ANSI.green) : color('off', ANSI.red))}`);
   const wd0 = resolveWatchdog(config);
   if (wd0.livenessGapMs) console.log(color(`SILENT n/${Math.round(wd0.livenessGapMs / 1000)}s = upstream silent → retry near threshold (empty turn may fire sooner); wait-tool = waiting on client tool; reap ${Math.round((wd0.busyStuckMs || 0) / 1000)}s`, ANSI.dim));
   if (pool.groups?.length) {
@@ -388,7 +413,9 @@ function printStatus(snap) {
       String(ch.openAttempts || 0), fmtAgo(ch.openedAt), fmtAgo(ch.lastActivityAt),
       String(ch.roundsServed || 0),
       ch.currentRequestId ? ch.currentRequestId.slice(0, 20) : '-',
-      ch.error ? String(ch.error).slice(0, 28) : '',
+      (ch.state === 'dead' && ch.deathReason)
+        ? color((ch.deathReason + (ch.error ? ' ' + String(ch.error).slice(0, 12) : '')).slice(0, 28), ANSI.red)
+        : (ch.error ? String(ch.error).slice(0, 28) : ''),
     ];
     const out = row.map((v, i) => {
       const raw = String(v).replace(/\x1b\[[0-9;]*m/g, '');
@@ -419,6 +446,7 @@ async function cmdTui() {
   const poolLines = [];
   let dirty = true;
   let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats'
+  let showHelp = false;          // '?' toggles a full keymap overlay
   // Throttle the /v1/_stats fetch: render fires on every `dirty` flip (log
   // activity, keypresses, the 1s tick) — up to ~4×/s — but latency percentiles
   // don't need sub-second refresh. Cache so the band/detail fetch is decoupled
@@ -515,8 +543,18 @@ async function cmdTui() {
     }
     if (sub === 'restart') { spawnRatlc(['restart', ...args]); return; }
     if (sub === 'help' || sub === '?') {
-      cmdResult = 'cmds: down · up [N] [translate|contract] [concurrent=N] [include=...] · ramp ±N · restart [ch-N] · help · q';
+      cmdResult = 'cmds: down · up [N] [translate|contract] · ramp ±N · subagent on|off · restart [ch-N] · help · q  (press ? for full keymap)';
       dirty = true;
+      return;
+    }
+    if (sub === 'subagent' || sub === 'subagents') {
+      const a = (args[0] || 'toggle').toLowerCase();
+      if (a === 'status') {
+        getStatus().then((s) => { const v = s?.config?.subagentSupport; cmdResult = 'subagent: ' + (v == null ? '?' : (v ? 'on' : 'off')); dirty = true; }).catch((e) => { cmdResult = '✗ ' + e.message; dirty = true; });
+        return;
+      }
+      const value = a === 'on' ? true : a === 'off' ? false : 'toggle';
+      poolRequest({ type: 'set_subagent_support', value }).then((r) => { cmdResult = '✓ ' + (r.message || 'subagent ' + a); dirty = true; }).catch((e) => { cmdResult = '✗ subagent: ' + e.message; dirty = true; });
       return;
     }
     if (sub === 'claude') { cmdResult = '(run `ratlc claude` from a separate terminal)'; dirty = true; return; }
@@ -554,6 +592,9 @@ async function cmdTui() {
       return;
     }
     // Normal-mode hotkeys
+    // Keymap overlay: '?' opens it; while open, ANY key just closes it (modal).
+    if (showHelp) { showHelp = false; dirty = true; return; }
+    if (key === '?') { showHelp = true; dirty = true; return; }
     if (key === 'q' || key === '') return exitTui(0);
     if (key === ':') { cmdMode = true; cmdBuffer = ''; cmdHistoryIdx = -1; dirty = true; return; }
     if (key === '1') { viewMode = 'split'; dirty = true; return; }
@@ -563,6 +604,7 @@ async function cmdTui() {
     if (key === '5') { viewMode = 'stats'; dirty = true; return; }
     if (key === 'r') { poolRequest({ type: 'ramp_up', count: 1 }).then(() => { cmdResult = '✓ ramp +1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp+1: ' + e.message; dirty = true; }); return; }
     if (key === 'R') { poolRequest({ type: 'ramp_down', count: 1 }).then(() => { cmdResult = '✓ ramp -1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp-1: ' + e.message; dirty = true; }); return; }
+    if (key === 'g') { poolRequest({ type: 'set_subagent_support', value: 'toggle' }).then((r) => { cmdResult = '✓ ' + (r.message || 'subagent toggled'); dirty = true; }).catch((e) => { cmdResult = '✗ subagent: ' + e.message; dirty = true; }); return; }
     if (key === 'k') {
       getStatus().then((s) => {
         const c = s.pool.channels.find((c) => c.state === 'opening' || c.state === 'dead') || s.pool.channels[0];
@@ -594,10 +636,11 @@ async function cmdTui() {
     out.push('Pool ' + color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold) + '  ' + counts + '  pending=' + pool.pendingRequests + '  tool_use_held=' + pool.toolUseIndex);
     const groups = Array.isArray(pool.groups) ? pool.groups : [];
     const multiGroup = groups.length > 1;
+    const subagentCell = '  subagent ' + (config.subagentSupport == null ? color('?', ANSI.gray) : (config.subagentSupport ? color('on', ANSI.green) : color('off', ANSI.red)));
     if (multiGroup) {
-      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  groups=' + color(String(groups.length), ANSI.bold) + ' (default=' + (config.model || groups.find((g) => g.isDefault)?.model || '?') + ')  parallel-opens=' + (config.concurrentOpens || 1));
+      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  groups=' + color(String(groups.length), ANSI.bold) + ' (default=' + (config.model || groups.find((g) => g.isDefault)?.model || '?') + ')  parallel-opens=' + (config.concurrentOpens || 1) + subagentCell);
     } else {
-      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1));
+      out.push('Mode ' + color(config.toolMode, ANSI.bold) + '  model=' + config.model + '  parallel-opens=' + (config.concurrentOpens || 1) + subagentCell);
     }
     const wd = resolveWatchdog(config);
     if (wd.livenessGapMs) {
@@ -750,8 +793,28 @@ async function cmdTui() {
     return [
       color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
       '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') +
-      '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[q]', ANSI.cyan) + ' quit',
+      '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[g]', ANSI.cyan) + ' subagent ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[?]', ANSI.cyan) + ' keymap ' + color('[q]', ANSI.cyan) + ' quit',
       color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
+    ];
+  }
+
+  function buildHelpLines() {
+    const k = (s) => color(s, ANSI.cyan + ANSI.bold);
+    const d = (s) => color(s, ANSI.dim);
+    return [
+      color('  RATLC TUI — keymap', ANSI.bold),
+      '',
+      '  ' + d('views  ') + '  ' + k('1') + ' split   ' + k('2') + ' api   ' + k('3') + ' pool   ' + k('4') + ' status   ' + k('5') + ' stats',
+      '  ' + d('keys   ') + '  ' + k('r') + ' ramp +1   ' + k('R') + ' ramp -1   ' + k('k') + ' restart a stuck channel',
+      '           ' + k('g') + ' toggle sub-agents on/off   ' + k('?') + ' this keymap   ' + k('q') + ' quit',
+      '  ' + d('command') + '  ' + k(':') + ' ' + d('up [N] [translate|contract] · down · ramp ±N [--group=M]'),
+      '             ' + d('subagent on|off|status · restart [ch-N] · help'),
+      '',
+      '  ' + d('CLI / launch.sh (outside the TUI)'),
+      '    ' + d('ratlc status · failures [N] · subagent on|off|status · ramp ±N · tail · metrics'),
+      '    ' + d('./launch.sh up|down|status|tui · ./launch.sh subagent on|off · ./launch.sh edit'),
+      '',
+      d('  press ? or any key to close'),
     ];
   }
 
@@ -787,6 +850,11 @@ async function cmdTui() {
     const ts = new Date().toISOString().slice(11, 19);
     const hdr = header(ts);
     for (const line of hdr) console.log(line);
+
+    if (showHelp) {
+      for (const l of buildHelpLines()) console.log(l);
+      drawCmdBar(cols); return;
+    }
 
     // command bar takes 2 lines at the bottom
     const cmdBarLines = 2;
@@ -854,6 +922,53 @@ async function cmdRamp(args) {
     process.exit(1);
   }
   console.log(r.message || JSON.stringify(r));
+}
+
+// ratlc subagent <on|off|status> — toggle native Task sub-agent support at runtime.
+async function cmdSubagent(args) {
+  const action = String(args[0] || 'status').toLowerCase();
+  if (action === 'status') {
+    const s = await getStatus();
+    const on = s?.config?.subagentSupport;
+    console.log(`subagent support: ${on ? color('ON', ANSI.green) : color('OFF', ANSI.red)}`);
+    return;
+  }
+  let value;
+  if (['on', 'enable', 'enabled', '1', 'true', 'yes'].includes(action)) value = true;
+  else if (['off', 'disable', 'disabled', '0', 'false', 'no'].includes(action)) value = false;
+  else { console.error('usage: ratlc subagent <on|off|status>'); process.exit(1); }
+  const r = await poolRequest({ type: 'set_subagent_support', value });
+  if (r?.type === 'error') { console.error(color('error: ' + (r.message || 'unknown'), ANSI.red)); process.exit(1); }
+  console.log(r.message || JSON.stringify(r));
+}
+
+// ratlc failures [N] — recent not-ok requests (rate-limits, empty turns, errors,
+// invalid params) straight from /requests, so you don't grep api.log.
+async function cmdFailures(args) {
+  const limit = parseInt(args[0] || '200', 10);
+  let data;
+  try { data = await getRequests(Number.isFinite(limit) ? limit : 200); }
+  catch (e) { console.error(color('requests unavailable: ' + e.message + ' (is the api-server up?)', ANSI.red)); process.exit(1); }
+  const all = data.items || [];
+  // Show anything that is NOT a normal/in-progress state (exclusion is robust to
+  // the status vocabulary growing) — catches error, upstream_rate_limit,
+  // empty_assistant_turn, stale_tool_result, timeouts, and any unknown status.
+  const NORMAL = new Set(['ok', 'completed', 'queued', 'streaming', 'waiting_tool_result', 'done', 'sent']);
+  // Only flag FINISHED requests (endedAt set). The api-server mutates a request's
+  // status through transient mid-stream states (thinking/tool_use/forwarded/…) that
+  // aren't in NORMAL; without this guard a healthy in-flight request would be
+  // mis-reported as a failure under load. endedAt is null while in-flight.
+  const bad = all.filter((r) => (r.error || (r.status && !NORMAL.has(r.status))) && r.endedAt != null);
+  const waiting = all.filter((r) => r.status === 'waiting_tool_result').length;
+  console.log(`requests: ${data.count} logged · scanned last ${all.length} · ${color(String(bad.length), bad.length ? ANSI.red : ANSI.green)} not-ok · ${waiting} waiting-on-tool`);
+  if (!bad.length) { console.log(color('  ✓ no failures in the window', ANSI.green)); return; }
+  console.log(color('  AGE    STATUS              REQUEST           MODEL→ROUTE                     ERROR', ANSI.dim));
+  for (const r of bad) {
+    const age = r.ageMs < 60000 ? Math.round(r.ageMs / 1000) + 's' : Math.round(r.ageMs / 60000) + 'm';
+    const route = (r.model || '?') + (r.routeModel && r.routeModel !== r.model ? '→' + r.routeModel : '');
+    const sc = /rate|limit|throttl/i.test(String(r.status || '')) ? ANSI.yellow : ANSI.red;
+    console.log(`  ${age.padStart(5)}  ${color(String(r.status || '?').padEnd(18), sc)}  ${String(r.requestId || '-').slice(0, 16).padEnd(16)}  ${route.slice(0, 30).padEnd(30)}  ${String(r.error || '').slice(0, 48)}`);
+  }
 }
 
 async function cmdRestart(args) {
@@ -1035,6 +1150,8 @@ const [, , cmd, ...rest] = process.argv;
       case 'tui': return await cmdTui();
       case 'tail': return await cmdTail();
       case 'ramp': return await cmdRamp(rest);
+      case 'subagent': case 'subagents': return await cmdSubagent(rest);
+      case 'failures': case 'requests': return await cmdFailures(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
       case 'stats': return await cmdStats(rest);

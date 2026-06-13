@@ -742,16 +742,83 @@ function summarizeSubagentToolResult(content) {
   };
 }
 
+// ── Subagent (Task) arg normalization ──────────────────────────────────────
+// Cursor's native subagent frame carries Cursor's OWN `model` (a backend slug)
+// and `subagent_type` (e.g. lowercase 'explore'). Claude Code validates the
+// Task tool_use against ITS schema — a small `model` keyword enum and the agent
+// types registered in the client — so the raw Cursor values fail client-side
+// with "Invalid tool parameters" BEFORE the sub-agent ever runs, and no retry by
+// the model can fix it (the break is downstream of the model). Normalize to
+// client-valid values so the already-wired passthrough + result round-trip
+// (nativeExecKinds → sendForwardCompatibleSubagentResult) can actually execute.
+// Directly analogous to the mcp_WebFetch bytes↔Value fix — see DEVLOG
+// "Round 2: decodeMcpArgs had the same bytes-vs-Value mismatch".
+// Claude Code's Task `model` is enum(["sonnet","opus","haiku"]).optional() —
+// verified against the installed client (cli.js). This list MUST stay in lockstep
+// with that enum: forwarding a value NOT in the client enum fails validation (zod
+// throws invalid_enum_value), re-introducing the very bug we fix. Override via
+// RATLC_SUBAGENT_MODEL_KEYWORDS (comma-separated) to track future enum additions
+// without a code change. (Note: 'fable' is deliberately NOT here — not a Task enum member.)
+const DEFAULT_SUBAGENT_MODEL_KEYWORDS = 'sonnet,opus,haiku';
+
+function _parseSubagentTypeMap(spec) {
+  const map = new Map();
+  for (const pair of String(spec || '').split(',')) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const k = pair.slice(0, eq).trim().toLowerCase();
+    const v = pair.slice(eq + 1).trim();
+    if (k && v) map.set(k, v);
+  }
+  return map;
+}
+
+// Map a Cursor subagent type onto a client-valid agent type. Default target is
+// `general-purpose` (the one agent type guaranteed to exist in every Claude Code
+// install), so an unknown/edge value can never re-introduce the validation
+// failure. Operators who know their installed agents restore fidelity via
+// RATLC_SUBAGENT_TYPE_MAP="explore=Explore,plan=Plan,code-review=code-reviewer".
+function normalizeSubagentType(raw) {
+  const def = (process.env.RATLC_SUBAGENT_TYPE_DEFAULT || 'general-purpose').trim() || 'general-purpose';
+  const key = String(raw || '').trim().toLowerCase();
+  if (!key) return def;
+  const userMap = _parseSubagentTypeMap(process.env.RATLC_SUBAGENT_TYPE_MAP);
+  if (userMap.has(key)) return userMap.get(key);
+  if (key === 'general-purpose' || key === 'general' || key === 'general_purpose') return 'general-purpose';
+  return def;
+}
+
+// Keep `model` only when it is already a Claude Code model keyword; otherwise
+// drop it so the sub-agent inherits the parent model. Cursor sends backend slugs
+// (e.g. 'claude-4-sonnet-thinking') that the client's `model` enum rejects.
+// RATLC_SUBAGENT_FORWARD_MODEL=0 forces drop even for keyword matches.
+function normalizeSubagentModel(raw) {
+  if (process.env.RATLC_SUBAGENT_FORWARD_MODEL === '0') return '';
+  const key = String(raw || '').trim().toLowerCase();
+  if (!key) return '';
+  const keywords = (process.env.RATLC_SUBAGENT_MODEL_KEYWORDS || DEFAULT_SUBAGENT_MODEL_KEYWORDS)
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return keywords.includes(key) ? key : '';
+}
+
 function buildSubagentToolArgsFromWire(argsBytes) {
   const decoded = decodeSubagentArgs(argsBytes);
   const prompt = decoded.prompt || '';
-  const subagentType = decoded.subagentType || '';
-  const modelId = decoded.modelId || '';
-  const description = firstNonEmptyLine(prompt).slice(0, 80) || subagentType || 'Cursor subagent';
-  const args = { description, prompt };
-  if (subagentType) args.subagent_type = subagentType;
-  if (modelId) args.model = modelId;
-  if (decoded.resumeAgentId) args.resume = decoded.resumeAgentId;
+  const rawType = decoded.subagentType || '';
+  const description = firstNonEmptyLine(prompt).slice(0, 80) || rawType || 'Cursor subagent';
+  // subagent_type is the defining Task parameter (required by claude-code's Task
+  // in current builds), so always emit it — always normalized to a valid value.
+  const args = { description, prompt, subagent_type: normalizeSubagentType(rawType) };
+  const model = normalizeSubagentModel(decoded.modelId || '');
+  if (model) args.model = model;
+  // `resume` is not part of every client's Task schema; an unknown property is
+  // itself a validation-failure vector, so forward only on explicit opt-in.
+  if (decoded.resumeAgentId && process.env.RATLC_SUBAGENT_FORWARD_RESUME === '1') {
+    args.resume = decoded.resumeAgentId;
+  }
+  // decoded.parentConversationId (field 9) is intentionally NOT forwarded: Claude
+  // Code's Task schema has no such field. Matches the pre-fix behavior (the old
+  // args object never carried it either) — decode-without-forward is not an oversight.
   return {
     decoded,
     args,
@@ -1823,9 +1890,24 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
 
   const subagentArgsBytes = !msgCase ? getUnknownLengthDelimitedPayload(execMsg, 28) : null;
   if (subagentArgsBytes) {
-    if (passthroughNative && nativeExecKinds) {
+    // Sub-agent support is toggleable. opts.subagentSupport may be a boolean
+    // (launch flag) OR a () => boolean getter (so the bridge can flip it live at
+    // runtime without re-opening the stream). Default ON. When OFF, reject the
+    // native subagent so the Cursor model does the work INLINE — no Task reaches
+    // the client, so there is no orphaned wait-tool (cleaner than the old bug,
+    // which left the parent channel hanging).
+    const ssOpt = opts ? opts.subagentSupport : undefined;
+    const subagentSupported = typeof ssOpt === 'function' ? ssOpt() !== false : ssOpt !== false;
+    if (subagentSupported && passthroughNative && nativeExecKinds) {
       const subagent = buildSubagentToolArgsFromWire(subagentArgsBytes);
       nativeExecKinds.set(execId, { kind: 'subagent', ...subagent.decoded });
+      if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+        console.log(
+          `[cursor-agent] subagent passthrough execId=${execId || '(empty)'} ` +
+          `type:${subagent.decoded.subagentType || '(none)'}→${subagent.args.subagent_type} ` +
+          `model:${subagent.decoded.modelId || '(none)'}→${subagent.args.model || '(inherit)'}`
+        );
+      }
       onMcpCall({
         id,
         execId,
@@ -1835,9 +1917,15 @@ function handleExecMessage(execMsg, mcpToolDefs, sendBinaryFrame, onMcpCall, opt
       });
       return 'subagent-passthrough';
     }
-    const resultPayload = buildSubagentErrorResultPayload('Cursor subagent execution is not available in this proxy transport.');
+    const reason = subagentSupported
+      ? 'Cursor subagent execution is not available in this proxy transport.'
+      : 'Sub-agents are disabled on this proxy. Do not spawn a sub-agent — perform the task directly in the current agent.';
+    if (!subagentSupported && process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+      console.log(`[cursor-agent] subagent DISABLED — rejecting execId=${execId || '(empty)'}`);
+    }
+    const resultPayload = buildSubagentErrorResultPayload(reason);
     sendRawExecClientMessageAndClose(id, execId, 28, resultPayload, sendBinaryFrame);
-    return 'subagent-rejected';
+    return subagentSupported ? 'subagent-rejected' : 'subagent-disabled';
   }
 
   // ── Reject native Cursor tools so the model falls back to MCP ──
@@ -3061,6 +3149,7 @@ function startConversation(token, options = {}) {
         currentCallbacks.onMcpCall(info);
       }, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        subagentSupport: options.subagentSupport,
         nativeExecKinds: _nativeExecKinds,
         onUnhandledExec: (info) => {
           currentCallbacks.onError(info?.detail || 'unhandled Cursor exec message');
@@ -3219,6 +3308,7 @@ function startConversation(token, options = {}) {
       markUsefulFrame();
       handleInteractionQuery(msg.message.value, sendBinaryFrame, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        subagentSupport: options.subagentSupport,
         onServerToolUse: currentCallbacks.onServerToolUse,
       });
       return;

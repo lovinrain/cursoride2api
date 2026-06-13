@@ -37,11 +37,28 @@ eq('95s over threshold → 95s/90s!', silentCell(ch({ busyAt: now - 95000, lastP
 console.log('=== wait-tool ===');
 const tool = ch({ busyAt: now - 60000, lastProgressAt: now - 50000, pendingToolUseIds: ['t'] });
 eq('wait-tool → STATE wait-tool', stateLabel(tool), 'wait-tool');
-eq('wait-tool → tool 50s (calm)', silentCell(tool, WD), 'tool 50s');
+eq('wait-tool → tool 50s (calm, lone tool)', silentCell(tool, WD), 'tool 50s');
 ok('wait-tool calm = blue not red', silentCell(tool, WD).includes('\x1b[34m'), 'not blue');
 const toolNear = ch({ busyAt: now - 320000, lastProgressAt: now - 320000, pendingToolUseIds: ['t'] });
 eq('wait-tool near reap → tool 320s!', silentCell(toolNear, WD), 'tool 320s!');
 ok('wait-tool near reap = red', silentCell(toolNear, WD).includes('\x1b[31m'), 'not red');
+// Finer granularity: the outstanding-result count is shown (shrinks as the
+// sub-agent's parallel siblings return → visible progress).
+const toolMulti = ch({ busyAt: now - 30000, lastProgressAt: now - 30000, pendingToolUseIds: ['a', 'b', 'c', 'd'] });
+eq('wait-tool 4 pending → 4×30s (parallel-batch granularity)', silentCell(toolMulti, WD), '4×30s');
+// With a wait-tool-specific reap timer, busyStuckMs no longer drives the near flag.
+const wtWD = { livenessGapMs: 90000, busyStuckMs: 360000, waitToolStuckMs: 1800000, ceilingMs: 300000 };
+ok('wait-tool 320s NOT near when waitToolStuckMs=1800s', !silentCell(toolNear, wtWD).includes('!'), strip(silentCell(toolNear, wtWD)));
+
+console.log('=== wait-tool detail (snapshot pendingTools) ===');
+const dch = (pendingTools, extra = {}) => ch({ busyAt: now - 50000, lastProgressAt: now - 50000, pendingToolUseIds: pendingTools.map((p) => p.id), pendingTools, ...extra });
+eq('lone Task → names it', silentCell(dch([{ id: 'a', toolName: 'Task', subagentType: 'general-purpose', provided: false }]), WD), 'Task 50s');
+eq('lone Bash → names it', silentCell(dch([{ id: 'a', toolName: 'Bash', provided: false }]), WD), 'Bash 50s');
+eq('lone WebFetch → abbreviated', silentCell(dch([{ id: 'a', toolName: 'WebFetch', provided: false }]), WD), 'WebF 50s');
+eq('batch → provided/total (progress)', silentCell(dch([{ id: 'a', toolName: 'Task', provided: true }, { id: 'b', toolName: 'Bash', provided: false }, { id: 'c', toolName: 'Read', provided: false }]), WD), '1/3 50s');
+const dNear = ch({ busyAt: now - 320000, lastProgressAt: now - 320000, pendingToolUseIds: ['a'], pendingTools: [{ id: 'a', toolName: 'WebFetch', provided: false }] });
+ok('detailed wait-tool near-reap ≤ 11 chars', strip(silentCell(dNear, WD)).length <= 11, strip(silentCell(dNear, WD)));
+eq('no pendingTools → count-only fallback (back-compat)', silentCell(toolMulti, WD), '4×30s');
 
 console.log('=== SLIP 3: negative clock skew clamps to 0 (→ live), never negative ===');
 const skew = ch({ busyAt: now + 5000, lastProgressAt: now + 5000 }); // since in the future

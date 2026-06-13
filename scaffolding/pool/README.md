@@ -77,6 +77,51 @@ ExaSearch to fire — without it the bridge abandons every InteractionQuery
 and the model falls back to confabulation. `launch.yaml` sets this by
 default; if you launch inline make sure it's there.
 
+### Sub-agents (Task / multi-agent teams)
+
+In `translate` mode the Cursor model can spawn its own **native sub-agents**.
+The proxy forwards each one to claude-code as a `Task` tool_use so claude-code
+runs it as a real sub-agent. Cursor's native frame carries *Cursor's* values
+(`subagent_type` like `explore`/`shell`, `model` like `composer-2.5-fast`),
+which claude-code's `Task` schema rejects with **`Invalid tool parameters`** —
+so the proxy **normalizes** them (`buildSubagentToolArgsFromWire`):
+
+- `subagent_type` → clamped to `general-purpose` (the agent type present in
+  every claude-code install). Restore fidelity by mapping specific Cursor types
+  to your installed agents via `RATLC_SUBAGENT_TYPE_MAP="explore=Explore,plan=Plan"`.
+- `model` → kept only if it's a claude-code model keyword (`sonnet`/`opus`/`haiku`);
+  Cursor backend slugs are dropped so the sub-agent inherits the parent model.
+- `resume` → dropped unless `RATLC_SUBAGENT_FORWARD_RESUME=1`.
+
+Set `CURSOR_LOG_NATIVE_EXEC=1` to see each `subagent passthrough … type:X→Y model:X→Y`
+line. **Operational note:** a native sub-agent holds the *parent* channel in
+`wait-tool` while claude-code runs the child as a **separate conversation that
+needs its own free channel** — keep **≥2 free channels** (parent + child) or the
+child queues against `POOL_GROUP_WAIT_MS`. The parent sits in `wait-tool` for the
+sub-agent's whole lifetime; it is reaped on the generous `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS`
+ceiling (default 30 min), **not** the aggressive `BUSY_STUCK` reap — so a long
+sub-agent no longer gets its parent SIGTERMed mid-run. In `ratlc tui` / `ratlc status`
+a wait-tool channel shows `tool Ns` (lone tool) or `N×Ms` for a parallel batch —
+**watch `N` shrink to confirm the wait is progressing**, not stuck.
+
+**Disabling sub-agents.** Set `RATLC_SUBAGENT_SUPPORT=0` (or `ratlc subagent off`
+/ the `[g]` key in the TUI at runtime) to make the proxy reject native subagent
+frames: the Cursor model gets a "sub-agents disabled — do the work inline" error
+and completes the task in the main agent, so no Task is launched and no channel is
+left waiting. `ratlc subagent status` shows the current state.
+
+**Pinning sub-agents to the main agent's model.** Dropping the sub-agent `model`
+makes claude-code *inherit* the parent's model — but that's the client's
+behaviour, and in a **multi-group** pool a sub-agent's fresh request can still
+route to a different group. Set `RATLC_SUBAGENT_INHERIT_PARENT_MODEL=1` to make
+the proxy **guarantee** it: each claude-code session's first (main-agent) model
+is remembered, and any sub-agent turn in that session — identified natively by
+the shared `x-claude-code-session-id` + a distinct `convKey` + carrying tools —
+is re-routed to that model/group *before* the pool routes. So multi-agent always
+runs on your strong model instead of Cursor's cheap Composer default, even across
+groups. Tool-less background calls (title/topic/quota) are left untouched. Default
+off; the `subagent-model-pin: X → Y` log line shows each override.
+
 ## Testing toolchain
 
 Three scripts in this directory verify the proxy's behavior end-to-end:
@@ -131,7 +176,15 @@ the children + api-server).
 | `POOL_REINJECT_THINKING_DEBUG` | `1` | unset | Exposes `/v1/_debug/thinking_buffer` and `/v1/_debug/render` for buffer inspection. Off in normal operation. |
 | `CURSOR_AGENT_DEBUG` | `1` | unset | Per-line wire debug from cursor-agent (verbose) |
 | `CURSOR_LOG_SERVER_MSG` | `1` | unset | Log every `AgentServerMessage` case received from Cursor |
-| `CURSOR_LOG_NATIVE_EXEC` | `1` | unset | Log every native exec passthrough event |
+| `CURSOR_LOG_NATIVE_EXEC` | `1` | unset | Log every native exec passthrough event (incl. `subagent passthrough type:X→Y model:X→Y`) |
+| `RATLC_SUBAGENT_TYPE_MAP` | `cursorType=clientAgent,...` | unset | Map specific Cursor sub-agent types to your installed claude-code agents (e.g. `explore=Explore,plan=Plan`). Unmapped types fall to the default. See [§ Sub-agents](#sub-agents-task--multi-agent-teams). |
+| `RATLC_SUBAGENT_TYPE_DEFAULT` | agent name | `general-purpose` | Fallback `subagent_type` for any Cursor type not in the map. Must be an agent that exists in the target claude-code. |
+| `RATLC_SUBAGENT_MODEL_KEYWORDS` | CSV | `sonnet,opus,haiku` | The claude-code `Task` `model` enum to keep as-is (anything else is dropped → inherit parent). Extend only to track future client enum additions. |
+| `RATLC_SUBAGENT_FORWARD_MODEL` | `0` | unset | `0` forces the sub-agent `model` to always be dropped (inherit parent), even for keyword matches. |
+| `RATLC_SUBAGENT_FORWARD_RESUME` | `1` | unset | `1` forwards Cursor's `resume`/agent-id to the `Task` call. Off by default (not in every client's Task schema). |
+| `RATLC_SUBAGENT_INHERIT_PARENT_MODEL` | `1` | unset | Pin every Task sub-agent to the **main agent's** model/group (keyed on claude-code session id), so multi-agent stays on your strong model instead of routing to a cheaper/other group. See [§ Sub-agents](#sub-agents-task--multi-agent-teams). |
+| `RATLC_SUBAGENT_SUPPORT` | `0` | `1` (on) | Master switch for sub-agent support. `0` → the proxy **rejects** native subagent frames (the Cursor model does the work inline; no Task reaches the client). Toggle at runtime with `ratlc subagent on/off` or the `[g]` key in `ratlc tui` — no restart needed. `ratlc subagent status` / the TUI header show the current state. |
+| `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS` | ms (`_FAST`/`_SLOW` too) | `1800000` | Reap ceiling for a channel in **wait-tool** (blocked on the client returning tool_results, e.g. a slow sub-agent). Separate from `BUSY_STUCK` because there's no stuck upstream to detect — a long sub-agent is normal. `0` = never reap while waiting on the client (client-disconnect still frees it). |
 | `LOG_REQUEST_TOOLS` | `1` | unset | api-server logs incoming tool list per request |
 | `LOG_REQUEST_BODY` | n/a | n/a | Body summary (last-message role + content shape) is always on. |
 | `CURSOR_LOG_INTERACTION` | `1` | unset | Log every `interactionQuery` decision (WebSearch approve/reject) and backend `webSearchToolCall` byte counts |

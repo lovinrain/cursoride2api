@@ -85,6 +85,13 @@ console.log(`[bridge-worker] channel=${CHANNEL_ID} model=${MODEL} protocol=${BRI
 // Enabled when the pool runs in POOL_TOOL_MODE=translate.
 const PASSTHROUGH_NATIVE = process.env.RATLC_PASSTHROUGH_NATIVE === '1';
 
+// Sub-agent (Task) support. Default ON. Can be set at launch via
+// RATLC_SUBAGENT_SUPPORT=0 and flipped at runtime by a `set_subagent_support`
+// IPC message from pool-manager (so `ratlc subagent off` / the TUI toggle work
+// without restarting). Passed to startConversation as a live getter, so a flip
+// takes effect on the next native subagent frame without re-opening the stream.
+let subagentSupportEnabled = process.env.RATLC_SUBAGENT_SUPPORT !== '0';
+
 const YIELD_TOOL_NAME = 'bajie_yield';
 const IMAGE_ONE_SHOT_TIMEOUT_MS = parseInt(process.env.RATLC_IMAGE_ONE_SHOT_TIMEOUT_MS || '300000', 10);
 const IMAGE_ONE_SHOT_MAX_ATTEMPTS = parseInt(process.env.RATLC_IMAGE_ONE_SHOT_MAX_ATTEMPTS || '120', 10);
@@ -325,6 +332,7 @@ function startNativeImageOneShot(msg) {
         tools: oneShotTools,
         maxMode: true,
         passthroughNativeTools: PASSTHROUGH_NATIVE,
+        subagentSupport: () => subagentSupportEnabled,
         onTextDelta: (t) => {
           if (finished || attemptNo !== attempt || !t) return;
           markVisible();
@@ -406,6 +414,7 @@ function openOnce(initialPrompt, allTools) {
       tools: allTools,
       maxMode: true,
       passthroughNativeTools: PASSTHROUGH_NATIVE,
+      subagentSupport: () => subagentSupportEnabled,
       onTextDelta: (t) => { textBuf += t; },
       onMcpCall: (info) => {
         if (info.toolName === YIELD_TOOL_NAME) {
@@ -768,6 +777,14 @@ async function handleMessage(msg) {
     setState('busy');
     bridge.sendToolResult(pendingYield.id, pendingYield.execId, '[health-check] Reply with exactly: OK');
     pendingYield = null;
+    return;
+  }
+
+  if (msg.type === 'set_subagent_support') {
+    subagentSupportEnabled = msg.value !== false;
+    if (process.env.CURSOR_LOG_NATIVE_EXEC === '1') {
+      console.log(`[bridge-worker ch=${CHANNEL_ID}] subagent support → ${subagentSupportEnabled ? 'ON' : 'OFF'}`);
+    }
     return;
   }
 

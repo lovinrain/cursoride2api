@@ -46,10 +46,11 @@ export function resolveWatchdog(config) {
   const gap = typeThresholds('NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
   const ceil = typeThresholds('NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
   const busy = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
+  const waitTool = typeThresholds('WAIT_TOOL_STUCK_TIMEOUT_MS', 1800000, 1800000);
   return {
     livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow,
-    fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast },
-    slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow },
+    fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast, waitToolStuckMs: waitTool.fast },
+    slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow, waitToolStuckMs: waitTool.slow },
     adaptive,
   };
 }
@@ -69,6 +70,13 @@ function pickWd(ch, wd) {
 function silenceMs(ch) {
   const since = Math.max(ch.lastProgressAt || 0, ch.busyAt || 0);
   return since > 0 ? Math.max(0, Date.now() - since) : null;
+}
+
+// Abbreviate a tool name to ≤4 chars so the SILENT cell stays within budget
+// (`WebFetch`→`WebF`), while keeping the high-signal names readable (Task/Bash/Read).
+function abbrevTool(name) {
+  const n = String(name || 'tool');
+  return n.length <= 4 ? n : n.slice(0, 4);
 }
 
 export function stateLabel(ch) {
@@ -91,9 +99,23 @@ export function silentCell(ch, wd) {
   const s = Math.round(ms / 1000);
   const t = pickWd(ch, wd);   // per-model-type threshold (fast vs non-fast)
   if (isWaitTool(ch)) {
-    const reapMs = (t && t.busyStuckMs) || 0;
+    // wait-tool is reaped on its OWN (much longer) timer post the wait-tool
+    // watchdog split — fall back to busyStuckMs only for pre-split snapshots.
+    const reapMs = (t && (t.waitToolStuckMs ?? t.busyStuckMs)) || 0;
     const near = reapMs > 0 && ms >= 0.85 * reapMs;
-    return (near ? C.red : C.blue) + `tool ${s}s${near ? '!' : ''}` + C.reset;
+    // Finer granularity, from the snapshot's pendingTools detail when present:
+    //  • lone tool → NAME it (`Task 280s`, `Bash 12s`) — a lone sub-agent wait is
+    //    no longer an opaque `tool 280s`.
+    //  • parallel batch → `provided/total` (`1/3 120s`) — watch provided climb /
+    //    pending shrink to see the wait PROGRESSING (siblings returning), vs stuck.
+    // Falls back to the count-only form for pre-detail snapshots.
+    const detail = Array.isArray(ch.pendingTools) ? ch.pendingTools : null;
+    const pending = detail ? detail.length : ch.pendingToolUseIds.length;
+    let body;
+    if (detail && pending === 1) body = `${abbrevTool(detail[0].toolName)} ${s}s`;
+    else if (detail && pending > 1) body = `${detail.filter((d) => d.provided).length}/${pending} ${s}s`;
+    else body = pending > 1 ? `${pending}×${s}s` : `tool ${s}s`;
+    return (near ? C.red : C.blue) + body + (near ? '!' : '') + C.reset;
   }
   if (wd && wd.adaptive) {
     // Adaptive gap is dynamic (regime p99 × margin, recomputed per request) — no

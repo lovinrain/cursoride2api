@@ -668,6 +668,7 @@ function startConversation(token, options = {}) {
         currentCallbacks.onMcpCall(info);
       }, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        subagentSupport: options.subagentSupport,
         nativeExecKinds: _nativeExecKinds,
         onUnhandledExec: (info) => {
           currentCallbacks.onError(info?.detail || 'unhandled Cursor exec message');
@@ -768,6 +769,7 @@ function startConversation(token, options = {}) {
       markUsefulFrame();
       handleInteractionQuery(msg.message.value, sendBinaryFrame, {
         passthroughNativeTools: !!options.passthroughNativeTools,
+        subagentSupport: options.subagentSupport,
         onServerToolUse: currentCallbacks.onServerToolUse,
       });
       return;

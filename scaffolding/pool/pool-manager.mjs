@@ -85,6 +85,10 @@ const IDLE_PING_MS = parseInt(process.env.IDLE_PING_MS || '1200000', 10);
 const PING_TIMEOUT_MS = parseInt(process.env.PING_TIMEOUT_MS || '45000', 10);
 const STAGGER_OPEN_MS = parseInt(process.env.STAGGER_OPEN_MS || '5000', 10);
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// Sub-agent (Task) support — mutable so `ratlc subagent on/off` can flip it at
+// runtime. Default ON (unless launched with RATLC_SUBAGENT_SUPPORT=0). Broadcast
+// to bridge-workers on change; inherited by channels that spawn afterwards.
+let subagentSupport = process.env.RATLC_SUBAGENT_SUPPORT !== '0';
 const POOL_BRIDGE_PROTOCOL = (process.env.POOL_BRIDGE_PROTOCOL || 'h2').toLowerCase();
 if (!['h1', 'h2'].includes(POOL_BRIDGE_PROTOCOL)) {
   console.error(`invalid POOL_BRIDGE_PROTOCOL=${POOL_BRIDGE_PROTOCOL} (must be h1|h2)`);
@@ -156,6 +160,27 @@ function getPendingToolUseIdsForChannel(channelId) {
   if (!channelId) return [];
   const ids = pendingToolUseIdsByChannel.get(channelId);
   return ids ? [...ids] : [];
+}
+
+// Detailed view of the tool_results a channel is blocked on, for observability:
+// each pending id resolved to its toolName (+ subagent_type for a Task) and
+// whether its result has already arrived in a held partial batch. Lets the TUI
+// answer "is this a Task sub-agent, and is it progressing (provided climbing)?"
+// without a log grep. All data already exists in toolUseIndex + heldToolResults.
+function getPendingToolsForChannel(channelId) {
+  const ids = getPendingToolUseIdsForChannel(channelId);
+  if (!ids.length) return [];
+  const held = getHeldToolResultsForChannel(channelId);
+  const provided = held && held.providedById ? held.providedById : null;
+  return ids.map((id) => {
+    const entry = toolUseIndex.get(id);
+    const toolName = (entry && entry.toolName) || '(?)';
+    const out = { id, toolName, provided: !!(provided && provided.has(id)) };
+    if (toolName === 'Task' && entry && entry.args && entry.args.subagent_type) {
+      out.subagentType = entry.args.subagent_type;
+    }
+    return out;
+  });
 }
 
 function rememberPendingToolUse(channelId, anthropicId) {
@@ -524,6 +549,9 @@ function spawnChannel(group) {
     POOL_CONTEXT_MODE,
     POOL_REINJECT_THINKING: POOL_REINJECT_THINKING ? '1' : '0',
     RATLC_PASSTHROUGH_NATIVE: POOL_TOOL_MODE === 'translate' ? '1' : '0',
+    // Newly-spawned channels inherit the CURRENT toggle state (so a runtime
+    // `subagent off` also covers channels that respawn afterwards).
+    RATLC_SUBAGENT_SUPPORT: subagentSupport ? '1' : '0',
     ...(POOL_TOOL_MODE === 'translate' ? {
       CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT: '1800000',
       CURSOR_STALL_TIMEOUT_MS: '600000',
@@ -606,6 +634,15 @@ function handleWorkerMessage(ch, msg) {
       }
       ch.error = msg.error || null;
       if (msg.errorKind) ch.errorKind = msg.errorKind;
+      // Worker-initiated death (auth/quota_exhausted/open-exhausted/…) — give it the
+      // same semantic deathReason + post-mortem stamps as a watchdog reap, so EVERY
+      // dead row in the TUI tells a uniform story (and gets the red treatment),
+      // not just watchdog reaps.
+      if (msg.state === 'dead') {
+        ch.deathReason = `worker:${msg.errorKind || 'error'}`;
+        ch.deathAt = Date.now();
+        ch.deathRequestId = ch.currentRequestId || null;
+      }
       // Worker-driven state change: if it just left 'busy', reset busyAt
       // so the TUI's BUSY column collapses back to '-'.
       if (msg.state !== 'busy') ch.busyAt = null;
@@ -1035,21 +1072,44 @@ setInterval(() => {
 // Per-model-type (fast vs non-fast). RATLC_BUSY_STUCK_TIMEOUT_MS_{FAST,SLOW}
 // override the global RATLC_BUSY_STUCK_TIMEOUT_MS.
 const BUSY_STUCK = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
+// A channel in WAIT-TOOL is blocked on the CLIENT returning tool_results — e.g. a
+// Task sub-agent that legitimately runs for many minutes (on another channel).
+// There is no stuck UPSTREAM to detect, so the aggressive busy reap is wrong here:
+// it was SIGTERMing the parent mid-sub-agent (observed: ch-723 reaped at 361s while
+// its sub-agent was still working → the whole turn died). Give wait-tool its own,
+// much longer ceiling. Tune via RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS{,_FAST,_SLOW};
+// 0 = never reap while blocked on the client (client-disconnect still frees the
+// channel via the normal cancel path).
+const WAIT_TOOL_STUCK = typeThresholds('WAIT_TOOL_STUCK_TIMEOUT_MS', 1800000, 1800000);
 setInterval(() => {
   const now = Date.now();
   for (const ch of channels.values()) {
     if (ch.state !== 'busy') continue;
     const idleMs = now - (ch.lastActivityAt || 0);
-    const threshold = isFastModel(ch.group) ? BUSY_STUCK.fast : BUSY_STUCK.slow;
+    const waitingOnClientTool = getPendingToolUseIdsForChannel(ch.id).length > 0;
+    let threshold;
+    if (waitingOnClientTool) {
+      threshold = isFastModel(ch.group) ? WAIT_TOOL_STUCK.fast : WAIT_TOOL_STUCK.slow;
+      if (!threshold) continue; // 0 → never reap a channel that's blocked on the client tool
+    } else {
+      threshold = isFastModel(ch.group) ? BUSY_STUCK.fast : BUSY_STUCK.slow;
+    }
     if (idleMs < threshold) continue;
-    log(`busy-watchdog: ${ch.id} (group=${ch.group}) stuck busy ${Math.floor(idleMs / 1000)}s reqId=${ch.currentRequestId} — killing for respawn`);
+    const stuckKind = waitingOnClientTool ? 'wait-tool' : 'busy';
+    // Record WHY this channel died so a `dead` row in the TUI is no longer an
+    // opaque Cursor error — `reap:wait-tool@361s` vs `reap:busy@250s` are very
+    // different operator stories. Survives until the channel object is replaced.
+    ch.deathReason = `reap:${stuckKind}@${Math.floor(idleMs / 1000)}s`;
+    ch.deathAt = now;
+    ch.deathRequestId = ch.currentRequestId || null;
+    log(`busy-watchdog: ${ch.id} (group=${ch.group}) stuck ${stuckKind} ${Math.floor(idleMs / 1000)}s reqId=${ch.currentRequestId} — killing for respawn`);
     if (ch.currentRequestId) {
       const client = requestClient.get(ch.currentRequestId);
       if (client) {
         writeToClient(client, {
           type: 'error',
           requestId: ch.currentRequestId,
-          message: `busy-watchdog timeout: channel ${ch.id} stuck busy ${Math.floor(idleMs / 1000)}s`,
+          message: `busy-watchdog timeout: channel ${ch.id} stuck ${stuckKind} ${Math.floor(idleMs / 1000)}s`,
         });
       }
       requestClient.delete(ch.currentRequestId);
@@ -1311,6 +1371,17 @@ function handleClientMessage(client, msg) {
     return;
   }
 
+  if (msg.type === 'set_subagent_support') {
+    subagentSupport = msg.value === 'toggle' ? !subagentSupport : msg.value !== false;
+    let n = 0;
+    for (const ch of channels.values()) {
+      try { ch.proc.send({ type: 'set_subagent_support', value: subagentSupport }); n++; } catch { /* ignore */ }
+    }
+    log(`subagent support → ${subagentSupport ? 'ON' : 'OFF'} (broadcast to ${n} channels)`);
+    writeToClient(client, { type: 'ack', message: `subagent support ${subagentSupport ? 'enabled' : 'disabled'} (${n} channels updated)` });
+    return;
+  }
+
   if (msg.type === 'ramp_up') {
     const n = Math.max(1, parseInt(msg.count || 1, 10));
     const targetModel = (msg.group && String(msg.group).trim()) || POOL_MODEL;
@@ -1427,6 +1498,10 @@ function statusSnapshot() {
       roundsServed: ch.roundsServed,
       currentRequestId: ch.currentRequestId,
       pendingToolUseIds: getPendingToolUseIdsForChannel(ch.id),
+      pendingTools: getPendingToolsForChannel(ch.id),
+      deathReason: ch.deathReason || null,
+      deathAgoMs: ch.deathAt ? now - ch.deathAt : null,
+      deathRequestId: ch.deathRequestId || null,
       error: ch.error,
     });
     if (ch.state === 'ready') readyCount++;
@@ -1470,6 +1545,7 @@ function statusSnapshot() {
     config: {
       model: POOL_MODEL,
       toolMode: POOL_TOOL_MODE,
+      subagentSupport: subagentSupport ? 1 : 0,
       bridgeProtocol: POOL_BRIDGE_PROTOCOL,
       contextMode: POOL_CONTEXT_MODE,
       reinjectThinking: POOL_REINJECT_THINKING ? 1 : 0,
@@ -1489,14 +1565,15 @@ function statusSnapshot() {
         const gap = typeThresholds('NO_VISIBLE_LIVENESS_GRACE_MS', 0, 0);
         const ceil = typeThresholds('NO_VISIBLE_EVENT_TIMEOUT_MS', 25000, 5000);
         const busy = typeThresholds('BUSY_STUCK_TIMEOUT_MS', 240000, 0);
+        const waitTool = typeThresholds('WAIT_TOOL_STUCK_TIMEOUT_MS', 1800000, 1800000);
         return {
           // Flat values = the "slow"/global tier (back-compat for any reader that
           // ignores model type; equals the global when no _FAST/_SLOW are set).
-          livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow,
+          livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow, waitToolStuckMs: waitTool.slow,
           // Per-model-type, so the TUI SILENT countdown uses the right threshold
           // for each channel (fast channels can have a tighter silent-timeout).
-          fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast },
-          slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow },
+          fast: { livenessGapMs: gap.fast, ceilingMs: ceil.fast, busyStuckMs: busy.fast, waitToolStuckMs: waitTool.fast },
+          slow: { livenessGapMs: gap.slow, ceilingMs: ceil.slow, busyStuckMs: busy.slow, waitToolStuckMs: waitTool.slow },
           // When the api-server runs RATLC_ADAPTIVE_TIMEOUTS=1 the silent-timeout
           // gap is derived live (regime p99 × margin) and changes per request, so
           // a fixed countdown denominator would mislead — the TUI shows the gap as

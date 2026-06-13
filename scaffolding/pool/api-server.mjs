@@ -37,6 +37,7 @@ import {
   normalizeAnthropicContentForCursorMcp,
   prependTextContent,
 } from './multimodal-content.mjs';
+import { createSubagentModelPin } from './subagent-model-pin.mjs';
 
 // Bridge to the existing CommonJS anthropic-tools helpers so we can reuse
 // `deriveConversationKey` and `extractClientSessionId` instead of porting
@@ -55,6 +56,10 @@ const PORT = parseInt(process.env.RATLC_API_PORT || process.env.PORT || '4242', 
 const HOST = process.env.RATLC_API_HOST || process.env.HOST || '127.0.0.1';
 const POOL_SOCK = process.env.POOL_SOCK || '/tmp/ratlc-pool.sock';
 const POOL_TOOL_MODE = (process.env.POOL_TOOL_MODE || 'contract').toLowerCase();
+// Opt-in: pin a Task sub-agent to the same model/group as the main agent that
+// spawned it (RATLC_SUBAGENT_INHERIT_PARENT_MODEL=1). Default off — no routing
+// change unless enabled. See ./subagent-model-pin.mjs.
+const subagentModelPin = createSubagentModelPin();
 // POOL_REINJECT_THINKING — opt-in symmetry with CURSOR_REINJECT_THINKING.
 // When set, every thinking_delta arriving from the pool is appended to a
 // per-convKey buffer; on subsequent turns the captured text is rendered
@@ -117,7 +122,7 @@ const HYBRID_SESSION_TTL_MS = Math.max(60_000, parseInt(process.env.POOL_HYBRID_
 const CONTEXT_MAX_BYTES = Math.max(0, parseInt(process.env.RATLC_CONTEXT_MAX_BYTES || process.env.POOL_CONTEXT_MAX_BYTES || '0', 10));
 
 const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [api]`, ...args);
-log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}`);
+log(`POOL_CONTEXT_MODE=${POOL_CONTEXT_MODE}  POOL_TOOL_MODE=${POOL_TOOL_MODE}  POOL_REINJECT_THINKING=${POOL_REINJECT_THINKING ? 1 : 0}  POOL_PROXY_THINKING_BLOCKS=${POOL_PROXY_THINKING_BLOCKS ? 1 : 0}  CONTEXT_MAX_BYTES=${CONTEXT_MAX_BYTES}  SUBAGENT_MODEL_PIN=${subagentModelPin.enabled ? 1 : 0}`);
 
 const REQUEST_LOG_MAX = Math.max(100, parseInt(process.env.RATLC_REQUEST_LOG_MAX || '500', 10));
 const requestLog = [];
@@ -706,15 +711,15 @@ async function handleMessagesRequest(req, res) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad json' } }));
   }
-  const { tools, model } = body;
+  const { tools } = body;
   // messages/system are mutable: a trailing (or embedded) role:system message
   // gets hoisted into the system field below (see the hoist block before
   // validation). Some clients append MCP-server-instructions / skills-list
   // content as a `{role:"system"}` element in messages[] — illegal in the
   // Anthropic schema (system belongs in the top-level field) — which would
   // otherwise 400 with "last message must be user".
-  let { messages, system } = body;
-  const routingModel = normalizeModelForRouting(model);
+  let { messages, system, model } = body;
+  let routingModel = normalizeModelForRouting(model);
   // claude-code (and other clients) enable `interleaved-thinking-2025-05-14`
   // beta plus `thinking: {type:'enabled'}` in the body when talking to
   // thinking models. With that beta on, the client REQUIRES a `thinking`
@@ -816,6 +821,26 @@ async function handleMessagesRequest(req, res) {
   );
   if (POOL_REINJECT_THINKING) {
     log(`  convKey=${convKey} clientSessionId=${clientSessionId ? clientSessionId.slice(0, 8) + '…' : '(none)'}`);
+  }
+
+  // Sub-agent model pin (opt-in, RATLC_SUBAGENT_INHERIT_PARENT_MODEL=1). A
+  // claude-code sub-agent shares the parent's session id but gets a distinct
+  // convKey; if its routing model drifted from the main agent's (e.g. Cursor
+  // proposed a cheaper model, or inherit resolved elsewhere), re-pin it to the
+  // parent session's primary model HERE — before the pool routes on model — so
+  // multi-agent stays on the same model/group. No-op unless the flag is set.
+  {
+    const pin = subagentModelPin.decide({
+      clientSessionId,
+      convKey,
+      model,
+      hasTools: Array.isArray(tools) && tools.length > 0,
+    });
+    if (pin.overridden) {
+      log(`  subagent-model-pin: ${model || '(default)'} → ${pin.model} (session=${(clientSessionId || '').slice(0, 8)}… subagent convKey=${convKey})`);
+      model = pin.model;
+      routingModel = normalizeModelForRouting(model);
+    }
   }
 
   // Decide what to send: tool_result(s) or user message.

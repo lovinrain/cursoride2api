@@ -9,7 +9,11 @@
 #   ./launch.sh down           # tear it down
 #   ./launch.sh status         # status snapshot
 #   ./launch.sh tui            # interactive TUI
+#   ./launch.sh subagent on|off|status   # toggle sub-agent support at runtime
+#   ./launch.sh failures [N]   # recent not-ok requests
 #   ./launch.sh edit           # open launch.yaml in $EDITOR (defaults to vim)
+#
+# Any other subcommand is forwarded straight to ratlc.mjs (ramp, restart, …).
 #
 # Override a single var without editing the YAML:
 #   POOL_SIZE=20 ./launch.sh up
