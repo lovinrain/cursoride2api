@@ -1097,7 +1097,12 @@ setInterval(() => {
     const idleMs = now - (ch.lastActivityAt || 0);
     const waitingOnClientTool = getPendingToolUseIdsForChannel(ch.id).length > 0;
     let threshold;
-    if (waitingOnClientTool) {
+    // The long wait-tool ceiling exists ONLY to protect a Task sub-agent that can
+    // legitimately run for many minutes. When sub-agents are OFF the remaining
+    // client tools (Bash/Read/Grep) are bounded, so a long wait-tool stall is an
+    // abandoned/hung client — reap it on the normal busy clock (restores the
+    // pre-split behaviour) instead of parking the slot for up to 30 min.
+    if (waitingOnClientTool && subagentSupport) {
       threshold = isFastModel(ch.group) ? WAIT_TOOL_STUCK.fast : WAIT_TOOL_STUCK.slow;
       if (!threshold) continue; // 0 → never reap a channel that's blocked on the client tool
     } else {
