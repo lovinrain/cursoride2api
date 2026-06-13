@@ -990,27 +990,55 @@ async function cmdInspect(args) {
   if (!id) { console.error('usage: ratlc inspect <ch-id>'); process.exit(1); }
   let snap;
   try { snap = await getStatus(); } catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
-  const ch = (snap.pool?.channels || []).find((c) => c.id === id);
-  if (!ch) { console.error(`channel ${id} not present (respawned?)`); process.exit(1); }
+  let ch = (snap.pool?.channels || []).find((c) => c.id === id);
+  let dead = false;
+  if (!ch) {
+    // Live channel gone — fall back to the dead-channel tombstone so we can still
+    // post-mortem WHY it died (the bar scenario). Tombstone carries deathReason +
+    // the tools it was still waiting on.
+    ch = (snap.pool?.recentDeaths || []).find((t) => t.id === id);
+    dead = !!ch;
+    if (!ch) { console.error(`channel ${id} not present, and no recent-death tombstone (raise RATLC_DEAD_TOMBSTONE_MAX, or it died long ago)`); process.exit(1); }
+  }
+  const reqId = ch.currentRequestId || ch.deathRequestId;
   let reqs; try { reqs = await getRequests(500); } catch { reqs = { items: [] }; }
-  const req = (reqs.items || []).find((r) => r.requestId === ch.currentRequestId);
+  const req = reqId ? (reqs.items || []).find((r) => r.requestId === reqId) : null;
   const tok = (snap.pool?.tokens || [])[ch.tokenIdx];
   const s = (ms) => ms == null ? '-' : Math.round(ms / 1000) + 's';
-  console.log(color(ch.id, ANSI.bold) + `  ${stateLabel(ch)}  silent=${s(ch.progressGapMs)}  busy=${s(ch.busyForMs)}  age=${s(ch.openedAgoMs)}  group=${ch.group}`);
+  if (dead) {
+    console.log(color(ch.id, ANSI.bold) + '  ' + color('DEAD', ANSI.red) + `  ${s(ch.deathAgoMs)} ago  group=${ch.group}  rounds=${ch.roundsServed || 0}`);
+  } else {
+    console.log(color(ch.id, ANSI.bold) + `  ${stateLabel(ch)}  silent=${s(ch.progressGapMs)}  busy=${s(ch.busyForMs)}  age=${s(ch.openedAgoMs)}  group=${ch.group}`);
+  }
   if (ch.deathReason) console.log('  death: ' + color(ch.deathReason, ANSI.red) + (ch.error ? '  (' + String(ch.error).slice(0, 80) + ')' : ''));
   const pt = ch.pendingTools || [];
   if (pt.length) {
     console.log(`  waiting on ${color(String(pt.length), ANSI.blue)} tool_result(s):`);
-    for (const t of pt) console.log(`    ${t.provided ? color('✓', ANSI.green) : color('·', ANSI.yellow)} ${t.toolName}${t.subagentType ? ':' + t.subagentType : ''}${t.argPreview ? '  ' + color(t.argPreview, ANSI.dim) : ''}`);
+    for (const t of pt.slice(0, 10)) console.log(`    ${t.provided ? color('✓', ANSI.green) : color('·', ANSI.yellow)} ${t.toolName}${t.subagentType ? ':' + t.subagentType : ''}${t.argPreview ? '  ' + color(t.argPreview, ANSI.dim) : ''}`);
+    if (pt.length > 10) console.log(`    … +${pt.length - 10} more`);
   }
   if (req) {
     const mb = req.textBytes ? (req.textBytes / 1048576).toFixed(1) + 'MB' : '-';
     const trouble = (req.retryCount > 0 || req.lastRetrySymptom) ? color(`retries=${req.retryCount || 0}${req.lastRetrySymptom ? ' (' + req.lastRetrySymptom + ')' : ''}`, ANSI.yellow) : `retries=0`;
     console.log(`  request ${req.requestId}: status=${req.status} ${trouble} payload=${mb} firstByte=${s(req.firstByteMs)} reinject=${req.reinjectTurns || 0}`);
-  } else if (ch.currentRequestId) {
-    console.log(`  request ${ch.currentRequestId}: (not in recent /requests window)`);
+  } else if (reqId) {
+    console.log(`  request ${reqId}: (not in recent /requests window)`);
   }
   if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
+}
+
+// ratlc deaths [N] — recent channel deaths (they vanish from the live view in ms).
+async function cmdDeaths(args) {
+  const n = parseInt(args[0] || '30', 10);
+  let snap; try { snap = await getStatus(); } catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
+  const d = (snap.pool?.recentDeaths || []).slice(0, Number.isFinite(n) ? n : 30);
+  if (!d.length) { console.log('(no recent channel deaths retained — old pool, or none yet)'); return; }
+  const sd = (ms) => ms == null ? '-' : (ms < 60000 ? Math.round(ms / 1000) + 's' : Math.round(ms / 60000) + 'm');
+  console.log(`recent channel deaths (${d.length}, newest first) — inspect one with \`ratlc inspect <ch>\`:`);
+  for (const t of d) {
+    const sc = /quota|auth|stall|client-wait/i.test(t.deathReason || '') ? ANSI.red : ANSI.yellow;
+    console.log(`  ${sd(t.deathAgoMs).padStart(5)}  ${color(String(t.deathReason || '?').padEnd(22), sc)}  ${String(t.id).padEnd(8)} tok[${t.tokenIdx}]  ${t.deathRequestId || ''}`);
+  }
 }
 
 async function cmdRestart(args) {
@@ -1195,6 +1223,7 @@ const [, , cmd, ...rest] = process.argv;
       case 'subagent': case 'subagents': return await cmdSubagent(rest);
       case 'failures': case 'requests': return await cmdFailures(rest);
       case 'inspect': return await cmdInspect(rest);
+      case 'deaths': return await cmdDeaths(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
       case 'stats': return await cmdStats(rest);

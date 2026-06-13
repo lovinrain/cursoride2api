@@ -2506,6 +2506,13 @@ Driven by a multi-agent audit + adversarial review (verdict: accept-with-fixes) 
 
 A channel parked in wait-tool for many minutes showing `0/N <s>!` (or `Task <s>`) with every pendingTool `provided:false` = the **claude-code client abandoned the conversation mid-tool-batch** (closed / Ctrl-C'd after the model emitted its tools). The proxy correctly holds it until the wait-tool ceiling. Clear with `ratlc restart ch-N` (or TUI `k`).
 
+### Follow-up: client-wait relabel, `ratlc inspect`/`deaths`, death tombstones (2026-06-13)
+
+A second multi-agent investigation (+ adversarial review) chased the ch-321/353 "busy 20-30 min, no idea what it's doing" reports. Key result: its synthesizer **overruled its own four investigators** — the "Upstream stalled — no progress for Ns" death is NOT a stall-timer bug. In `translate` mode a native tool call does not emit `turnEnded`, so the bridge stall watchdog stays armed and counts Cursor's silence — which, when the client never returns the result, IS the client-tool-wait, *by design* (`stall-thresholds.js:196`; `CURSOR_STALL_TIMEOUT_MS_WITH_CONTENT=1800000`). Deleting the `lastUsefulFrameAt` reset (the investigators' fix) would have shrunk the post-injection resume budget → spurious stalls. So it was a **labeling** bug, not a timer bug. Fixes shipped:
+- **Relabel (pool-side, no timer change):** the death classifier checks `getPendingToolUseIdsForChannel(ch.id).length>0` at death — a stall with a tool still outstanding is `reap:client-wait@Ns` (+ a truthful error), distinct from `stall:upstream@Ns` (silent, no tool outstanding). Race ruled out: the `state:dead` IPC drains before `handleWorkerExit` clears the ids (Node message ordering).
+- **`ratlc inspect <ch>`** — joins snapshot + `/requests` + token: pendingTools with **arg preview**, request trouble (retries/payload/symptom/first-byte), token. The "why is THIS stuck now" command.
+- **Death tombstones** — the adversarial adjudicator caught the blocker the four reviewers missed: a dead channel object (carrying `deathReason`) is deleted within ms of exit, so `inspect` on the *bar scenario* (a channel that DIED) hit "not present". Fix: capture a bounded tombstone in `handleWorkerExit` before deletion (`RATLC_DEAD_TOMBSTONE_MAX`), expose `pool.recentDeaths`, and have `inspect` fall back to it; `ratlc deaths [N]` lists them.
+
 Tests: `tests/src/forward-compatible-exec-test.js` (normalizer + toggle), `tests/pool/subagent-model-pin-test.mjs`, `scaffolding/pool/tui-format-test.mjs`.
 
 ---

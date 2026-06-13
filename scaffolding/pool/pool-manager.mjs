@@ -191,6 +191,32 @@ function getPendingToolsForChannel(channelId) {
   });
 }
 
+// Bounded tombstones of recently-dead channels, captured at exit BEFORE the
+// channel object + its pending tools are deleted — so `ratlc inspect`/`status`
+// can post-mortem a channel that just died (deaths are the bar scenario; the
+// deathReason + pendingTools otherwise vanish within ms of the exit, leaving
+// "channel not present"). Tune size via RATLC_DEAD_TOMBSTONE_MAX.
+const deadTombstones = [];
+const DEAD_TOMBSTONE_MAX = Math.max(20, parseInt(process.env.RATLC_DEAD_TOMBSTONE_MAX || '60', 10));
+function recordDeadTombstone(ch) {
+  if (!ch || !ch.id) return;
+  deadTombstones.unshift({
+    id: ch.id,
+    group: ch.group || null,
+    tokenIdx: ch.tokenIdx ?? null,
+    tokenName: ch.tokenName ?? null,
+    deathReason: ch.deathReason || 'exit',
+    deathAt: ch.deathAt || Date.now(),
+    deathRequestId: ch.deathRequestId || ch.currentRequestId || null,
+    currentRequestId: ch.currentRequestId || null,
+    error: ch.error || null,
+    pendingTools: getPendingToolsForChannel(ch.id),
+    openedAt: ch.openedAt || null,
+    roundsServed: ch.roundsServed || 0,
+  });
+  while (deadTombstones.length > DEAD_TOMBSTONE_MAX) deadTombstones.pop();
+}
+
 function rememberPendingToolUse(channelId, anthropicId) {
   if (!channelId || !anthropicId) return;
   let ids = pendingToolUseIdsByChannel.get(channelId);
@@ -750,6 +776,9 @@ function handleWorkerExit(ch, code, signal) {
       recordTokenOtherError(ch.tokenIdx, ch.error);
     }
   }
+  // Snapshot the dying channel (deathReason + still-pending tools) before we
+  // delete it, so `ratlc inspect`/`status` can post-mortem it.
+  recordDeadTombstone(ch);
   channels.delete(ch.id);
   clearPendingToolUsesForChannel(ch.id);
   const g = groups.get(ch.group);
@@ -1573,6 +1602,7 @@ function statusSnapshot() {
       pendingToolUseChannels: pendingToolUseIdsByChannel.size,
       consumedToolUseIndex: consumedToolUseIndex.size,
       sessionAffinity: sessionAffinity.size,
+      recentDeaths: deadTombstones.slice(0, 40).map((t) => ({ ...t, deathAgoMs: now - t.deathAt })),
     },
     config: {
       model: POOL_MODEL,

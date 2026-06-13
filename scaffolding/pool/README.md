@@ -19,7 +19,7 @@ the rest of each channel's lifetime.
 | **`pool-manager.mjs`** | Forks N `bridge-worker` children, maintains the pool, pings idle channels every 20 min, auto-respawns dead ones. Listens on `/tmp/ratlc-pool.sock`. | High — restarting loses all warm channels |
 | **`bridge-worker.mjs`** *(child)* | Owns one Cursor `RunSSE` stream + matching `BidiAppend` POSTs. Managed by the pool. | Auto-respawn |
 | **`api-server.mjs`** | HTTP `:4242` serving `/v1/messages` (Anthropic format). Stateless. | **Free** — restart anytime, pool stays up |
-| **`ratlc`** (unified CLI) | Single entry point: `up`, `down`, `status`, `watch`, `tui`, `ramp`, `restart`, `subagent on\|off\|status`, `failures [N]`, `claude`, `tail`, `metrics`, `logs` | n/a |
+| **`ratlc`** (unified CLI) | Single entry point: `up`, `down`, `status`, `watch`, `tui`, `ramp`, `restart`, `subagent on\|off\|status`, `failures [N]`, `inspect <ch>`, `deaths [N]`, `claude`, `tail`, `metrics`, `logs` | n/a |
 
 ## Recommended launch (for claude-code use)
 
@@ -144,15 +144,30 @@ execution — a wait-tool channel is idle, blocked on claude-code running the to
 which is opaque to the proxy. The header shows `⚠tok-dead=N/total` when tokens are
 quota-dead (your main capacity limiter).
 
+- **`ratlc inspect <ch>`** — "why is THIS channel stuck right now": one dump joining
+  the pool snapshot + `/requests` + token — state/silence/death, the outstanding
+  tools **with arg preview** (the actual Bash command / Read path), the request's
+  trouble (`retries`, payload MB, symptom, first-byte), and the token. Works on a
+  **dead** channel too (falls back to a death tombstone), so you can post-mortem a
+  channel that just died.
+- **`ratlc deaths [N]`** — recent channel deaths with their reason (`reap:wait-tool@Ns`,
+  `reap:client-wait@Ns`, `stall:upstream@Ns`, `worker:quota_exhausted`). Dead rows
+  vanish from the live table in milliseconds; this retains the last ~60.
 - **`ratlc failures [N]`** — recent not-ok requests (rate-limit, empty turn, stale
   tool_result, errors) straight from `/requests`, so you don't tail `api.log`.
 - **`ratlc tui` → press `?`** — full keymap overlay.
 
+Death-reason vocabulary: `reap:wait-tool@Ns` (pool gave up waiting on the client),
+`reap:client-wait@Ns` (the bridge stall fired with a client tool_result still
+outstanding — **not** a Cursor fault, despite the raw "Upstream stalled" string),
+`stall:upstream@Ns` (a real Cursor stall — silent with no tool outstanding),
+`worker:quota_exhausted` / `worker:auth_error` (the Cursor account is broken).
+
 **Most common stuck pattern:** a channel parked in `wait-tool` for minutes with
 `0/N` and nothing returned = the **claude-code client abandoned the conversation
 mid-tool-batch** (closed / Ctrl-C'd after the model emitted tool calls). The proxy
-correctly holds it until `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS`. Clear it now with
-`ratlc restart ch-N` (or the TUI `k` key).
+correctly holds it until `RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS` (or the busy clock when
+sub-agents are off). Clear it now with `ratlc restart ch-N` (or the TUI `k` key).
 
 ## Testing toolchain
 
