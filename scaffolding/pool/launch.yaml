@@ -180,13 +180,13 @@ RATLC_NO_VISIBLE_LIVENESS_GRACE_MS: 90000      # liveness-gap: hung if NO frame 
 # POOL_TOOL_USE_WATCHDOG_MS: 1000              # parallel-tools finalize watchdog (default 1000)
 RATLC_BUSY_STUCK_TIMEOUT_MS: 360000            # busy-watchdog reap threshold (6min) — MUST exceed NO_VISIBLE ceiling (5min) above, else it SIGTERMs the slow-but-alive channel at 4min before first byte (default was 240000)
 
-# wait-tool reap: a channel BLOCKED on the client returning tool_results gets its
-# OWN (longer) ceiling, separate from BUSY_STUCK (no stuck upstream to detect).
-# Code default is 30min (protects slow sub-agents). With sub-agents OFF there are
-# no legitimate long waits, so 10min reclaims abandoned-client channels (observed:
-# ch-256/260/282 parked 10-27min after a claude-code session was closed mid-batch)
-# while still covering a long Bash/WebFetch. Raise it if you re-enable sub-agents.
-RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS: 600000       # 10min; 0 = never reap while waiting on the client
+# wait-tool reap ceiling — only applies WHEN SUB-AGENTS ARE ON (it exists to
+# protect a Task sub-agent that can run for many minutes). When sub-agents are OFF
+# the watchdog ignores this and reaps wait-tool on the normal BUSY_STUCK clock
+# (~6min), since the remaining client tools are bounded and a long wait = an
+# abandoned/hung client (observed: ch-256/260/282/321/353 parked 10-30min). This
+# value is the ceiling when you re-enable sub-agents. 0 = never reap while waiting.
+RATLC_WAIT_TOOL_STUCK_TIMEOUT_MS: 600000       # 10min (only with sub-agents ON)
 
 # ── Per-model-type watchdog thresholds (fast vs non-fast) ───────────────────
 # "fast" = the `-fast` accelerator in the model name (both current models are
