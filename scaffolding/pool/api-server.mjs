@@ -514,7 +514,12 @@ function findAllToolResults(content) {
 }
 
 function makeClientBridgeToolUseId(poolToolUseId) {
-  const suffix = String(poolToolUseId || randomUUID()).replace(/[^A-Za-z0-9_-]/g, '').slice(-16);
+  // Must match Anthropic's tool_use pattern ^toolu_[a-zA-Z0-9_]+$ (NO dashes) so
+  // the block survives a session resume against the real API. The pool id is
+  // arbitrary (often a UUID with dashes); strip dashes too (the prior class
+  // `[^A-Za-z0-9_-]` kept them). Correlation back to the pool id is via a stored
+  // map (poolToolUseId), not by decoding this suffix, so sanitizing is safe.
+  const suffix = String(poolToolUseId || randomUUID()).replace(/[^A-Za-z0-9_]/g, '').slice(-16);
   return `toolu_client_${suffix || randomUUID().replace(/-/g, '').slice(0, 16)}`;
 }
 
@@ -1588,7 +1593,18 @@ async function handleMessagesRequest(req, res) {
   }
 
   function normalizeServerToolId(id) {
-    return String(id || ('srv_' + randomUUID().replace(/-/g, '').slice(0, 16))).replace(/[^A-Za-z0-9_-]/g, '_');
+    // Anthropic requires server_tool_use ids to match ^srvtoolu_[a-zA-Z0-9_]+$
+    // — note: NO dashes. Cursor's native tool id is arbitrary (typically a UUID
+    // WITH dashes), so we must (a) strip dashes/any other char to underscores,
+    // and (b) guarantee the srvtoolu_ prefix. Without this, a session that used
+    // Cursor WebSearch/WebFetch can't be RESUMED against the real Anthropic API:
+    // claude-code replays the stored server_tool_use block and the API 400s with
+    // "server_tool_use.id: String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'".
+    // Idempotent: an already-normalized id round-trips unchanged (the result
+    // block reuses this same id as tool_use_id, and completeOpenServerTools
+    // re-feeds it, so the started/completed pair must stay identical).
+    const base = String(id || '').replace(/^srvtoolu_/i, '').replace(/[^A-Za-z0-9_]/g, '_');
+    return 'srvtoolu_' + (base || randomUUID().replace(/-/g, ''));
   }
 
   async function emitServerToolUseEvent(event) {
