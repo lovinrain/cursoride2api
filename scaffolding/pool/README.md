@@ -247,7 +247,7 @@ the children + api-server).
 | `RATLC_WAIT_DECREASE_MS` | int | `50` | AIMD linear decrement per non-rate-limit |
 | `RATLC_WAIT_INCREASE_FACTOR` | float | `2.0` | AIMD multiplier per rate-limit hit |
 | `RATLC_INITIAL_WAIT_MS` | int | `1000` | AIMD starting wait |
-| `RATLC_OPEN_RETRY_MAX` | int | `500` | Hard cap on open attempts per worker before process recycle |
+| `RATLC_OPEN_RETRY_MAX` | int | `2500` | Hard cap on open attempts per worker before process recycle (was 500; raised so a channel grinds through a long throttle window instead of dying `exhausted` and respawning) |
 | `POOL_TOOL_USE_WATCHDOG_MS` | int | `1000` | Tool-use turn finalize watchdog. Re-armed on every `text_delta` / `thinking_delta` / `tool_use`, so it measures "model went silent" rather than "no more tool_uses." See [STEP_COMPLETED_INVESTIGATION.md](./STEP_COMPLETED_INVESTIGATION.md) and [WATCHDOG_REARM_REVIEW.md](./WATCHDOG_REARM_REVIEW.md) for why this design. |
 | `POOL_TOOL_USE_DEBOUNCE_MS` | int | unset | Legacy alias for `POOL_TOOL_USE_WATCHDOG_MS`; kept for backwards compat |
 | `RATLC_BUSY_STUCK_TIMEOUT_MS` | int | `240000` | Pool-manager scans for channels stuck in `busy` state with no activity longer than this and SIGTERMs the worker. Replacement spawns automatically. The ultimate safety net beyond the tool-use watchdog. |

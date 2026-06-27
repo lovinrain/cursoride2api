@@ -51,7 +51,7 @@ const _tokenIdx = Number.isFinite(_tokenIdxRaw)
 const token = tokenFile.tokens[_tokenIdx];
 const _tokenName = token?.name || `token-${_tokenIdx}`;
 
-const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '500', 10);
+const OPEN_RETRY_MAX = parseInt(process.env.RATLC_OPEN_RETRY_MAX || '2500', 10);
 const OPEN_RETRY_MS = parseInt(process.env.RATLC_OPEN_RETRY_MS || '300', 10);
 
 // Retry mode selects how the channel paces its open attempts.
