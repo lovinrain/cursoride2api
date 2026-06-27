@@ -256,7 +256,9 @@ the children + api-server).
 
 | Var | Default | What it controls |
 |---|---|---|
-| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Consecutive `other_error` strikes (with no token validation) before pool-manager marks a token dead and skips it in round-robin. `auth_error` and `quota_exhausted` always mark dead on first strike regardless of this. |
+| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Consecutive `other_error` strikes (with no token validation) before pool-manager marks a token dead and skips it in round-robin. `quota_exhausted` marks the token dead on first strike regardless of this; `auth_error` is intermittent, so the token is instead put on an auto-reviving cooldown (skipped in rotation, revived after a backoff) with a reset count surfaced in the TUI. |
+| `RATLC_TOKEN_AUTH_COOLDOWN_MS` | `300000` (5 min) | Base cooldown a token sits out of rotation after an `auth_error` (`unauthenticated`/`ERROR_NOT_LOGGED_IN`) before it's auto-revived and retried. Doubles per consecutive reset, capped at `RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS`. |
+| `RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS` | `3600000` (1 hr) | Ceiling for the exponential auth-cooldown backoff. |
 | `CURSOR_CLIENT_OS` | auto-detected | Forces the `x-cursor-client-os` header. Auto-derives `darwin` when `token.macMachineId` is set and host isn't darwin (Mac-minted token spoofing). Override here to force a value. |
 | `CURSOR_CLIENT_OS_VERSION` | `os.release()` or `23.5.0` for Mac-spoof | Forces `x-cursor-client-os-version` header. |
 | `CURSOR_CLIENT_ARCH` | `process.arch` or `arm64` for Mac-spoof | Forces `x-cursor-client-arch` header. |
@@ -418,7 +420,7 @@ in `bridge-worker.mjs onError`. Three definite-fatal kinds:
 
 | Kind | Pattern | When marked dead |
 |---|---|---|
-| `auth_error` | `ERROR_NOT_LOGGED_IN`, `unauthenticated` | First strike |
+| `auth_error` | `ERROR_NOT_LOGGED_IN`, `unauthenticated` | Cooldown + auto-revive (reset count tracked) |
 | `quota_exhausted` | `ERROR_RATE_LIMITED_CHANGEABLE`, `API usage limit reached` | First strike |
 | `other_error` | Anything we don't classify | After `RATLC_TOKEN_DEATH_THRESHOLD` strikes (default 3), only if the token has never reached a post-auth response |
 
@@ -447,7 +449,7 @@ The pool log emits clear events for every transition:
 - `token rotation: N token(s) loaded — [name1, name2, ...]`
 - `spawned ch-K (..., token[idx]=name)`
 - `token[idx]=name validated (reached Cursor past auth)`
-- `⚠ TOKEN DEAD (auth_error): token[idx]=name marked dead on first strike. ...`
+- `TOKEN COOLDOWN (auth_error): token[idx]=name reset #N, out of rotation then auto-revived. ...`
 - `⚠ TOKEN DEAD: token[idx]=name marked dead after N consecutive other_error failures ...`
 
 ### Constraints
@@ -795,7 +797,7 @@ LAST_ERROR             the actual Cursor error message (colored)
 |---|---|
 | claude-code hangs mid-conversation | `/tmp/ratlc-api.log` for "→ tool_use to client" then check `/tmp/ratlc-pool.log` for the matching `sendToolResult` and `BidiAppend OK seqno=…` |
 | "API returned an empty or malformed response" | Likely parallel-tool-call bug if the model fires multiple in one turn. We support this now; if it surfaces, check `pendingMcpInfo` map state |
-| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — `stream-summary-h1 code=fail reason="…"` entries reveal which. If reason is `unauthenticated` or `API usage limit reached`, see [§ Token health detection](#token-health-detection) — the token will get marked dead on first strike. |
+| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — `stream-summary-h1 code=fail reason="…"` entries reveal which. If reason is `unauthenticated` or `API usage limit reached`, see [§ Token health detection](#token-health-detection) — an `auth_error` token is cooled down and auto-revived (`unauthenticated`); `API usage limit reached` marks it dead on first strike. |
 | Channel stuck `busy` with high `IDLE` | Pool-manager's busy-watchdog will SIGTERM it at `RATLC_BUSY_STUCK_TIMEOUT_MS` (default 240 s). If you're seeing this routinely, check [WATCHDOG_REARM_REVIEW.md](./WATCHDOG_REARM_REVIEW.md) — the tool_use watchdog might be finalizing turns prematurely (re-armed in `3c2f017` to mitigate). |
 | Pool slowly shrinks: token count drops, no new spawns | A token has been marked dead (see [§ Multi-account token rotation](#multi-account-token-rotation)). `ratlc tui` → token-health panel shows which, and the `LAST_ERROR` column shows why. Fix the upstream account, then `ratlc down` + `ratlc up`. |
 | Model returns "READY" instead of answering a long-context question | You're above the model's effective context window. See [NIAH_RESULTS.md](./NIAH_RESULTS.md) — `claude-opus-4-7-max-fast` tops out around 600 k tokens (Cursor truncates from the tail, leaving only the priming "Reply with READY" instruction). |

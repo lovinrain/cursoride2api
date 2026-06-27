@@ -467,10 +467,30 @@ try {
   log(`WARN: failed to read ${_tokenPath} for rotation count: ${e.message} — assuming single token`);
 }
 const TOKEN_DEATH_THRESHOLD = parseInt(process.env.RATLC_TOKEN_DEATH_THRESHOLD || '3', 10);
+// Auth errors (ERROR_NOT_LOGGED_IN / unauthenticated) are frequently INTERMITTENT:
+// Cursor rejects a token's open with "try logging out and back in", then accepts
+// the very same token minutes later. So rather than killing it for good (as we
+// still do for quota_exhausted), we put the token on a COOLDOWN: skip it in
+// rotation, then auto-revive it after a backoff and let it retry. Each cooldown
+// bumps the token's reset counter (surfaced in the TUI) so an operator can spot a
+// token that keeps tripping and pull it from token.json manually. The backoff
+// grows with each reset (a genuinely-broken token backs off further every time)
+// up to a cap.
+const TOKEN_AUTH_COOLDOWN_MS = Math.max(1000, parseInt(process.env.RATLC_TOKEN_AUTH_COOLDOWN_MS || '300000', 10));
+const TOKEN_AUTH_COOLDOWN_MAX_MS = Math.max(TOKEN_AUTH_COOLDOWN_MS, parseInt(process.env.RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS || '3600000', 10));
 const _tokenValidated = new Array(_tokenCount).fill(false);
 const _tokenOtherErrors = new Array(_tokenCount).fill(0);
 const _tokenDead = new Array(_tokenCount).fill(false);
 const _tokenLastError = new Array(_tokenCount).fill(null);
+// Auth-cooldown bookkeeping (parallel to the arrays above):
+//   _tokenCooldownUntil - epoch ms the token stays out of rotation until; 0 when
+//     the token is either live or PERMANENTLY dead. A non-zero value is exactly
+//     what distinguishes a revivable cooldown from a real (no-revival) death.
+//   _tokenResetCount    - how many times this token has been auth-reset (cumulative).
+//   _tokenReviveTimer   - pending timer that wakes the spawner when cooldown ends.
+const _tokenCooldownUntil = new Array(_tokenCount).fill(0);
+const _tokenResetCount = new Array(_tokenCount).fill(0);
+const _tokenReviveTimer = new Array(_tokenCount).fill(null);
 log(`token rotation: ${_tokenCount} token(s) loaded — [${_tokenNames.join(', ')}], death-threshold=${TOKEN_DEATH_THRESHOLD}`);
 let _nextTokenIdx = 0;
 function nextTokenIndex() {
@@ -480,10 +500,34 @@ function nextTokenIndex() {
   for (let i = 0; i < _tokenCount; i++) {
     const idx = _nextTokenIdx % _tokenCount;
     _nextTokenIdx = (_nextTokenIdx + 1) % _tokenCount;
+    reviveTokenIfCooled(idx);
     if (!_tokenDead[idx]) return idx;
   }
   log('CRITICAL: every token is marked dead; falling back to index 0 anyway');
   return 0;
+}
+// A token is available to spawn on if it's live now, or its auth-cooldown has
+// already elapsed (nextTokenIndex will revive it on the spot). Permanently-dead
+// tokens (quota / 3x other_error, cooldownUntil===0) never count as available.
+function anyTokenAvailable(now = Date.now()) {
+  for (let i = 0; i < _tokenCount; i++) {
+    if (!_tokenDead[i]) return true;
+    if (_tokenCooldownUntil[i] > 0 && now >= _tokenCooldownUntil[i]) return true;
+  }
+  return false;
+}
+// Revive an auth-cooled token once its backoff has elapsed. Only auth-cooldowns
+// are revivable: a permanent death has cooldownUntil===0 and is left untouched.
+function reviveTokenIfCooled(idx, now = Date.now()) {
+  if (idx < 0 || idx >= _tokenCount) return false;
+  if (_tokenDead[idx] && _tokenCooldownUntil[idx] > 0 && now >= _tokenCooldownUntil[idx]) {
+    _tokenDead[idx] = false;
+    _tokenCooldownUntil[idx] = 0;
+    if (_tokenReviveTimer[idx]) { clearTimeout(_tokenReviveTimer[idx]); _tokenReviveTimer[idx] = null; }
+    log(`TOKEN REVIVED: token[${idx}]=${_tokenNames[idx]} auth-cooldown elapsed (reset #${_tokenResetCount[idx]}) - back in rotation`);
+    return true;
+  }
+  return false;
 }
 function markTokenValidated(idx) {
   if (idx < 0 || idx >= _tokenCount) return;
@@ -511,11 +555,43 @@ function killTokenImmediately(idx, errorKind, errMsg) {
   if (idx < 0 || idx >= _tokenCount) return;
   _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
   _tokenOtherErrors[idx]++;
+  _tokenCooldownUntil[idx] = 0;  // permanent: never auto-revives
+  if (_tokenReviveTimer[idx]) { clearTimeout(_tokenReviveTimer[idx]); _tokenReviveTimer[idx] = null; }
   if (!_tokenDead[idx]) {
     _tokenDead[idx] = true;
     log(`⚠ TOKEN DEAD (${errorKind}): token[${idx}]=${_tokenNames[idx]} marked dead on first strike. Cursor returned ${errorKind === 'auth_error' ? 'auth failure (invalid/expired token)' : 'account quota exhausted'}. lastError="${_tokenLastError[idx]}"`);
     log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
   }
+}
+
+// Auth error (ERROR_NOT_LOGGED_IN / unauthenticated) - frequently intermittent.
+// Pull the token from rotation and schedule an automatic revival after a backoff
+// instead of killing it permanently. The backoff grows with each reset (capped),
+// and the reset count is surfaced in the TUI so an operator can manually remove a
+// token that keeps tripping. Spawns are gated by anyTokenAvailable(), so we don't
+// spin-respawn onto a token that's still cooling down.
+function coolDownTokenForAuth(idx, errorKind, errMsg) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
+  _tokenResetCount[idx]++;
+  // Exponential backoff by reset count: base, 2x, 4x, ... capped at the max.
+  const backoff = Math.min(
+    TOKEN_AUTH_COOLDOWN_MAX_MS,
+    TOKEN_AUTH_COOLDOWN_MS * 2 ** Math.min(_tokenResetCount[idx] - 1, 20),
+  );
+  _tokenDead[idx] = true;
+  _tokenCooldownUntil[idx] = Date.now() + backoff;
+  log(`TOKEN COOLDOWN (${errorKind}): token[${idx}]=${_tokenNames[idx]} reset #${_tokenResetCount[idx]} - out of rotation for ${Math.round(backoff / 1000)}s, then auto-retry. lastError="${_tokenLastError[idx]}"`);
+  if (_tokenResetCount[idx] >= 5) {
+    log(`  token[${idx}]=${_tokenNames[idx]} has auth-reset ${_tokenResetCount[idx]}x - if it keeps failing, remove it from token.json (ratlc down / up).`);
+  }
+  if (_tokenReviveTimer[idx]) clearTimeout(_tokenReviveTimer[idx]);
+  _tokenReviveTimer[idx] = setTimeout(() => {
+    _tokenReviveTimer[idx] = null;
+    reviveTokenIfCooled(idx);
+    setImmediate(maybeSpawnNext);
+  }, backoff + 50);
+  if (_tokenReviveTimer[idx].unref) _tokenReviveTimer[idx].unref();
 }
 
 const requestQueue = [];
@@ -766,11 +842,15 @@ function handleWorkerMessage(ch, msg) {
 function handleWorkerExit(ch, code, signal) {
   log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}${ch.errorKind ? ` errorKind=${ch.errorKind}` : ''}${ch.error ? ` error="${String(ch.error).slice(0, 120)}"` : ''}`);
   // Feed token health: an other_error death on a token that hasn't been
-  // validated counts as a strike. auth_error and quota_exhausted are
-  // explicit signals from Cursor that the token is broken — mark dead
-  // immediately, no threshold. Once dead, future spawns skip this token.
+  // validated counts as a strike (dead after N). quota_exhausted is a hard
+  // account cap - mark dead immediately, no revival. auth_error is usually
+  // intermittent - cooldown the token and auto-revive after a backoff while
+  // counting resets. Dead/cooling tokens are skipped in rotation.
   if (typeof ch.tokenIdx === 'number') {
-    if (ch.errorKind === 'auth_error' || ch.errorKind === 'quota_exhausted') {
+    if (ch.errorKind === 'auth_error') {
+      // Intermittent auth failure: cooldown + auto-revive instead of a hard kill.
+      coolDownTokenForAuth(ch.tokenIdx, ch.errorKind, ch.error);
+    } else if (ch.errorKind === 'quota_exhausted') {
       killTokenImmediately(ch.tokenIdx, ch.errorKind, ch.error);
     } else if (ch.errorKind === 'other_error') {
       recordTokenOtherError(ch.tokenIdx, ch.error);
@@ -810,6 +890,10 @@ function countOpening() {
 }
 
 function maybeSpawnNext() {
+  // Don't spin-respawn when every token is dead or still cooling down: a fresh
+  // channel would just rotate onto a known-bad token and die instantly. Auth
+  // cooldowns wake us via their revival timer; permanent deaths need an operator.
+  if (!anyTokenAvailable()) return;
   while (countOpening() < POOL_CONCURRENT_OPENS) {
     let spawned = false;
     for (const g of groups.values()) {
@@ -1578,11 +1662,15 @@ function statusSnapshot() {
   for (const g of groups.values()) configuredSize += g.targetSize;
   const tokens = [];
   for (let i = 0; i < _tokenCount; i++) {
+    const coolingDown = _tokenDead[i] && _tokenCooldownUntil[i] > now;
     tokens.push({
       idx: i,
       name: _tokenNames[i],
       validated: _tokenValidated[i],
       dead: _tokenDead[i],
+      coolingDown,
+      cooldownMs: coolingDown ? _tokenCooldownUntil[i] - now : 0,
+      resetCount: _tokenResetCount[i],
       otherErrorCount: _tokenOtherErrors[i],
       lastError: _tokenLastError[i],
     });

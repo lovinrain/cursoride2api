@@ -12,9 +12,9 @@
 # After editing this file, restart the pool with `./launch.sh up`.
 
 # ── Pool sizing & concurrency ──────────────────────────────────────────────
-POOL_SIZE: 10                                  # number of channels to maintain
+POOL_SIZE: 20                                  # number of channels to maintain
 POOL_CONCURRENT_OPENS: 30                      # max channel opens running in parallel during cold start
-POOL_MODEL: claude-opus-4-8-thinking-max-fast,claude-opus-4-7-thinking-max-fast
+POOL_MODEL: claude-opus-4-8-thinking-max-fast
 #POOL_MODEL: claude-opus-4-8-thinking-max-fast,claude-4.6-opus-max-thinking-fast
 
 # ── Tool & context handling ────────────────────────────────────────────────
@@ -220,5 +220,7 @@ RATLC_BUSY_STUCK_TIMEOUT_MS_SLOW: 660000         # non-fast reap (> slow ceiling
 # RATLC_STATS_MIN_SUGGEST_SAMPLES: 30            # min samples before a suggested gap is computed
 # RATLC_STATS_DISABLE: 1                          # turn off all latency recording
 # RATLC_TOKEN_DEATH_THRESHOLD: 3               # strikes before a token gets marked dead on `other_error`
+# RATLC_TOKEN_AUTH_COOLDOWN_MS: 300000         # auth_error (unauthenticated) is intermittent: skip the token this long, then auto-revive & retry. Doubles per reset.
+# RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS: 3600000    # ceiling for the exponential auth-cooldown backoff
 # LOG_REQUEST_TOOLS: 1                         # log incoming /v1/messages tools list
 # POOL_REINJECT_THINKING_DEBUG: 1              # enables POST /v1/_debug/render endpoint used by test_render.sh

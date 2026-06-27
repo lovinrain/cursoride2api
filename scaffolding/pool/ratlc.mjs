@@ -364,7 +364,8 @@ function printStatus(snap) {
   if (!snap?.pool) { console.log(JSON.stringify(snap, null, 2)); return; }
   const { pool, config } = snap;
   const { thinking: thinkingCount, waitTool: waitToolCount, busy: busySilent } = countSplit(pool.channels, pool.busyCount);
-  const deadToks = (pool.tokens || []).filter((t) => t.dead).length;
+  const deadToks = (pool.tokens || []).filter((t) => t.dead && !t.coolingDown).length;
+  const coolToks = (pool.tokens || []).filter((t) => t.coolingDown).length;
   const counts = [
     `ready=${color(pool.readyCount, ANSI.green)}`,
     `thinking=${color(thinkingCount, ANSI.cyan)}`,
@@ -376,6 +377,7 @@ function printStatus(snap) {
   // A dead token will fail every channel that rotates onto it — surface it in the
   // header so token exhaustion is visible at a glance, not buried in the token table.
   if (deadToks) counts.push(color(`⚠tok-dead=${deadToks}/${pool.tokens.length}`, ANSI.red));
+  if (coolToks) counts.push(color(`⏳tok-cooling=${coolToks}/${pool.tokens.length}`, ANSI.yellow));
   console.log(`Pool: ${color(pool.actualSize + '/' + pool.configuredSize, ANSI.bold)} channels  ${counts.join('  ')}  pending=${pool.pendingRequests}  tool_use_index=${pool.toolUseIndex}`);
   const groupCount = (pool.groups || []).length;
   console.log(`Mode: ${color(config.toolMode, ANSI.bold)}  groups=${groupCount} (default=${pool.defaultGroup || config.model})  concurrent_opens=${config.concurrentOpens || 1}  group_wait_ms=${config.groupWaitMs ?? '-'}  contract=${config.toolMode === 'translate' ? 'cursor defaults' : (config.poolToolsContractCount ?? 'unset')}  subagent=${config.subagentSupport == null ? color('?', ANSI.gray) : (config.subagentSupport ? color('on', ANSI.green) : color('off', ANSI.red))}`);
@@ -696,14 +698,27 @@ async function cmdTui() {
       // ERROR_WIDTH: fit the message in the remaining terminal columns.
       // Conservative default 80; truncated cleanly per-row below.
       const termCols = process.stdout.columns || 132;
-      const tw = [4, 18, 12, 6, 9];
-      const fixedWidth = tw.reduce((a, b) => a + b, 0) + 5 /* separators */ + 3 /* '  ' indent */;
+      const tw = [4, 18, 12, 10, 7, 9];
+      const fixedWidth = tw.reduce((a, b) => a + b, 0) + 6 /* separators */ + 3 /* '  ' indent */;
       const errWidth = Math.max(20, Math.min(120, termCols - fixedWidth - 2));
-      const thdr = ['IDX', 'NAME', 'VALIDATED', 'DEAD', 'OTHERERR', 'LAST_ERROR'];
-      out.push('  ' + thdr.slice(0, 5).map((h, i) => color(rpad(h, tw[i]), ANSI.bold)).join(' ') + ' ' + color(thdr[5], ANSI.bold));
+      const thdr = ['IDX', 'NAME', 'VALIDATED', 'DEAD', 'RESETS', 'OTHERERR', 'LAST_ERROR'];
+      out.push('  ' + thdr.slice(0, 6).map((h, i) => color(rpad(h, tw[i]), ANSI.bold)).join(' ') + ' ' + color(thdr[6], ANSI.bold));
       for (const t of tokens) {
         const valTxt = t.validated ? color('✓ yes', ANSI.green) : color('✗ no', ANSI.yellow);
-        const deadTxt = t.dead ? color('YES', ANSI.red + ANSI.bold) : color('no', ANSI.gray);
+        // DEAD cell distinguishes a permanent death (red YES, needs operator
+        // action) from an auth-error cooldown (yellow COOL Ns, auto-revives).
+        const deadTxt = t.coolingDown
+          ? color('COOL ' + Math.ceil((t.cooldownMs || 0) / 1000) + 's', ANSI.yellow + ANSI.bold)
+          : t.dead
+            ? color('YES', ANSI.red + ANSI.bold)
+            : color('no', ANSI.gray);
+        // RESETS: how many times this account was auto-reset after an auth error.
+        // A climbing count means the account keeps failing auth = candidate for
+        // manual removal from token.json even though the pool keeps auto-retrying.
+        const resetCount = t.resetCount || 0;
+        const resetTxt = resetCount > 0
+          ? color(String(resetCount), resetCount >= 5 ? ANSI.red + ANSI.bold : ANSI.yellow)
+          : color('0', ANSI.gray);
         const errCount = t.otherErrorCount || 0;
         const errCntTxt = errCount > 0
           ? color(String(errCount), t.dead ? ANSI.red : ANSI.yellow)
@@ -719,7 +734,8 @@ async function cmdTui() {
           rpad(t.name || '?', tw[1]),
           rpad(valTxt, tw[2]),
           rpad(deadTxt, tw[3]),
-          rpad(errCntTxt, tw[4]),
+          rpad(resetTxt, tw[4]),
+          rpad(errCntTxt, tw[5]),
         ].join(' ') + ' ' + lastErrTxt);
       }
     }
@@ -1024,7 +1040,7 @@ async function cmdInspect(args) {
   } else if (reqId) {
     console.log(`  request ${reqId}: (not in recent /requests window)`);
   }
-  if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
+  if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.coolingDown ? color('COOL ' + Math.ceil((tok.cooldownMs || 0) / 1000) + 's', ANSI.yellow) : tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.resetCount ? ' resets=' + tok.resetCount : ''}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
 }
 
 // ratlc deaths [N] — recent channel deaths (they vanish from the live view in ms).
