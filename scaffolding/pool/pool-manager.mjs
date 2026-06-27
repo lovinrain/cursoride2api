@@ -467,17 +467,47 @@ try {
   log(`WARN: failed to read ${_tokenPath} for rotation count: ${e.message} — assuming single token`);
 }
 const TOKEN_DEATH_THRESHOLD = parseInt(process.env.RATLC_TOKEN_DEATH_THRESHOLD || '3', 10);
-// Auth errors (ERROR_NOT_LOGGED_IN / unauthenticated) are frequently INTERMITTENT:
-// Cursor rejects a token's open with "try logging out and back in", then accepts
-// the very same token minutes later. So rather than killing it for good (as we
-// still do for quota_exhausted), we put the token on a COOLDOWN: skip it in
-// rotation, then auto-revive it after a backoff and let it retry. Each cooldown
-// bumps the token's reset counter (surfaced in the TUI) so an operator can spot a
-// token that keeps tripping and pull it from token.json manually. The backoff
-// grows with each reset (a genuinely-broken token backs off further every time)
-// up to a cap.
-const TOKEN_AUTH_COOLDOWN_MS = Math.max(1000, parseInt(process.env.RATLC_TOKEN_AUTH_COOLDOWN_MS || '300000', 10));
-const TOKEN_AUTH_COOLDOWN_MAX_MS = Math.max(TOKEN_AUTH_COOLDOWN_MS, parseInt(process.env.RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS || '3600000', 10));
+// Token errors are handled in THREE tiers (see tierForKind + the *_KINDS env
+// below). The DEFAULT tier is IGNORE: the token stays in rotation and the channel
+// just respawns, so a cold-start throttle storm (soft resource_exhausted / rate
+// limits) never pulls the pool out from under itself. Only genuine ACCOUNT faults
+// (auth / hard quota) COOL DOWN -- skipped in rotation, exponential backoff, then
+// auto-revived. Nothing is permanently killed unless its kind is in the NEVER set
+// (empty by default). Every error, whatever its tier, is appended to a per-token
+// history ring surfaced by `ratlc errors` so a HUMAN decides when an account is
+// truly done. (RATLC_TOKEN_AUTH_COOLDOWN_MS/_MAX_MS kept as fallback names for the
+// cooldown timings.)
+const TOKEN_COOLDOWN_MS = Math.max(1000, parseInt(process.env.RATLC_TOKEN_COOLDOWN_MS || process.env.RATLC_TOKEN_AUTH_COOLDOWN_MS || '300000', 10));
+const TOKEN_COOLDOWN_MAX_MS = Math.max(TOKEN_COOLDOWN_MS, parseInt(process.env.RATLC_TOKEN_COOLDOWN_MAX_MS || process.env.RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS || '3600000', 10));
+// Three-tier error policy, keyed by a channel-death errorKind:
+//   never    - permanently kill the token (no auto-revive). RATLC_NEVER_RETRY_KINDS,
+//              default EMPTY (nothing is permanently fatal).
+//   cooldown - pull from rotation, exponential backoff, then auto-revive.
+//              RATLC_COOLDOWN_KINDS, default `auth_error,quota_exhausted` (real
+//              account-level faults worth backing off; neither fires during a
+//              normal cold-start throttle storm).
+//   ignore   - DEFAULT for every other kind (rate_limited / resource_exhausted /
+//              other_error / exhausted / generic stream errors): keep the token in
+//              rotation and just retry (respawn a fresh channel), recording the
+//              error so it stays visible in `ratlc errors`. This is what stops a
+//              cold start from cooling every token. An UNVALIDATED token still
+//              escalates to a cooldown after TOKEN_DEATH_THRESHOLD ignore-strikes
+//              (broken-token detection); a validated token retries indefinitely.
+// Set a var to empty (e.g. `RATLC_COOLDOWN_KINDS=`) to empty that tier; move a kind
+// between the two vars to retune live without code changes.
+function parseKindSet(raw, dflt) {
+  const v = raw != null ? raw : dflt;
+  return new Set(String(v).split(',').map((s) => s.trim()).filter(Boolean));
+}
+const COOLDOWN_KINDS = parseKindSet(process.env.RATLC_COOLDOWN_KINDS, 'auth_error,quota_exhausted');
+const NEVER_RETRY_KINDS = parseKindSet(process.env.RATLC_NEVER_RETRY_KINDS, '');
+function tierForKind(kind) {
+  if (NEVER_RETRY_KINDS.has(kind)) return 'never';
+  if (COOLDOWN_KINDS.has(kind)) return 'cooldown';
+  return 'ignore';
+}
+// Per-token error history ring size (newest kept; older evicted).
+const TOKEN_ERROR_HISTORY_MAX = Math.max(1, parseInt(process.env.RATLC_TOKEN_ERROR_HISTORY_MAX || '30', 10));
 const _tokenValidated = new Array(_tokenCount).fill(false);
 const _tokenOtherErrors = new Array(_tokenCount).fill(0);
 const _tokenDead = new Array(_tokenCount).fill(false);
@@ -491,6 +521,19 @@ const _tokenLastError = new Array(_tokenCount).fill(null);
 const _tokenCooldownUntil = new Array(_tokenCount).fill(0);
 const _tokenResetCount = new Array(_tokenCount).fill(0);
 const _tokenReviveTimer = new Array(_tokenCount).fill(null);
+// Full per-token error history (chronological, newest last), bounded to
+// TOKEN_ERROR_HISTORY_MAX. Each entry: { at, kind, message, action, resetNumber?,
+// cooldownMs?, agoMs? }. Powers `ratlc errors` / TUI view 6 so an operator can
+// see every past failure, when it happened, and the retry/reset it triggered.
+const _tokenErrorHistory = Array.from({ length: _tokenCount }, () => []);
+const _tokenLastRevivedAt = new Array(_tokenCount).fill(0);
+const _tokenDeaths = new Array(_tokenCount).fill(0);
+function pushTokenErrorEvent(idx, ev) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  const hist = _tokenErrorHistory[idx];
+  hist.push({ at: Date.now(), ...ev });
+  while (hist.length > TOKEN_ERROR_HISTORY_MAX) hist.shift();
+}
 log(`token rotation: ${_tokenCount} token(s) loaded — [${_tokenNames.join(', ')}], death-threshold=${TOKEN_DEATH_THRESHOLD}`);
 let _nextTokenIdx = 0;
 function nextTokenIndex() {
@@ -523,8 +566,10 @@ function reviveTokenIfCooled(idx, now = Date.now()) {
   if (_tokenDead[idx] && _tokenCooldownUntil[idx] > 0 && now >= _tokenCooldownUntil[idx]) {
     _tokenDead[idx] = false;
     _tokenCooldownUntil[idx] = 0;
+    _tokenLastRevivedAt[idx] = now;
     if (_tokenReviveTimer[idx]) { clearTimeout(_tokenReviveTimer[idx]); _tokenReviveTimer[idx] = null; }
-    log(`TOKEN REVIVED: token[${idx}]=${_tokenNames[idx]} auth-cooldown elapsed (reset #${_tokenResetCount[idx]}) - back in rotation`);
+    pushTokenErrorEvent(idx, { kind: 'revived', message: `cooldown elapsed (reset #${_tokenResetCount[idx]})`, action: 'revived' });
+    log(`TOKEN REVIVED: token[${idx}]=${_tokenNames[idx]} cooldown elapsed (reset #${_tokenResetCount[idx]}) - back in rotation`);
     return true;
   }
   return false;
@@ -533,57 +578,46 @@ function markTokenValidated(idx) {
   if (idx < 0 || idx >= _tokenCount) return;
   if (!_tokenValidated[idx]) {
     log(`token[${idx}]=${_tokenNames[idx]} validated (reached Cursor past auth)`);
+    pushTokenErrorEvent(idx, { kind: 'validated', message: 'reached Cursor past auth', action: 'validated' });
   }
   _tokenValidated[idx] = true;
   _tokenOtherErrors[idx] = 0;  // reset strike count
 }
-function recordTokenOtherError(idx, errMsg) {
+// Single choke-point: stamp lastError + append to the per-token history ring.
+function recordTokenError(idx, kind, errMsg, action, extra = {}) {
   if (idx < 0 || idx >= _tokenCount) return;
   _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
-  if (_tokenValidated[idx]) return;  // proven good before, this is a transient
-  _tokenOtherErrors[idx]++;
-  if (_tokenOtherErrors[idx] >= TOKEN_DEATH_THRESHOLD && !_tokenDead[idx]) {
-    _tokenDead[idx] = true;
-    log(`⚠ TOKEN DEAD: token[${idx}]=${_tokenNames[idx]} marked dead after ${_tokenOtherErrors[idx]} consecutive other_error failures with no validation. lastError="${_tokenLastError[idx]}"`);
-    log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
-  }
-}
-// Definite-fatal kinds (auth_error, quota_exhausted) — Cursor explicitly
-// told us this token is permanently broken (invalid login / account quota
-// exhausted). No retry threshold; mark dead on first strike.
-function killTokenImmediately(idx, errorKind, errMsg) {
-  if (idx < 0 || idx >= _tokenCount) return;
-  _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
-  _tokenOtherErrors[idx]++;
-  _tokenCooldownUntil[idx] = 0;  // permanent: never auto-revives
-  if (_tokenReviveTimer[idx]) { clearTimeout(_tokenReviveTimer[idx]); _tokenReviveTimer[idx] = null; }
-  if (!_tokenDead[idx]) {
-    _tokenDead[idx] = true;
-    log(`⚠ TOKEN DEAD (${errorKind}): token[${idx}]=${_tokenNames[idx]} marked dead on first strike. Cursor returned ${errorKind === 'auth_error' ? 'auth failure (invalid/expired token)' : 'account quota exhausted'}. lastError="${_tokenLastError[idx]}"`);
-    log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
-  }
+  pushTokenErrorEvent(idx, {
+    kind: kind || 'error',
+    message: errMsg ? String(errMsg).slice(0, 300) : '',
+    action: action || 'recorded',
+    ...extra,
+  });
 }
 
-// Auth error (ERROR_NOT_LOGGED_IN / unauthenticated) - frequently intermittent.
-// Pull the token from rotation and schedule an automatic revival after a backoff
-// instead of killing it permanently. The backoff grows with each reset (capped),
-// and the reset count is surfaced in the TUI so an operator can manually remove a
-// token that keeps tripping. Spawns are gated by anyTokenAvailable(), so we don't
-// spin-respawn onto a token that's still cooling down.
-function coolDownTokenForAuth(idx, errorKind, errMsg) {
+// Generalized cooldown - used for EVERY resettable error kind (auth_error,
+// quota_exhausted, other_error past threshold, open-exhausted, ...). Pull the
+// token from rotation and schedule an automatic revival after an exponential
+// backoff (by reset count, capped). resetCount is cumulative and surfaced in the
+// TUI so an operator can spot a token that keeps tripping and pull it from
+// token.json manually. anyTokenAvailable() gates spawns so we never spin-respawn
+// onto a token that is still cooling down.
+function coolDownToken(idx, kind, errMsg) {
   if (idx < 0 || idx >= _tokenCount) return;
-  _tokenLastError[idx] = errMsg ? String(errMsg).slice(0, 200) : null;
   _tokenResetCount[idx]++;
-  // Exponential backoff by reset count: base, 2x, 4x, ... capped at the max.
   const backoff = Math.min(
-    TOKEN_AUTH_COOLDOWN_MAX_MS,
-    TOKEN_AUTH_COOLDOWN_MS * 2 ** Math.min(_tokenResetCount[idx] - 1, 20),
+    TOKEN_COOLDOWN_MAX_MS,
+    TOKEN_COOLDOWN_MS * 2 ** Math.min(_tokenResetCount[idx] - 1, 20),
   );
   _tokenDead[idx] = true;
   _tokenCooldownUntil[idx] = Date.now() + backoff;
-  log(`TOKEN COOLDOWN (${errorKind}): token[${idx}]=${_tokenNames[idx]} reset #${_tokenResetCount[idx]} - out of rotation for ${Math.round(backoff / 1000)}s, then auto-retry. lastError="${_tokenLastError[idx]}"`);
+  recordTokenError(idx, kind, errMsg, `cooldown ${Math.round(backoff / 1000)}s`, {
+    resetNumber: _tokenResetCount[idx],
+    cooldownMs: backoff,
+  });
+  log(`TOKEN COOLDOWN (${kind}): token[${idx}]=${_tokenNames[idx]} reset #${_tokenResetCount[idx]} - out of rotation for ${Math.round(backoff / 1000)}s, then auto-retry. lastError="${_tokenLastError[idx]}"`);
   if (_tokenResetCount[idx] >= 5) {
-    log(`  token[${idx}]=${_tokenNames[idx]} has auth-reset ${_tokenResetCount[idx]}x - if it keeps failing, remove it from token.json (ratlc down / up).`);
+    log(`  token[${idx}]=${_tokenNames[idx]} has reset ${_tokenResetCount[idx]}x - if it keeps failing, remove it from token.json (ratlc down / up).`);
   }
   if (_tokenReviveTimer[idx]) clearTimeout(_tokenReviveTimer[idx]);
   _tokenReviveTimer[idx] = setTimeout(() => {
@@ -592,6 +626,50 @@ function coolDownTokenForAuth(idx, errorKind, errMsg) {
     setImmediate(maybeSpawnNext);
   }, backoff + 50);
   if (_tokenReviveTimer[idx].unref) _tokenReviveTimer[idx].unref();
+}
+
+// Permanent kill - ONLY for kinds in RATLC_NEVER_RETRY_KINDS (empty by default,
+// so this normally never fires). cooldownUntil=0 marks it non-revivable; only
+// `ratlc down`/`up` (or removing it from token.json) brings it back.
+function killTokenPermanently(idx, kind, errMsg) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  _tokenCooldownUntil[idx] = 0;
+  if (_tokenReviveTimer[idx]) { clearTimeout(_tokenReviveTimer[idx]); _tokenReviveTimer[idx] = null; }
+  recordTokenError(idx, kind, errMsg, 'permanent');
+  if (!_tokenDead[idx]) {
+    _tokenDead[idx] = true;
+    log(`⚠ TOKEN DEAD (${kind}): token[${idx}]=${_tokenNames[idx]} is in RATLC_NEVER_RETRY_KINDS - permanently dead, no auto-revive. lastError="${_tokenLastError[idx]}"`);
+    log(`  → future channel spawns will skip this token. ratlc down + fix token.json + ratlc up to revive.`);
+  }
+}
+
+// Orchestrator for every channel death that carried an errorKind. Uniform policy:
+// record it, then EITHER permanently kill (only if the kind is in the operator-
+// configured NEVER_RETRY set) OR cool it down + auto-revive. other_error keeps a
+// light validated-token exemption so a single transient blip (a 503, a stray
+// socket close) on a proven-good token is recorded but kept in rotation until it
+// crosses the strike threshold.
+function recordTokenDeath(idx, kind, errMsg) {
+  if (idx < 0 || idx >= _tokenCount) return;
+  _tokenDeaths[idx]++;
+  const tier = tierForKind(kind);
+  if (tier === 'never') { killTokenPermanently(idx, kind, errMsg); return; }
+  if (tier === 'cooldown') { coolDownToken(idx, kind, errMsg); return; }
+  // ignore tier (default): keep the token in rotation, just record the error so it
+  // shows in `ratlc errors`. A VALIDATED token (one that has reached a post-auth
+  // response) retries indefinitely -- transients are expected. An UNVALIDATED token
+  // that never got through still escalates to a cooldown after TOKEN_DEATH_THRESHOLD
+  // ignore-strikes, so the open lottery doesn't spin forever on a broken account.
+  if (_tokenValidated[idx]) {
+    recordTokenError(idx, kind, errMsg, 'retry');
+    return;
+  }
+  _tokenOtherErrors[idx]++;
+  if (_tokenOtherErrors[idx] >= TOKEN_DEATH_THRESHOLD) {
+    coolDownToken(idx, kind, errMsg);
+  } else {
+    recordTokenError(idx, kind, errMsg, `retry ${_tokenOtherErrors[idx]}/${TOKEN_DEATH_THRESHOLD}`);
+  }
 }
 
 const requestQueue = [];
@@ -841,20 +919,13 @@ function handleWorkerMessage(ch, msg) {
 
 function handleWorkerExit(ch, code, signal) {
   log(`channel ${ch.id} (group=${ch.group}) exited code=${code} signal=${signal} state=${ch.state}${ch.errorKind ? ` errorKind=${ch.errorKind}` : ''}${ch.error ? ` error="${String(ch.error).slice(0, 120)}"` : ''}`);
-  // Feed token health: an other_error death on a token that hasn't been
-  // validated counts as a strike (dead after N). quota_exhausted is a hard
-  // account cap - mark dead immediately, no revival. auth_error is usually
-  // intermittent - cooldown the token and auto-revive after a backoff while
-  // counting resets. Dead/cooling tokens are skipped in rotation.
-  if (typeof ch.tokenIdx === 'number') {
-    if (ch.errorKind === 'auth_error') {
-      // Intermittent auth failure: cooldown + auto-revive instead of a hard kill.
-      coolDownTokenForAuth(ch.tokenIdx, ch.errorKind, ch.error);
-    } else if (ch.errorKind === 'quota_exhausted') {
-      killTokenImmediately(ch.tokenIdx, ch.errorKind, ch.error);
-    } else if (ch.errorKind === 'other_error') {
-      recordTokenOtherError(ch.tokenIdx, ch.error);
-    }
+  // Feed token health (three-tier policy -- see recordTokenDeath): the death is
+  // recorded to the token's error history, then handled by its kind's tier --
+  // ignore (DEFAULT: token stays in rotation, channel just respawns), cooldown
+  // (auth / hard quota: backoff + auto-revive), or never (permanent, only if
+  // configured). Dead/cooling tokens are skipped in rotation.
+  if (typeof ch.tokenIdx === 'number' && ch.errorKind) {
+    recordTokenDeath(ch.tokenIdx, ch.errorKind, ch.error);
   }
   // Snapshot the dying channel (deathReason + still-pending tools) before we
   // delete it, so `ratlc inspect`/`status` can post-mortem it.
@@ -1663,16 +1734,23 @@ function statusSnapshot() {
   const tokens = [];
   for (let i = 0; i < _tokenCount; i++) {
     const coolingDown = _tokenDead[i] && _tokenCooldownUntil[i] > now;
+    const permanentlyDead = _tokenDead[i] && _tokenCooldownUntil[i] === 0;
     tokens.push({
       idx: i,
       name: _tokenNames[i],
       validated: _tokenValidated[i],
       dead: _tokenDead[i],
       coolingDown,
+      permanentlyDead,
       cooldownMs: coolingDown ? _tokenCooldownUntil[i] - now : 0,
+      cooldownUntil: _tokenCooldownUntil[i] || 0,
       resetCount: _tokenResetCount[i],
+      deaths: _tokenDeaths[i],
+      lastRevivedAt: _tokenLastRevivedAt[i] || 0,
+      lastRevivedAgoMs: _tokenLastRevivedAt[i] ? now - _tokenLastRevivedAt[i] : null,
       otherErrorCount: _tokenOtherErrors[i],
       lastError: _tokenLastError[i],
+      errorHistory: _tokenErrorHistory[i].map((e) => ({ ...e, agoMs: now - e.at })),
     });
   }
   return {
@@ -1704,6 +1782,13 @@ function statusSnapshot() {
       queueTimeoutMs: RATLC_QUEUE_TIMEOUT_MS,
       consumedToolTtlMs: RATLC_CONSUMED_TOOL_TTL_MS,
       sessionTtlMs: RATLC_SESSION_TTL_MS,
+      tokenPolicy: {
+        cooldownKinds: [...COOLDOWN_KINDS],
+        neverRetryKinds: [...NEVER_RETRY_KINDS],
+        cooldownMs: TOKEN_COOLDOWN_MS,
+        cooldownMaxMs: TOKEN_COOLDOWN_MAX_MS,
+        deathThreshold: TOKEN_DEATH_THRESHOLD,
+      },
       idlePingMs: IDLE_PING_MS,
       pingTimeoutMs: PING_TIMEOUT_MS,
       poolToolsContractCount: poolTools ? poolTools.length : null,

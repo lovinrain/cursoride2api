@@ -440,14 +440,16 @@ function openOnce(initialPrompt, allTools) {
         // out and back in [ERROR_NOT_LOGGED_IN]". Definite-fatal for this
         // token until it's rotated by the user.
         else if (/ERROR_NOT_LOGGED_IN|unauthenticated/i.test(msg)) resolve({ kind: 'auth_error', msg });
-        // Permanent (or long-cooldown) account quota exhaustion. Cursor
-        // returns "Connect error resource_exhausted: Switched to Composer
-        // 2 after reaching API limit... [ERROR_RATE_LIMITED_CHANGEABLE]".
-        // Different from the soft "Please wait" — this account has hit
-        // its monthly cap, not a per-stream rate limit.
+        // Account quota exhaustion (the MONTHLY cap, not a per-stream throttle):
+        // Cursor returns "...reaching API limit... [ERROR_RATE_LIMITED_CHANGEABLE]".
+        // Keep this NARROW — the bare `resource_exhausted` connect code is also
+        // Cursor's SOFT throttle ("Please wait a moment"), which is extremely
+        // common during cold start. Lumping it in here used to exit every channel
+        // as quota_exhausted and cool every token immediately. Bare
+        // resource_exhausted goes to the soft branch below so it's retried IN-LOOP.
         else if (/ERROR_RATE_LIMITED_CHANGEABLE|API usage limit/i.test(msg)) resolve({ kind: 'quota_exhausted', msg });
         else if (/RATE_LIMIT_EXCEEDED|too many requests/i.test(msg)) resolve({ kind: 'rate_limit_hard', msg });
-        else if (/rate limit/i.test(msg)) resolve({ kind: 'rate_limit_soft', msg });
+        else if (/rate limit|resource_exhausted/i.test(msg)) resolve({ kind: 'rate_limit_soft', msg });
         else resolve({ kind: 'other_error', msg });
       },
     });
@@ -540,6 +542,23 @@ async function openWithRetry(system, callerTools) {
   }
   setState('dead', { error: 'open exhausted', errorKind: 'exhausted' });
   process.exit(1);
+}
+
+// Classify a LIVE-turn error message into a token-fault errorKind, or null when
+// it is ambiguous (a stall, a watchdog reap, a generic stream error) and must NOT
+// be blamed on the token. Mirrors openOnce()'s classifier but only for the
+// account-level kinds that belong in token health; everything else stays
+// unattributed so client-wait reaps etc. don't cool down a healthy token.
+function classifyTokenFaultKind(msg) {
+  const m = String(msg || '');
+  if (/ERROR_NOT_LOGGED_IN|unauthenticated/i.test(m)) return 'auth_error';
+  // Hard monthly cap only (narrow — see openOnce). NOT bare resource_exhausted.
+  if (/ERROR_RATE_LIMITED_CHANGEABLE|API usage limit/i.test(m)) return 'quota_exhausted';
+  // Soft throttle / per-stream rate-limit family, incl. the bare resource_exhausted
+  // connect code. Distinct `rate_limited` kind so the pool can keep the token in
+  // rotation (IGNORE tier) and just record it, instead of cooling it down.
+  if (/RATE_LIMIT_EXCEEDED|too many requests|resource_exhausted|rate limit/i.test(m)) return 'rate_limited';
+  return null;
 }
 
 // ── Live callbacks after open ────────────────────────────────────────────
@@ -646,7 +665,12 @@ function attachLiveCallbacks() {
       const msg = String(err?.message || err || '');
       send({ type: 'error', channelId: CHANNEL_ID, requestId: currentRequestId, message: msg });
       currentRequestId = null;
-      setState('dead', { error: msg });
+      // Attribute account-level faults (auth / quota / resource_exhausted /
+      // rate-limit) to the token so the pool records + cools them down; leave
+      // ambiguous live errors (stalls, reaps, generic stream errors) unattributed
+      // so they are not mistaken for a bad token.
+      const tokenFaultKind = classifyTokenFaultKind(msg);
+      setState('dead', tokenFaultKind ? { error: msg, errorKind: tokenFaultKind } : { error: msg });
       process.exit(1);
     },
   });

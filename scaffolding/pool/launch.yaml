@@ -220,7 +220,17 @@ RATLC_BUSY_STUCK_TIMEOUT_MS_SLOW: 660000         # non-fast reap (> slow ceiling
 # RATLC_STATS_MIN_SUGGEST_SAMPLES: 30            # min samples before a suggested gap is computed
 # RATLC_STATS_DISABLE: 1                          # turn off all latency recording
 # RATLC_TOKEN_DEATH_THRESHOLD: 3               # strikes before a token gets marked dead on `other_error`
-# RATLC_TOKEN_AUTH_COOLDOWN_MS: 300000         # auth_error (unauthenticated) is intermittent: skip the token this long, then auto-revive & retry. Doubles per reset.
-# RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS: 3600000    # ceiling for the exponential auth-cooldown backoff
+# ── Token error policy (three tiers) ───────────────────────────────────────
+# Every channel death is recorded per-token (see `ratlc errors` / TUI view 6).
+# Each errorKind falls in one tier: IGNORE (default — token keeps retrying, stays
+# in rotation), COOLDOWN (pulled out, backoff, auto-revive), or NEVER (permanent).
+# The soft throttle (bare resource_exhausted) is IGNORE, so a cold start never
+# cools the pool; only auth / hard-quota cool down by default.
+# RATLC_COOLDOWN_KINDS: auth_error,quota_exhausted  # kinds that cool down + auto-revive (empty = keep retrying everything)
+# RATLC_NEVER_RETRY_KINDS:                     # kinds to PERMANENTLY kill (empty = nothing is fatal)
+# RATLC_TOKEN_COOLDOWN_MS: 300000              # base cooldown for cooldown-tier kinds; doubles per reset (was RATLC_TOKEN_AUTH_COOLDOWN_MS)
+# RATLC_TOKEN_COOLDOWN_MAX_MS: 3600000         # ceiling for the exponential cooldown backoff
+# RATLC_TOKEN_DEATH_THRESHOLD: 3               # ignore-tier strikes before an UNVALIDATED token escalates to cooldown
+# RATLC_TOKEN_ERROR_HISTORY_MAX: 30            # per-token error events retained for `ratlc errors` / TUI view 6
 # LOG_REQUEST_TOOLS: 1                         # log incoming /v1/messages tools list
 # POOL_REINJECT_THINKING_DEBUG: 1              # enables POST /v1/_debug/render endpoint used by test_render.sh

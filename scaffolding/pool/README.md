@@ -256,9 +256,12 @@ the children + api-server).
 
 | Var | Default | What it controls |
 |---|---|---|
-| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Consecutive `other_error` strikes (with no token validation) before pool-manager marks a token dead and skips it in round-robin. `quota_exhausted` marks the token dead on first strike regardless of this; `auth_error` is intermittent, so the token is instead put on an auto-reviving cooldown (skipped in rotation, revived after a backoff) with a reset count surfaced in the TUI. |
-| `RATLC_TOKEN_AUTH_COOLDOWN_MS` | `300000` (5 min) | Base cooldown a token sits out of rotation after an `auth_error` (`unauthenticated`/`ERROR_NOT_LOGGED_IN`) before it's auto-revived and retried. Doubles per consecutive reset, capped at `RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS`. |
-| `RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS` | `3600000` (1 hr) | Ceiling for the exponential auth-cooldown backoff. |
+| `RATLC_COOLDOWN_KINDS` | `auth_error,quota_exhausted` | CSV of error kinds that COOL DOWN (pull from rotation + exponential backoff + auto-revive). Anything not here and not in the never set is **ignore** (token keeps retrying). Set empty to keep retrying everything. |
+| `RATLC_NEVER_RETRY_KINDS` | _(empty)_ | CSV of kinds to permanently kill (no auto-revive). Empty = nothing is permanently fatal. |
+| `RATLC_TOKEN_DEATH_THRESHOLD` | `3` | Ignore-tier strikes on an **unvalidated** token before it escalates to a cooldown (broken-token detection). Validated tokens retry ignore-tier errors indefinitely. |
+| `RATLC_TOKEN_COOLDOWN_MS` | `300000` (5 min) | Base cooldown a **cooldown-tier** token sits out of rotation before auto-revive. Doubles per consecutive reset, capped at `RATLC_TOKEN_COOLDOWN_MAX_MS`. (Falls back to the older `RATLC_TOKEN_AUTH_COOLDOWN_MS` name.) |
+| `RATLC_TOKEN_COOLDOWN_MAX_MS` | `3600000` (1 hr) | Ceiling for the exponential cooldown backoff. (Falls back to `RATLC_TOKEN_AUTH_COOLDOWN_MAX_MS`.) |
+| `RATLC_TOKEN_ERROR_HISTORY_MAX` | `30` | Per-token error events retained (timestamp + kind + action) for `ratlc errors` and TUI view 6. |
 | `CURSOR_CLIENT_OS` | auto-detected | Forces the `x-cursor-client-os` header. Auto-derives `darwin` when `token.macMachineId` is set and host isn't darwin (Mac-minted token spoofing). Override here to force a value. |
 | `CURSOR_CLIENT_OS_VERSION` | `os.release()` or `23.5.0` for Mac-spoof | Forces `x-cursor-client-os-version` header. |
 | `CURSOR_CLIENT_ARCH` | `process.arch` or `arm64` for Mac-spoof | Forces `x-cursor-client-arch` header. |
@@ -415,34 +418,54 @@ With N > 1, the pool boot log says `token rotation: N token(s) loaded —
 
 ### Token health detection
 
-Bad tokens are detected automatically via the response-kind classifier
-in `bridge-worker.mjs onError`. Three definite-fatal kinds:
+Channel deaths are classified into an `errorKind` (`bridge-worker.mjs`), and the
+pool handles each kind in one of **three tiers**:
 
-| Kind | Pattern | When marked dead |
+| Tier | Default kinds | What happens |
 |---|---|---|
-| `auth_error` | `ERROR_NOT_LOGGED_IN`, `unauthenticated` | Cooldown + auto-revive (reset count tracked) |
-| `quota_exhausted` | `ERROR_RATE_LIMITED_CHANGEABLE`, `API usage limit reached` | First strike |
-| `other_error` | Anything we don't classify | After `RATLC_TOKEN_DEATH_THRESHOLD` strikes (default 3), only if the token has never reached a post-auth response |
+| **ignore** (default) | everything else: `rate_limited` (incl. soft `resource_exhausted`), `other_error`, `exhausted`, generic stream errors (503 / BidiAppend timeout) | Token **stays in rotation**; the channel just respawns. The error is recorded to history (visible in `ratlc errors`) but the token is **not** pulled. This is why a cold-start throttle storm no longer cools the pool. |
+| **cooldown** | `auth_error`, `quota_exhausted` | Token is pulled from rotation, backed off (exponential per reset, capped), then **auto-revived**. Reset count tracked. |
+| **never** | _(empty)_ | Permanent kill, no auto-revive. Only `ratlc down`/`up` brings it back. |
+
+Tiers are set by `RATLC_COOLDOWN_KINDS` (default `auth_error,quota_exhausted`) and
+`RATLC_NEVER_RETRY_KINDS` (default empty); anything in neither set is **ignore**.
+Move a kind between the two vars to retune without code changes (e.g. add
+`rate_limited` to `RATLC_COOLDOWN_KINDS` to back off on soft throttle, or empty the
+cooldown set with `RATLC_COOLDOWN_KINDS=` to keep retrying everything).
+
+> **Important:** the bare `resource_exhausted` connect code is Cursor's **soft
+> throttle** (extremely common during cold start), classified as `rate_limited` →
+> **ignore**. Only the hard monthly cap (`ERROR_RATE_LIMITED_CHANGEABLE` /
+> `API usage limit reached`) is `quota_exhausted` → cooldown. During channel open,
+> soft throttle is retried in-loop and never even reaches token health.
 
 A token is marked **validated** the first time it gets any of: `opened`,
-`unpaid`, `rate_limit_soft`, `rate_limit_hard`, `no_yield` — these all
-prove the token authenticated past Cursor's gate. Validated tokens are
-exempt from `other_error` strikes (treated as transients).
+`unpaid`, `rate_limit_soft`, `rate_limit_hard`, `no_yield` — these all prove the
+token authenticated past Cursor's gate. A **validated** token retries ignore-tier
+errors indefinitely; an **unvalidated** token (never got through) escalates an
+ignore-tier kind to a cooldown after `RATLC_TOKEN_DEATH_THRESHOLD` strikes (default
+3) so the open lottery doesn't spin forever on a broken account.
 
-Dead tokens are skipped in `nextTokenIndex` round-robin. They never get
-new channels until pool restart. To revive: fix the underlying account
-(re-login, refill quota), `ratlc down`, `ratlc up`.
+Cooling-down tokens are skipped in `nextTokenIndex` round-robin and auto-revived
+when their backoff elapses. Every error — whatever its tier — is appended to a
+per-token history ring surfaced by `ratlc errors` / TUI view 6, so a human decides
+when to pull an account from `token.json`.
 
 ### Observing token health
 
 ```bash
 ratlc tui
 # new TOK column on the channel table shows token index per channel
-# new "token health" panel below the group table (only with N > 1 tokens)
-# shows IDX / NAME / VALIDATED / DEAD / OTHERERR / LAST_ERROR per token
+# "token health" panel below the group table (only with N > 1 tokens) shows
+# IDX / NAME / VALIDATED / DEAD (or COOL Ns) / RESETS / OTHERERR / LAST_ERROR
+# press 6 for the per-token ERROR HISTORY view (every error + retry timestamp)
+
+ratlc errors [idx]
+# per-token error timeline: each past error, how long ago, and the cooldown/
+# retry it triggered, plus reset/death counts — so you can decide manual removal
 
 ratlc metrics
-# JSON snapshot now includes `pool.tokens[]` with full per-token state
+# JSON snapshot now includes `pool.tokens[]` with full per-token state + errorHistory
 ```
 
 The pool log emits clear events for every transition:
@@ -797,7 +820,7 @@ LAST_ERROR             the actual Cursor error message (colored)
 |---|---|
 | claude-code hangs mid-conversation | `/tmp/ratlc-api.log` for "→ tool_use to client" then check `/tmp/ratlc-pool.log` for the matching `sendToolResult` and `BidiAppend OK seqno=…` |
 | "API returned an empty or malformed response" | Likely parallel-tool-call bug if the model fires multiple in one turn. We support this now; if it surfaces, check `pendingMcpInfo` map state |
-| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — `stream-summary-h1 code=fail reason="…"` entries reveal which. If reason is `unauthenticated` or `API usage limit reached`, see [§ Token health detection](#token-health-detection) — an `auth_error` token is cooled down and auto-revived (`unauthenticated`); `API usage limit reached` marks it dead on first strike. |
+| Channel stuck `opening` forever | Probabilistic gate or hard rate-limit — `stream-summary-h1 code=fail reason="…"` entries reveal which. If reason is `unauthenticated` or `API usage limit reached`, see [§ Token health detection](#token-health-detection) — auth/quota/other errors are all recorded and the token is cooled down + auto-revived (see `ratlc errors`); nothing is permanently killed unless its kind is in `RATLC_NEVER_RETRY_KINDS`. |
 | Channel stuck `busy` with high `IDLE` | Pool-manager's busy-watchdog will SIGTERM it at `RATLC_BUSY_STUCK_TIMEOUT_MS` (default 240 s). If you're seeing this routinely, check [WATCHDOG_REARM_REVIEW.md](./WATCHDOG_REARM_REVIEW.md) — the tool_use watchdog might be finalizing turns prematurely (re-armed in `3c2f017` to mitigate). |
 | Pool slowly shrinks: token count drops, no new spawns | A token has been marked dead (see [§ Multi-account token rotation](#multi-account-token-rotation)). `ratlc tui` → token-health panel shows which, and the `LAST_ERROR` column shows why. Fix the upstream account, then `ratlc down` + `ratlc up`. |
 | Model returns "READY" instead of answering a long-context question | You're above the model's effective context window. See [NIAH_RESULTS.md](./NIAH_RESULTS.md) — `claude-opus-4-7-max-fast` tops out around 600 k tokens (Cursor truncates from the tail, leaving only the priming "Reply with READY" instruction). |

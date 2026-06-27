@@ -459,7 +459,7 @@ async function cmdTui() {
   const apiLines = [];
   const poolLines = [];
   let dirty = true;
-  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats'
+  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats' | 'errors'
   let showHelp = false;          // '?' toggles a full keymap overlay
   // Throttle the /v1/_stats fetch: render fires on every `dirty` flip (log
   // activity, keypresses, the 1s tick) — up to ~4×/s — but latency percentiles
@@ -616,6 +616,7 @@ async function cmdTui() {
     if (key === '3') { viewMode = 'pool'; dirty = true; return; }
     if (key === '4') { viewMode = 'status'; dirty = true; return; }
     if (key === '5') { viewMode = 'stats'; dirty = true; return; }
+    if (key === '6') { viewMode = 'errors'; dirty = true; return; }
     if (key === 'r') { poolRequest({ type: 'ramp_up', count: 1 }).then(() => { cmdResult = '✓ ramp +1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp+1: ' + e.message; dirty = true; }); return; }
     if (key === 'R') { poolRequest({ type: 'ramp_down', count: 1 }).then(() => { cmdResult = '✓ ramp -1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp-1: ' + e.message; dirty = true; }); return; }
     if (key === 'g') { poolRequest({ type: 'set_subagent_support', value: 'toggle' }).then((r) => { cmdResult = '✓ ' + (r.message || 'subagent toggled'); dirty = true; }).catch((e) => { cmdResult = '✗ subagent: ' + e.message; dirty = true; }); return; }
@@ -813,6 +814,39 @@ async function cmdTui() {
     return out;
   }
 
+  function buildErrorsLines(snap) {
+    const out = [];
+    if (!snap?.pool) { out.push(color('pool unreachable', ANSI.red)); return out; }
+    const tokens = Array.isArray(snap.pool.tokens) ? snap.pool.tokens : [];
+    if (!tokens.length) { out.push(color('  (no tokens in token.json)', ANSI.dim)); return out; }
+    const sd = (ms) => ms == null ? '-' : (ms < 1000 ? ms + 'ms' : ms < 60000 ? Math.round(ms / 1000) + 's' : Math.round(ms / 60000) + 'm');
+    out.push(color('Per-token error history + retry state', ANSI.bold) + color('  (ignore=keep retrying · cooldown=backoff+revive · never=permanent)', ANSI.dim));
+    const _pol = tierPolicyLine(snap.config);
+    if (_pol) out.push(_pol);
+    for (const t of tokens) {
+      const stateTxt = t.permanentlyDead ? color('DEAD permanent', ANSI.red + ANSI.bold)
+        : t.coolingDown ? color('COOLING ' + sd(t.cooldownMs) + ' -> retry', ANSI.yellow + ANSI.bold)
+        : t.validated ? color('ok', ANSI.green) : color('untried', ANSI.gray);
+      const resetsC = (t.resetCount || 0) >= 5 ? ANSI.red + ANSI.bold : (t.resetCount || 0) > 0 ? ANSI.yellow : ANSI.gray;
+      out.push('');
+      out.push(color('token[' + t.idx + '] ', ANSI.bold) + (t.name || '?') + '  ' + stateTxt
+        + '  ' + color('resets=' + (t.resetCount || 0), resetsC)
+        + color('  deaths=' + (t.deaths || 0), ANSI.dim)
+        + (t.lastRevivedAgoMs != null ? color('  revived ' + sd(t.lastRevivedAgoMs) + ' ago', ANSI.dim) : ''));
+      const hist = Array.isArray(t.errorHistory) ? t.errorHistory : [];
+      if (!hist.length) { out.push(color('    (no errors recorded)', ANSI.dim)); continue; }
+      for (const e of hist.slice(-8).reverse()) {
+        const isGood = /revived|validated/.test(e.kind || '');
+        const kindC = isGood ? ANSI.green : /permanent/.test(e.action || '') ? ANSI.red : ANSI.yellow;
+        out.push('    ' + color(sd(e.agoMs).padStart(7) + ' ago', ANSI.dim)
+          + '  ' + color(String(e.kind || '?').padEnd(16), kindC)
+          + ' ' + color(String(e.action || '').padEnd(14), ANSI.dim)
+          + ' ' + String(e.message || '').replace(/\s+/g, ' ').slice(0, 72));
+      }
+    }
+    return out;
+  }
+
   function header(ts) {
     const tabs = (key, label, active) => {
       const tag = key + ':' + label;
@@ -820,7 +854,7 @@ async function cmdTui() {
     };
     return [
       color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
-      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') +
+      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') + tabs('6', 'errors', viewMode === 'errors') +
       '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[g]', ANSI.cyan) + ' subagent ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[?]', ANSI.cyan) + ' keymap ' + color('[q]', ANSI.cyan) + ' quit',
       color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
     ];
@@ -832,7 +866,7 @@ async function cmdTui() {
     return [
       color('  RATLC TUI — keymap', ANSI.bold),
       '',
-      '  ' + d('views  ') + '  ' + k('1') + ' split   ' + k('2') + ' api   ' + k('3') + ' pool   ' + k('4') + ' status   ' + k('5') + ' stats',
+      '  ' + d('views  ') + '  ' + k('1') + ' split   ' + k('2') + ' api   ' + k('3') + ' pool   ' + k('4') + ' status   ' + k('5') + ' stats   ' + k('6') + ' errors',
       '  ' + d('keys   ') + '  ' + k('r') + ' ramp +1   ' + k('R') + ' ramp -1   ' + k('k') + ' restart a stuck channel',
       '           ' + k('g') + ' toggle sub-agents on/off   ' + k('?') + ' this keymap   ' + k('q') + ' quit',
       '  ' + d('command') + '  ' + k(':') + ' ' + d('up [N] [translate|contract] · down · ramp ±N [--group=M]'),
@@ -901,6 +935,10 @@ async function cmdTui() {
     }
     if (viewMode === 'stats') {
       for (const l of formatStatsLines(await getStatsCached())) console.log(l);
+      drawCmdBar(cols); return;
+    }
+    if (viewMode === 'errors') {
+      for (const l of buildErrorsLines(snap)) console.log(l);
       drawCmdBar(cols); return;
     }
     // split — status panel + a compact latency band (always visible by default;
@@ -1040,7 +1078,13 @@ async function cmdInspect(args) {
   } else if (reqId) {
     console.log(`  request ${reqId}: (not in recent /requests window)`);
   }
-  if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.coolingDown ? color('COOL ' + Math.ceil((tok.cooldownMs || 0) / 1000) + 's', ANSI.yellow) : tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.resetCount ? ' resets=' + tok.resetCount : ''}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
+  if (tok) console.log(`  token[${ch.tokenIdx}] ${tok.name || ''}: ${tok.coolingDown ? color('COOL ' + Math.ceil((tok.cooldownMs || 0) / 1000) + 's', ANSI.yellow) : tok.dead ? color('DEAD', ANSI.red) : (tok.validated ? color('ok', ANSI.green) : '?')}${tok.resetCount ? ' resets=' + tok.resetCount : ''}${tok.deaths ? ' deaths=' + tok.deaths : ''}${tok.otherErrorCount ? ' errs=' + tok.otherErrorCount : ''}${tok.lastError ? ' last=' + String(tok.lastError).slice(0, 50) : ''}`);
+  if (tok && Array.isArray(tok.errorHistory) && tok.errorHistory.length) {
+    console.log(`  token error history (newest first; full: ratlc errors ${ch.tokenIdx}):`);
+    for (const e of tok.errorHistory.slice(-6).reverse()) {
+      console.log(`    ${s(e.agoMs).padStart(6)} ago  ${color(String(e.kind || '?').padEnd(15), ANSI.yellow)} ${String(e.action || '').padEnd(13)} ${String(e.message || '').replace(/\s+/g, ' ').slice(0, 70)}`);
+    }
+  }
 }
 
 // ratlc deaths [N] — recent channel deaths (they vanish from the live view in ms).
@@ -1055,6 +1099,54 @@ async function cmdDeaths(args) {
     const sc = /quota|auth|stall|client-wait/i.test(t.deathReason || '') ? ANSI.red : ANSI.yellow;
     console.log(`  ${sd(t.deathAgoMs).padStart(5)}  ${color(String(t.deathReason || '?').padEnd(22), sc)}  ${String(t.id).padEnd(8)} tok[${t.tokenIdx}]  ${t.deathRequestId || ''}`);
   }
+}
+
+// Render the active three-tier policy (cooldown / ignore / never) as one line so an
+// operator can confirm what a kind will do. `ignore` is the default for anything
+// not in the other two sets => the token keeps retrying and stays in rotation.
+function tierPolicyLine(config) {
+  const p = config?.tokenPolicy;
+  if (!p) return null;
+  const cd = (p.cooldownKinds || []).join(',') || '(none)';
+  const nv = (p.neverRetryKinds || []).join(',') || '(none)';
+  return color('policy: ', ANSI.bold)
+    + color('cooldown=', ANSI.dim) + color(cd, ANSI.yellow)
+    + color('  never=', ANSI.dim) + color(nv, nv === '(none)' ? ANSI.gray : ANSI.red)
+    + color('  ignore=', ANSI.dim) + color('everything else (keep retrying)', ANSI.green);
+}
+
+// ratlc errors [idx] — per-token error history + retry/reset state. Every error
+// the pool has seen for a token (auth, quota, transient 503/timeout, open-
+// exhausted, ...), when it happened, and the cooldown/retry it triggered — so an
+// operator can decide whether an account that keeps tripping should be pulled
+// from token.json (nothing is auto-removed; all errors are resettable).
+async function cmdErrors(args) {
+  let snap;
+  try { snap = await getStatus(); } catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
+  const tokens = snap.pool?.tokens || [];
+  if (!tokens.length) { console.log(color('(no tokens)', ANSI.dim)); return; }
+  const _pol = tierPolicyLine(snap.config);
+  if (_pol) console.log(_pol);
+  const want = args[0] != null && /^\d+$/.test(args[0]) ? parseInt(args[0], 10) : null;
+  const sd = (ms) => ms == null ? '-' : (ms < 1000 ? ms + 'ms' : ms < 60000 ? Math.round(ms / 1000) + 's' : Math.round(ms / 60000) + 'm');
+  let shown = 0;
+  for (const t of tokens) {
+    if (want != null && t.idx !== want) continue;
+    shown++;
+    const stateTxt = t.permanentlyDead ? color('DEAD (permanent, in NEVER_RETRY)', ANSI.red + ANSI.bold)
+      : t.coolingDown ? color('COOLING - retry in ' + sd(t.cooldownMs), ANSI.yellow + ANSI.bold)
+      : t.validated ? color('ok', ANSI.green) : color('untried', ANSI.gray);
+    const resetsC = (t.resetCount || 0) >= 5 ? ANSI.red + ANSI.bold : (t.resetCount || 0) > 0 ? ANSI.yellow : ANSI.gray;
+    console.log(`${color('token[' + t.idx + ']', ANSI.bold)} ${t.name || '?'}  ${stateTxt}  ${color('resets=' + (t.resetCount || 0), resetsC)}${color(' deaths=' + (t.deaths || 0), ANSI.dim)}${t.lastRevivedAgoMs != null ? color(' revived=' + sd(t.lastRevivedAgoMs) + ' ago', ANSI.dim) : ''}`);
+    const hist = Array.isArray(t.errorHistory) ? t.errorHistory : [];
+    if (!hist.length) { console.log(color('    (no errors recorded)', ANSI.dim)); continue; }
+    for (const e of hist.slice().reverse()) {
+      const isGood = /revived|validated/.test(e.kind || '');
+      const kindC = isGood ? ANSI.green : /permanent/.test(e.action || '') ? ANSI.red : ANSI.yellow;
+      console.log(`    ${sd(e.agoMs).padStart(7)} ago  ${color(String(e.kind || '?').padEnd(16), kindC)} ${color(String(e.action || '').padEnd(14), ANSI.dim)} ${String(e.message || '').replace(/\s+/g, ' ').slice(0, 90)}`);
+    }
+  }
+  if (want != null && shown === 0) console.log(color(`no token with idx=${want} (have 0..${tokens.length - 1})`, ANSI.red));
 }
 
 async function cmdRestart(args) {
@@ -1240,6 +1332,7 @@ const [, , cmd, ...rest] = process.argv;
       case 'failures': case 'requests': return await cmdFailures(rest);
       case 'inspect': return await cmdInspect(rest);
       case 'deaths': return await cmdDeaths(rest);
+      case 'errors': case 'token-errors': return await cmdErrors(rest);
       case 'restart': case 'restart-channel': return await cmdRestart(rest);
       case 'metrics': return await cmdMetrics();
       case 'stats': return await cmdStats(rest);
