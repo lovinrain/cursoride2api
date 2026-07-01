@@ -77,6 +77,9 @@ const CONNECT_END_STREAM_FLAG = 0b00000010;
 //   • the caller's `!hasEmittedContent` gate — never retry after client-visible
 //     output (would duplicate).
 // Toggle off with RATLC_RETRY_TRANSIENT_UPSTREAM=0.
+// Rationale + correctness (does this break the never-ending conversation? no —
+// conversationId is stable + the turn payload is replayed): see the repo-root
+// doc TRANSIENT_UPSTREAM_RETRY.md.
 const RETRY_TRANSIENT_UPSTREAM = process.env.RATLC_RETRY_TRANSIENT_UPSTREAM !== '0';
 function isFatalUpstreamFault(msg) {
   return /ERROR_NOT_LOGGED_IN|unauthenticated|ERROR_RATE_LIMITED|API usage limit|resource_exhausted|rate.?limit|too many requests|too many computers|unpaid invoice/i.test(String(msg || ''));
