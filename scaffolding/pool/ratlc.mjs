@@ -52,7 +52,7 @@ const API_URL = process.env.RATLC_API_URL || `http://${RATLC_API_HOST}:${RATLC_A
 const ANSI = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
   red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m',
-  blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m',
+  blue: '\x1b[34m', magenta: '\x1b[35m', cyan: '\x1b[36m', gray: '\x1b[90m',
   clear: '\x1b[2J\x1b[H', clearLine: '\x1b[2K',
   hideCursor: '\x1b[?25l', showCursor: '\x1b[?25h',
   altScreen: '\x1b[?1049h', restoreScreen: '\x1b[?1049l',
@@ -472,7 +472,7 @@ async function cmdTui() {
   const apiLines = [];
   const poolLines = [];
   let dirty = true;
-  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats' | 'errors'
+  let viewMode = 'split';        // 'split' | 'api' | 'pool' | 'status' | 'stats' | 'errors' | 'deaths'
   let showHelp = false;          // '?' toggles a full keymap overlay
   // Throttle the /v1/_stats fetch: render fires on every `dirty` flip (log
   // activity, keypresses, the 1s tick) — up to ~4×/s — but latency percentiles
@@ -630,6 +630,7 @@ async function cmdTui() {
     if (key === '4') { viewMode = 'status'; dirty = true; return; }
     if (key === '5') { viewMode = 'stats'; dirty = true; return; }
     if (key === '6') { viewMode = 'errors'; dirty = true; return; }
+    if (key === '7') { viewMode = 'deaths'; dirty = true; return; }
     if (key === 'r') { poolRequest({ type: 'ramp_up', count: 1 }).then(() => { cmdResult = '✓ ramp +1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp+1: ' + e.message; dirty = true; }); return; }
     if (key === 'R') { poolRequest({ type: 'ramp_down', count: 1 }).then(() => { cmdResult = '✓ ramp -1'; dirty = true; }).catch((e) => { cmdResult = '✗ ramp-1: ' + e.message; dirty = true; }); return; }
     if (key === 'g') { poolRequest({ type: 'set_subagent_support', value: 'toggle' }).then((r) => { cmdResult = '✓ ' + (r.message || 'subagent toggled'); dirty = true; }).catch((e) => { cmdResult = '✗ subagent: ' + e.message; dirty = true; }); return; }
@@ -682,6 +683,19 @@ async function cmdTui() {
       out.push(color('▶ WARMING UP — wait for ready≥1 before launching claude-code', ANSI.yellow + ANSI.bold) + color('  (best attempt: ' + maxAttempts + ')', ANSI.dim));
     } else {
       out.push(color('▶ NOT READY — no channels opening; check status', ANSI.red + ANSI.bold));
+    }
+
+    // Death-churn breadcrumb: surface how many channels were discarded recently so
+    // high turnover is visible on the default view, and point at the audit tab.
+    const deaths = Array.isArray(pool.recentDeaths) ? pool.recentDeaths : [];
+    if (deaths.length) {
+      const last5 = deaths.filter((t) => (t.deathAgoMs ?? Infinity) < 300000).length;
+      if (last5 > 0) {
+        const top = Object.entries(deaths.filter((t) => (t.deathAgoMs ?? Infinity) < 300000)
+          .reduce((m, t) => { const k = String(t.deathReason || '?').replace(/@\d+m?s?/, ''); m[k] = (m[k] || 0) + 1; return m; }, {}))
+          .sort((a, b) => b[1] - a[1])[0];
+        out.push(color(`⚰ ${last5} channel death(s) in last 5m` + (top ? ` (mostly ${top[0]})` : '') + ' — press 7 for the death audit', last5 >= 5 ? ANSI.red : ANSI.yellow));
+      }
     }
 
     // Per-group summary table (only shown when there's more than one group;
@@ -867,7 +881,7 @@ async function cmdTui() {
     };
     return [
       color('ratlc tui', ANSI.bold) + '  ' + color(ts, ANSI.dim) +
-      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') + tabs('6', 'errors', viewMode === 'errors') +
+      '   views: ' + tabs('1', 'split', viewMode === 'split') + tabs('2', 'api', viewMode === 'api') + tabs('3', 'pool', viewMode === 'pool') + tabs('4', 'status', viewMode === 'status') + tabs('5', 'stats', viewMode === 'stats') + tabs('6', 'errors', viewMode === 'errors') + tabs('7', 'deaths', viewMode === 'deaths') +
       '   actions: ' + color('[r]', ANSI.cyan) + '+1 ' + color('[R]', ANSI.cyan) + '-1 ' + color('[k]', ANSI.cyan) + ' restart-stuck ' + color('[g]', ANSI.cyan) + ' subagent ' + color('[:]', ANSI.cyan) + ' cmd ' + color('[?]', ANSI.cyan) + ' keymap ' + color('[q]', ANSI.cyan) + ' quit',
       color('─'.repeat(Math.max(1, (process.stdout.columns || 100) - 1)), ANSI.dim),
     ];
@@ -879,7 +893,7 @@ async function cmdTui() {
     return [
       color('  RATLC TUI — keymap', ANSI.bold),
       '',
-      '  ' + d('views  ') + '  ' + k('1') + ' split   ' + k('2') + ' api   ' + k('3') + ' pool   ' + k('4') + ' status   ' + k('5') + ' stats   ' + k('6') + ' errors',
+      '  ' + d('views  ') + '  ' + k('1') + ' split   ' + k('2') + ' api   ' + k('3') + ' pool   ' + k('4') + ' status   ' + k('5') + ' stats   ' + k('6') + ' errors   ' + k('7') + ' deaths',
       '  ' + d('keys   ') + '  ' + k('r') + ' ramp +1   ' + k('R') + ' ramp -1   ' + k('k') + ' restart a stuck channel',
       '           ' + k('g') + ' toggle sub-agents on/off   ' + k('?') + ' this keymap   ' + k('q') + ' quit',
       '  ' + d('command') + '  ' + k(':') + ' ' + d('up [N] [translate|contract] · down · ramp ±N [--group=M]'),
@@ -952,6 +966,10 @@ async function cmdTui() {
     }
     if (viewMode === 'errors') {
       for (const l of buildErrorsLines(snap)) console.log(l);
+      drawCmdBar(cols); return;
+    }
+    if (viewMode === 'deaths') {
+      for (const l of buildDeathsLines(snap, Math.max(3, rows - hdr.length - cmdBarLines - 5))) console.log(l);
       drawCmdBar(cols); return;
     }
     // split — status panel + a compact latency band (always visible by default;
@@ -1101,17 +1119,62 @@ async function cmdInspect(args) {
 }
 
 // ratlc deaths [N] — recent channel deaths (they vanish from the live view in ms).
+// Per-CHANNEL death audit (the tombstones): a post-mortem of every channel that
+// was discarded/respawned, newest first — reason, lifetime, rounds served, the raw
+// upstream error, and any tool_results it was still holding at death. THE answer to
+// "why did my ready channel go away?". Shared by `ratlc deaths` (one-shot) and TUI
+// view 7 (live). Reads snap.pool.recentDeaths.
+function buildDeathsLines(snap, maxRows = 30) {
+  const out = [];
+  if (!snap?.pool) { out.push(color('pool unreachable', ANSI.red)); return out; }
+  const sd = (ms) => ms == null ? '-' : (ms < 1000 ? ms + 'ms' : ms < 60000 ? Math.round(ms / 1000) + 's' : ms < 3600000 ? Math.round(ms / 60000) + 'm' : (ms / 3600000).toFixed(1) + 'h');
+  out.push(color('Channel deaths', ANSI.bold) + color('  — why channels were discarded & respawned (newest first · inspect one: ratlc inspect <ch>)', ANSI.dim));
+  if (snap.pool.recentDeaths === undefined) {
+    out.push(color('  (this pool-manager predates death tombstones — restart with ./launch.sh up to enable)', ANSI.yellow));
+    return out;
+  }
+  const deaths = Array.isArray(snap.pool.recentDeaths) ? snap.pool.recentDeaths : [];
+  if (!deaths.length) { out.push(''); out.push(color('  no channel deaths recorded — the pool has been stable ✓', ANSI.green)); return out; }
+  // Summary: churn rate + reason tally (normalize the @Ns suffix so reap:busy@30s and @240s group).
+  const norm = (r) => String(r || '?').replace(/@\d+m?s?/, '');
+  const last1 = deaths.filter((t) => (t.deathAgoMs ?? Infinity) < 60000).length;
+  const last5 = deaths.filter((t) => (t.deathAgoMs ?? Infinity) < 300000).length;
+  const tally = {};
+  for (const t of deaths) { const k = norm(t.deathReason); tally[k] = (tally[k] || 0) + 1; }
+  const tallyStr = Object.entries(tally).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k} ${color(String(v), ANSI.bold)}`).join('  ');
+  out.push(color(`  churn: ${last1} in last 1m · ${last5} in last 5m · ${deaths.length} shown`, last5 >= 5 ? ANSI.red + ANSI.bold : last5 > 0 ? ANSI.yellow : ANSI.dim));
+  out.push(color('  by reason: ', ANSI.dim) + tallyStr);
+  out.push('');
+  const W = [6, 8, 19, 13, 4, 6];
+  const hdr = ['AGE', 'CHANNEL', 'GROUP', 'TOKEN', 'RND', 'LIFE'];
+  out.push('  ' + hdr.map((h, i) => color(padAnsi(h, W[i]), ANSI.bold)).join(' ') + '  ' + color('REASON / upstream error', ANSI.bold));
+  for (const t of deaths.slice(0, Math.max(1, maxRows))) {
+    const life = (t.openedAt && t.deathAt) ? sd(t.deathAt - t.openedAt) : color('—', ANSI.gray);  // — = died before ever reaching ready
+    const grp = String(t.group || '?').replace(/^claude-/, '').slice(0, W[2]);
+    const tok = String(t.tokenName || ('tok' + t.tokenIdx)).split('@')[0].slice(0, W[3]);
+    const sev = /quota|auth|permanent|rate.?limit|resource_exhausted/i.test((t.deathReason || '') + ' ' + (t.error || '')) ? ANSI.red : ANSI.yellow;
+    let reason = color(t.deathReason || '?', sev);
+    if (t.error) reason += color('  ' + String(t.error).replace(/\s+/g, ' ').slice(0, 44), ANSI.dim);
+    if (Array.isArray(t.pendingTools) && t.pendingTools.length) {
+      reason += color(`  ⚠ held ${t.pendingTools.length} tool(s): ${t.pendingTools.map((p) => p.toolName || '?').slice(0, 3).join(',')}`, ANSI.magenta);
+    }
+    const rounds = t.roundsServed || 0;
+    out.push('  ' + [
+      padAnsi(sd(t.deathAgoMs), W[0]),
+      padAnsi(String(t.id || '?'), W[1]),
+      padAnsi(grp, W[2]),
+      padAnsi(tok, W[3]),
+      padAnsi(color(String(rounds), rounds > 0 ? ANSI.green : ANSI.gray), W[4]),
+      padAnsi(life, W[5]),
+    ].join(' ') + '  ' + reason);
+  }
+  return out;
+}
+
 async function cmdDeaths(args) {
   const n = parseInt(args[0] || '30', 10);
   let snap; try { snap = await getStatus(); } catch (e) { console.error(color('pool unreachable: ' + e.message, ANSI.red)); process.exit(1); }
-  const d = (snap.pool?.recentDeaths || []).slice(0, Number.isFinite(n) ? n : 30);
-  if (!d.length) { console.log('(no recent channel deaths retained — old pool, or none yet)'); return; }
-  const sd = (ms) => ms == null ? '-' : (ms < 60000 ? Math.round(ms / 1000) + 's' : Math.round(ms / 60000) + 'm');
-  console.log(`recent channel deaths (${d.length}, newest first) — inspect one with \`ratlc inspect <ch>\`:`);
-  for (const t of d) {
-    const sc = /quota|auth|stall|client-wait/i.test(t.deathReason || '') ? ANSI.red : ANSI.yellow;
-    console.log(`  ${sd(t.deathAgoMs).padStart(5)}  ${color(String(t.deathReason || '?').padEnd(22), sc)}  ${String(t.id).padEnd(8)} tok[${t.tokenIdx}]  ${t.deathRequestId || ''}`);
-  }
+  for (const l of buildDeathsLines(snap, Number.isFinite(n) ? n : 30)) console.log(l);
 }
 
 // Render the active three-tier policy (cooldown / ignore / never) as one line so an
