@@ -1144,6 +1144,8 @@ function buildDeathsLines(snap, maxRows = 30) {
   const tallyStr = Object.entries(tally).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k} ${color(String(v), ANSI.bold)}`).join('  ');
   out.push(color(`  churn: ${last1} in last 1m · ${last5} in last 5m · ${deaths.length} shown`, last5 >= 5 ? ANSI.red + ANSI.bold : last5 > 0 ? ANSI.yellow : ANSI.dim));
   out.push(color('  by reason: ', ANSI.dim) + tallyStr);
+  out.push(color('  key:  worker:exhausted', ANSI.gray) + color('=never opened, token throttled (RND=0, LIFE=—)   ', ANSI.dim) + color('worker:<err>', ANSI.gray) + color('=died mid-turn on upstream error', ANSI.dim));
+  out.push(color('        reap:*', ANSI.gray) + color('=pool killed it (silent/stuck/wait-tool/ping)   ', ANSI.dim) + color('stall:upstream', ANSI.gray) + color('=Cursor stalled   ', ANSI.dim) + color('exit:*', ANSI.gray) + color('=process exit (clean/killed/crash)', ANSI.dim));
   out.push('');
   const W = [6, 8, 19, 13, 4, 6];
   const hdr = ['AGE', 'CHANNEL', 'GROUP', 'TOKEN', 'RND', 'LIFE'];

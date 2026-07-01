@@ -927,6 +927,14 @@ function handleWorkerExit(ch, code, signal) {
   if (typeof ch.tokenIdx === 'number' && ch.errorKind) {
     recordTokenDeath(ch.tokenIdx, ch.errorKind, ch.error);
   }
+  // If nothing already classified the death (worker:*, reap:*, stall:*), label
+  // it with the actual process outcome so a bare "exit" is self-explanatory:
+  //   exit:clean   — code 0 (graceful shutdown, e.g. group drain / 'shutdown' IPC)
+  //   exit:SIGKILL — killed (restart-stuck 'k', external kill, OOM)
+  //   exit:code=N  — worker exited non-zero without tagging a reason (crash path)
+  if (!ch.deathReason) {
+    ch.deathReason = signal ? `exit:${signal}` : (code === 0 ? 'exit:clean' : `exit:code=${code}`);
+  }
   // Snapshot the dying channel (deathReason + still-pending tools) before we
   // delete it, so `ratlc inspect`/`status` can post-mortem it.
   recordDeadTombstone(ch);
