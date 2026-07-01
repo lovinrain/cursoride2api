@@ -65,6 +65,34 @@ const {
 // Connect-protocol "end stream" frame flag
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 
+// ── Recoverable-upstream retry ──────────────────────────────────────────────
+// Keep a warm channel ALIVE through a transient Cursor backend/transport blip
+// (5xx, aborted stream, BidiAppend fetch error, connection reset) by re-issuing
+// the turn on a fresh stream — instead of tearing the whole channel down and
+// paying the (throttle-expensive) re-open. failOrRetry already does this for
+// NGHTTP2/socket errors; these classifiers extend it to the backend errors that
+// otherwise dominate channel deaths. Two hard guards keep it safe:
+//   • NEVER for fatal faults (auth / quota / rate-limit) — those need a different
+//     token or a real backoff, not an immediate same-token retry.
+//   • the caller's `!hasEmittedContent` gate — never retry after client-visible
+//     output (would duplicate).
+// Toggle off with RATLC_RETRY_TRANSIENT_UPSTREAM=0.
+const RETRY_TRANSIENT_UPSTREAM = process.env.RATLC_RETRY_TRANSIENT_UPSTREAM !== '0';
+function isFatalUpstreamFault(msg) {
+  return /ERROR_NOT_LOGGED_IN|unauthenticated|ERROR_RATE_LIMITED|API usage limit|resource_exhausted|rate.?limit|too many requests|too many computers|unpaid invoice/i.test(String(msg || ''));
+}
+// `code` is the structured tag failOrRetry's callers pass (HTTP_5xx,
+// ERR_BIDI_APPEND[_5xx], ERR_STREAM, ERR_RES, ERR_REQ); `msg` is the raw text.
+function isRecoverableUpstreamError(msg, code) {
+  const m = String(msg || ''); const c = String(code || '');
+  if (isFatalUpstreamFault(m)) return false;  // fatal faults are never "recoverable"
+  return /^HTTP_50[234]$/.test(c)                              // RunSSE 502/503/504
+    || /^ERR_BIDI_APPEND(_50[234])?$/.test(c)                  // BidiAppend fetch err / 5xx
+    || c === 'ERR_RES' || c === 'ERR_REQ'                      // response/request transport error
+    || (c === 'ERR_STREAM' && /abort|reset|closed|socket|econn|timed?\s*out|broken|network/i.test(m))  // "Response error: aborted"
+    || /RunSSE non-200:\s*50[234]|Bad Gateway|Service Unavailable|Response error: aborted|BidiAppend.*(fetch error|returned 50[234])/i.test(m);
+}
+
 // ── Module-load: kick off proto load so the first startConversation()
 //   call is fast. cursor-agent.js already pre-warms, but if this module
 //   is imported standalone it doesn't hurt to nudge again.
@@ -1079,7 +1107,10 @@ function startConversation(token, options = {}) {
       /NGHTTP2_REFUSED_STREAM|REFUSED_STREAM/i.test(msg) ||
       /NGHTTP2_INTERNAL_ERROR|INTERNAL_ERROR/i.test(msg) ||
       /socket hang up|ECONNRESET|EPIPE|ETIMEDOUT/i.test(msg) ||
-      code === 'ERR_H1_STALL' || code === 'ERR_SOCKET_CLOSED';
+      code === 'ERR_H1_STALL' || code === 'ERR_SOCKET_CLOSED' ||
+      // Recoverable Cursor backend blips (5xx / aborted / BidiAppend / transport)
+      // — retry the turn on a fresh stream instead of tearing the channel down.
+      (RETRY_TRANSIENT_UPSTREAM && isRecoverableUpstreamError(msg, code));
 
     const safeToRetry = !hasEmittedContent && retryAttempts < MAX_REQUEST_RETRIES && isTransient;
     dumpStreamSummary(msg, code || 'stream-error');
@@ -1185,4 +1216,7 @@ function startConversation(token, options = {}) {
 module.exports = {
   startConversation,
   deterministicConversationId,
+  // Exposed for tests: the recoverable-vs-fatal retry classification.
+  isRecoverableUpstreamError,
+  isFatalUpstreamFault,
 };
