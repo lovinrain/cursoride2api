@@ -12,7 +12,7 @@
 # After editing this file, restart the pool with `./launch.sh up`.
 
 # ── Pool sizing & concurrency ──────────────────────────────────────────────
-POOL_SIZE: 20                                  # number of channels to maintain
+POOL_SIZE: 15                                 # number of channels to maintain
 POOL_CONCURRENT_OPENS: 30                      # max channel opens running in parallel during cold start
 POOL_MODEL: claude-opus-4-8-thinking-max-fast
 #POOL_MODEL: claude-opus-4-8-thinking-max-fast,claude-4.6-opus-max-thinking-fast
@@ -43,6 +43,12 @@ POOL_PROXY_THINKING_BLOCKS: 1                   # 0=capture only (legacy); 1=str
 # ── Retry behavior on rate-limit during channel open ───────────────────────
 RATLC_RETRY_MODE: constant                     # constant | aimd
 RATLC_CONSTANT_INTERVAL_MS: 500                # interval between attempts in constant mode
+# How many times a channel re-attempts the open before giving up with `open
+# exhausted` (errorKind=exhausted -> ignore tier -> respawn on the next token).
+# At constant 500ms x jitter, 2500 attempts is roughly ~20min of grinding through
+# a throttle window before it yields. Lower it to rotate to a fresh channel/token
+# sooner; raise it to ride out longer throttles on the same token.
+RATLC_OPEN_RETRY_MAX: 2500                      # max open attempts per channel (code default also 2500)
 
 # ── Cursor backend native passthrough ──────────────────────────────────────
 # Required for native WebSearch (PR #1's webSearchToolCall surfacing). With

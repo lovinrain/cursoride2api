@@ -200,11 +200,24 @@ async function cmdUp(args) {
   });
   fs.writeFileSync(API_PID, String(apiProc.pid));
   apiProc.unref();
-  await new Promise((r) => setTimeout(r, 1500));
 
-  // Verify api-server is responsive.
+  // Verify api-server is responsive. POLL rather than a single fixed-delay probe:
+  // at large POOL_SIZE/POOL_CONCURRENT_OPENS the pool-manager forks dozens of
+  // workers that storm Cursor the instant it boots, starving the api-server's
+  // Node startup so it binds a bit later. A one-shot check raced that and printed
+  // a false "didn't come up" (ECONNREFUSED) while the server was in fact about to
+  // bind. Probe every 500ms for up to ~20s; succeed the instant it answers.
+  const API_UP_TIMEOUT_MS = parseInt(process.env.RATLC_API_UP_TIMEOUT_MS || '20000', 10);
+  const _deadline = Date.now() + API_UP_TIMEOUT_MS;
+  let h = null, _lastErr = null;
+  while (Date.now() < _deadline) {
+    try { h = await getHealth(); break; } catch (e) { _lastErr = e; }
+    // Bail early with a clear message if the process already exited.
+    if (!(await isProcAlive(API_PID))) { _lastErr = new Error('api-server process exited during startup'); break; }
+    await new Promise((r) => setTimeout(r, 500));
+  }
   try {
-    const h = await getHealth();
+    if (!h) throw _lastErr || new Error('timed out waiting for /health');
     console.log(color(`✅ api-server up at ${API_URL}`, ANSI.green));
     console.log(color(`   pool:  ${POOL_LOG}`, ANSI.dim));
     console.log(color(`   api:   ${API_LOG}`, ANSI.dim));
