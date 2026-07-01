@@ -21,6 +21,48 @@ If it misbehaves, flip the kill-switch — no code revert needed (see Revert).
 
 ---
 
+## ⚠ SCOPE: this retry is TURN-1-ONLY — and why channels still die "after a successful turn"
+
+**The in-place retry only applies to a channel's FIRST turn.** This is a hard
+property of the current transport, not a config choice:
+
+- A channel has **one long-lived RunSSE stream**. Turn 1 is the `runRequest`;
+  follow-up turns are pushed as **fire-and-forget BidiAppend frames** that are
+  never stored anywhere (`sendBinaryFrame` → `_doBidiAppend`, cursor-agent-h1.js).
+- `failOrRetry` retries by re-opening the stream, resetting `appendSeqno = 0n`,
+  and re-sending **`cachedInitialEncoded`, which is frozen as turn 1's payload**
+  (`cursor-agent-h1.js`, set once at start, never updated per turn).
+- The retry is gated by `!hasEmittedContent`, and `hasEmittedContent` is set true
+  on turn 1's first output and **never reset**. So for turn 2+ `safeToRetry` is
+  always false → the follow-up-turn retry branch is **currently dead code.**
+
+**Consequence — this is exactly the "bizarre UX" (channel vanishes after a
+successful turn):** a channel serves turn 1..N fine, then a transient blip on turn
+N+1 (before its content) **cannot be retried in place** (doing so would re-send
+turn 1 and break the seqno sequence), so the channel is torn down. The earlier
+turns succeeded — which is why it "felt like things were going well" — then it
+went away.
+
+**This is currently CORRECT, just churny.** Tearing down is the *safe* choice: the
+api-server then retries the whole request on a **fresh** channel, rebuilding
+FULL context (`buildFullContextCursorMcpContent`), so the user's request still
+completes. Only the warm channel is lost (an expensive re-open under throttle).
+
+**Do NOT "fix" this by simply resetting `hasEmittedContent` per turn.** That would
+enable the dead retry branch and re-send **turn 1's** prompt on a turn-N+1 retry
+(wrong turn) with a conflicting `appendSeqno` — corrupting the conversation. A
+*correct* follow-up-turn retry requires: (1) reset `hasEmittedContent` per turn,
+(2) capture the CURRENT turn's encoded frames and replay THOSE (not
+`cachedInitialEncoded`), and (3) preserve `appendSeqno` continuity (don't reset to
+0 for turn 2+). That is a real, correctness-sensitive feature — design + test it
+deliberately, don't bolt it on.
+
+**Net:** the widened classifier below reduces churn on a channel's FIRST turn.
+Follow-up-turn churn is unchanged (and safe) until/unless the per-turn replay above
+is built.
+
+---
+
 ## Why the channel matters (the design constraint we must not break)
 
 A RATLC **channel = one long-lived Cursor Agent conversation** (a stable

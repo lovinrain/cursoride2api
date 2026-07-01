@@ -476,6 +476,7 @@ async function openWithRetry(system, callerTools) {
   // toward floor otherwise).
   let currentWait = RETRY_MODE === 'aimd' ? INITIAL_WAIT_MS : CONSTANT_INTERVAL_MS;
   let tokenValidatedReported = false;
+  let lastOpenResult = null;  // remember the final open failure so exhaustion is concrete
   for (let attempt = 1; attempt <= OPEN_RETRY_MAX; attempt++) {
     openAttempts = attempt;
     // Push state on every attempt so the TUI's ATTEMPTS column tracks retry
@@ -484,6 +485,7 @@ async function openWithRetry(system, callerTools) {
     // the pool socket cares about.
     setState('opening', { waitMs: currentWait });
     const result = await openOnce(primingPrompt, allTools);
+    lastOpenResult = result;
     // Any kind in this validation set proves the token reached Cursor's
     // backend past auth — opened, unpaid (probabilistic gate),
     // rate_limit_* (throttle), or no_yield are all post-auth signals.
@@ -540,7 +542,11 @@ async function openWithRetry(system, callerTools) {
     await sleep(jitter(currentWait));
     continue;
   }
-  setState('dead', { error: 'open exhausted', errorKind: 'exhausted' });
+  // Concrete exhaustion reason: name the throttle we kept hitting, e.g.
+  // "open exhausted after 2500 tries (rate_limit_soft: resource_exhausted…)".
+  const _lastKind = lastOpenResult?.kind || 'unknown';
+  const _lastMsg = lastOpenResult?.msg ? `: ${String(lastOpenResult.msg).replace(/\s+/g, ' ').slice(0, 90)}` : '';
+  setState('dead', { error: `open exhausted after ${OPEN_RETRY_MAX} tries (${_lastKind}${_lastMsg})`, errorKind: 'exhausted' });
   process.exit(1);
 }
 
