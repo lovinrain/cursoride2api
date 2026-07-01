@@ -125,6 +125,16 @@ RATLC_RETRY_UPSTREAM_ABORT_MAX: 2              # 0=off, N=up to N retries on pre
 # continuation is a fresh generation conditioned on the partial — usually
 # seamless, but may occasionally re-phrase the join; set 0 if undesirable.)
 RATLC_RETRY_CONTINUE_AFTER_ABORT_MAX: 2        # 0=off, N=up to N self-driven continuations per turn
+# transient-upstream IN-PLACE retry (channel survival) — DIFFERENT LAYER from the
+# four MAX vars above. Those retry a request on a FRESH channel (api-server). THIS
+# one retries the turn on a fresh STREAM to the SAME Cursor conversation (same
+# conversationId, same warm channel) so a transient backend blip (RunSSE 502/503,
+# "Response error: aborted", BidiAppend fetch/5xx, socket reset) does NOT tear the
+# channel down + force an expensive re-open. Only before any client-visible output;
+# NEVER for auth/quota/rate-limit (those stay fatal). Bounded (5 retries + backoff).
+# Preserves the never-ending multi-turn conversation — see TRANSIENT_UPSTREAM_RETRY.md.
+# This is the KILL-SWITCH: set 0 to revert to old tear-down-on-transient behavior.
+RATLC_RETRY_TRANSIENT_UPSTREAM: 1              # 1=on (default), 0=off (revert)
 
 # ── Time-to-first-byte patience (Option A: wait-and-reuse over kill-and-retry) ─
 # This watchdog is a TIME-TO-FIRST-BYTE gate, NOT a generation cap — it disarms
