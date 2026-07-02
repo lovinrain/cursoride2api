@@ -4,7 +4,7 @@
 // torn down. Uses the exact error strings/codes seen in real channel-death
 // tombstones. Recoverable → retry (channel survives). Fatal → teardown.
 const assert = require('node:assert/strict');
-const { isRecoverableUpstreamError, isFatalUpstreamFault } = require('../../src/cursor-agent-h1');
+const { isRecoverableUpstreamError, isFatalUpstreamFault, isRetryableTransientType } = require('../../src/cursor-agent-h1');
 
 let fail = 0;
 const ok = (name, cond) => { if (cond) { console.log('  ✓ ' + name); } else { console.log('  ✗ ' + name); fail++; } };
@@ -42,6 +42,13 @@ ok('503 code but resource_exhausted body → fatal', isRecoverableUpstreamError(
 console.log('=== unrelated / non-transient → not classified as recoverable-upstream ===');
 ok('unexpected_turn_ended → not recoverable (handled elsewhere)', isRecoverableUpstreamError('unexpected_turn_ended', 'ERR_TURN') === false);
 ok('plain empty → not recoverable', isRecoverableUpstreamError('', '') === false);
+
+console.log('=== isRetryableTransientType (labels a death: transport OR recoverable-upstream, not fatal) ===');
+ok('NGHTTP2 refused → retryable type', isRetryableTransientType('NGHTTP2_REFUSED_STREAM', 'ERR_HTTP2_STREAM_ERROR') === true);
+ok('socket reset → retryable type', isRetryableTransientType('read ECONNRESET', 'ERR_REQ') === true);
+ok('RunSSE 503 → retryable type', isRetryableTransientType('RunSSE non-200: 503', 'HTTP_503') === true);
+ok('rate limit → NOT retryable type (fatal)', isRetryableTransientType("resource_exhausted: rate limit", 'HTTP_429') === false);
+ok('auth → NOT retryable type (fatal)', isRetryableTransientType('ERROR_NOT_LOGGED_IN', 'ERR_STREAM') === false);
 
 console.log(fail === 0 ? '\nrecoverable-upstream-test: OK' : `\nrecoverable-upstream-test: FAIL (${fail})`);
 process.exit(fail === 0 ? 0 : 1);

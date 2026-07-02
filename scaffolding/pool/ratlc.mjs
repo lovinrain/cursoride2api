@@ -1133,8 +1133,20 @@ function buildDeathsLines(snap, maxRows = 30) {
     out.push(color('  (this pool-manager predates death tombstones — restart with ./launch.sh up to enable)', ANSI.yellow));
     return out;
   }
-  const deaths = Array.isArray(snap.pool.recentDeaths) ? snap.pool.recentDeaths : [];
-  if (!deaths.length) { out.push(''); out.push(color('  no channel deaths recorded — the pool has been stable ✓', ANSI.green)); return out; }
+  // This tab is about channels that were READY and then died. Exclude channels
+  // that never reached ready (open failures / token throttle) — those live in the
+  // errors tab (6) / token health, not here. (pool-manager filters at source now;
+  // this also cleans up snapshots from an older pool-manager that still stored them.)
+  const allDeaths = Array.isArray(snap.pool.recentDeaths) ? snap.pool.recentDeaths : [];
+  const deaths = allDeaths.filter((t) => t.openedAt != null);
+  const neverReady = (snap.pool.neverReadyDeaths != null) ? snap.pool.neverReadyDeaths : (allDeaths.length - deaths.length);
+  const openNote = neverReady ? color(`  note: ${neverReady} channel(s) died before ever reaching ready (open / token throttle) — not shown here; see the errors tab (6).`, ANSI.dim) : null;
+  if (!deaths.length) {
+    out.push('');
+    if (openNote) out.push(openNote);
+    out.push(color('  no READY channel has died — warm channels are stable ✓', ANSI.green));
+    return out;
+  }
   // Summary: churn rate + reason tally (normalize the @Ns suffix so reap:busy@30s and @240s group).
   const norm = (r) => String(r || '?').replace(/@\d+m?s?/, '');
   const last1 = deaths.filter((t) => (t.deathAgoMs ?? Infinity) < 60000).length;
@@ -1142,21 +1154,30 @@ function buildDeathsLines(snap, maxRows = 30) {
   const tally = {};
   for (const t of deaths) { const k = norm(t.deathReason); tally[k] = (tally[k] || 0) + 1; }
   const tallyStr = Object.entries(tally).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k} ${color(String(v), ANSI.bold)}`).join('  ');
-  out.push(color(`  churn: ${last1} in last 1m · ${last5} in last 5m · ${deaths.length} shown`, last5 >= 5 ? ANSI.red + ANSI.bold : last5 > 0 ? ANSI.yellow : ANSI.dim));
+  out.push(color(`  churn: ${last1} in last 1m · ${last5} in last 5m · ${deaths.length} ready-then-dead shown`, last5 >= 5 ? ANSI.red + ANSI.bold : last5 > 0 ? ANSI.yellow : ANSI.dim));
   out.push(color('  by reason: ', ANSI.dim) + tallyStr);
-  out.push(color('  key:  worker:exhausted', ANSI.gray) + color('=never opened, token throttled (RND=0, LIFE=—)   ', ANSI.dim) + color('worker:<err>', ANSI.gray) + color('=died mid-turn on upstream error', ANSI.dim));
-  out.push(color('        reap:*', ANSI.gray) + color('=pool killed it (silent/stuck/wait-tool/ping)   ', ANSI.dim) + color('stall:upstream', ANSI.gray) + color('=Cursor stalled   ', ANSI.dim) + color('exit:*', ANSI.gray) + color('=process exit (clean/killed/crash)', ANSI.dim));
+  if (openNote) out.push(openNote);
+  out.push(color('  reason:  worker:<err>', ANSI.gray) + color('=died mid-turn   ', ANSI.dim) + color('reap:*', ANSI.gray) + color('=pool killed (silent/stuck/wait-tool/ping)   ', ANSI.dim) + color('stall:upstream', ANSI.gray) + color('=Cursor stalled   ', ANSI.dim) + color('exit:*', ANSI.gray) + color('=process exit', ANSI.dim));
+  out.push(color('  RETRY:   ', ANSI.gray) + color('↻N', ANSI.yellow) + color('=retried N× then died   ', ANSI.dim) + color('y/0', ANSI.magenta) + color('=retryable TYPE but not retried (usually a follow-up turn)   ', ANSI.dim) + color('fatal', ANSI.gray) + color('=not retryable (auth/quota/rate-limit)', ANSI.dim));
   out.push('');
-  const W = [6, 8, 19, 13, 4, 6];
-  const hdr = ['AGE', 'CHANNEL', 'GROUP', 'TOKEN', 'RND', 'LIFE'];
+  const W = [6, 8, 17, 11, 4, 5, 6];
+  const hdr = ['AGE', 'CHANNEL', 'GROUP', 'TOKEN', 'RND', 'LIFE', 'RETRY'];
   out.push('  ' + hdr.map((h, i) => color(padAnsi(h, W[i]), ANSI.bold)).join(' ') + '  ' + color('REASON / upstream error', ANSI.bold));
   for (const t of deaths.slice(0, Math.max(1, maxRows))) {
-    const life = (t.openedAt && t.deathAt) ? sd(t.deathAt - t.openedAt) : color('—', ANSI.gray);  // — = died before ever reaching ready
+    const life = (t.openedAt && t.deathAt) ? sd(t.deathAt - t.openedAt) : color('—', ANSI.gray);
     const grp = String(t.group || '?').replace(/^claude-/, '').slice(0, W[2]);
     const tok = String(t.tokenName || ('tok' + t.tokenIdx)).split('@')[0].slice(0, W[3]);
+    // RETRY cell: was the error a retryable TYPE, and how many in-place retries
+    // happened before we let the channel die. y/0 = retryable but 0 retries (the
+    // "should we have retried?" case — usually a follow-up turn; see the doc).
+    let retryCell;
+    if (t.retryable == null && t.retries == null) retryCell = color('?', ANSI.gray);
+    else if (t.retryable === false) retryCell = color('fatal', ANSI.gray);
+    else if ((t.retries || 0) > 0) retryCell = color('↻' + t.retries, ANSI.yellow);
+    else retryCell = color('y/0', ANSI.magenta);
     const sev = /quota|auth|permanent|rate.?limit|resource_exhausted/i.test((t.deathReason || '') + ' ' + (t.error || '')) ? ANSI.red : ANSI.yellow;
     let reason = color(t.deathReason || '?', sev);
-    if (t.error) reason += color('  ' + String(t.error).replace(/\s+/g, ' ').slice(0, 44), ANSI.dim);
+    if (t.error) reason += color('  ' + String(t.error).replace(/\s+/g, ' ').slice(0, 40), ANSI.dim);
     if (Array.isArray(t.pendingTools) && t.pendingTools.length) {
       reason += color(`  ⚠ held ${t.pendingTools.length} tool(s): ${t.pendingTools.map((p) => p.toolName || '?').slice(0, 3).join(',')}`, ANSI.magenta);
     }
@@ -1168,6 +1189,7 @@ function buildDeathsLines(snap, maxRows = 30) {
       padAnsi(tok, W[3]),
       padAnsi(color(String(rounds), rounds > 0 ? ANSI.green : ANSI.gray), W[4]),
       padAnsi(life, W[5]),
+      padAnsi(retryCell, W[6]),
     ].join(' ') + '  ' + reason);
   }
   return out;

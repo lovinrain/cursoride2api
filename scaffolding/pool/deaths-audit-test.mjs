@@ -20,12 +20,15 @@ const snapshot = () => ({
   pool: {
     actualSize: 2, configuredSize: 2, readyCount: 2, busyCount: 0, openingCount: 0, deadCount: 0,
     pendingRequests: 0, toolUseIndex: 0, channels: [], groups: [], tokens: [],
+    neverReadyDeaths: 7,   // channels that never reached ready (open failures) — excluded from the tab
     recentDeaths: [
-      // served turns then Cursor aborted it (the "went away after a successful turn" case)
-      { id: 'ch-11', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'worker:error', error: 'Response error: aborted', roundsServed: 5, openedAt: 1000, deathAt: 1000 + NOW_LIKE, deathAgoMs: 45000, pendingTools: [] },
-      // died holding client tools (wait-tool)
-      { id: 'ch-12', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'reap:wait-tool@1800s', error: null, roundsServed: 2, openedAt: 2000, deathAt: 2000 + 60000, deathAgoMs: 20000, pendingTools: [{ toolName: 'Bash' }, { toolName: 'Task' }] },
-      // never opened (open exhausted)
+      // served turns, then Cursor aborted mid-follow-up-turn: retryable TYPE but 0 retries (turn-1-only)
+      { id: 'ch-11', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'worker:error', error: 'Response error: aborted', roundsServed: 5, openedAt: 1000, deathAt: 1000 + NOW_LIKE, deathAgoMs: 45000, pendingTools: [], retryable: true, retries: 0 },
+      // died on its FIRST turn after retrying 4× (retryable, exhausted)
+      { id: 'ch-14', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'worker:error', error: 'RunSSE non-200: 503 Service Unavailable', roundsServed: 0, openedAt: 1500, deathAt: 1500 + 30000, deathAgoMs: 30000, pendingTools: [], retryable: true, retries: 4 },
+      // died holding client tools (wait-tool) — not a retryable stream error
+      { id: 'ch-12', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'reap:wait-tool@1800s', error: null, roundsServed: 2, openedAt: 2000, deathAt: 2000 + 60000, deathAgoMs: 20000, pendingTools: [{ toolName: 'Bash' }, { toolName: 'Task' }], retryable: false, retries: 0 },
+      // never reached ready (open exhausted) — MUST be excluded from the tab
       { id: 'ch-13', group: 'claude-opus-4-8-thinking-max-fast', tokenIdx: 0, tokenName: 'flaky@outlook.com', deathReason: 'worker:exhausted', error: 'open exhausted', roundsServed: 0, openedAt: null, deathAt: 5000, deathAgoMs: 600000, pendingTools: [] },
     ],
   },
@@ -60,11 +63,15 @@ try {
   const r = await runDeaths();
   console.log(r.split('\n').slice(0, 9).join('\n'));
   a('renders the death-audit header', /Channel deaths/.test(r), 'no header');
-  a('churn summary: 2 in last 1m, 2 in last 5m, 3 shown', /churn: 2 in last 1m · 2 in last 5m · 3 shown/.test(r), r.match(/churn:.*/)?.[0]);
-  a('reason tally present', /by reason:.*worker:error 1/.test(r) && /worker:exhausted 1/.test(r) && /reap:wait-tool 1/.test(r), r.match(/by reason:.*/)?.[0]);
-  a('served-then-aborted row shows rounds + lifetime + error', /ch-11.*\b5\b.*2\.0h.*worker:error.*Response error: aborted/.test(r), r.match(/ch-11.*/)?.[0]);
-  a('wait-tool death flags the held tools', /ch-12.*reap:wait-tool.*held 2 tool\(s\): Bash,Task/.test(r), r.match(/ch-12.*/)?.[0]);
-  a('never-opened row shows LIFE as — (died before ready)', /ch-13.*—.*worker:exhausted.*open exhausted/.test(r), r.match(/ch-13.*/)?.[0]);
+  // (1) never-ready channel EXCLUDED + noted
+  a('never-ready channel (ch-13) is EXCLUDED from the tab', !/ch-13/.test(r), 'ch-13 leaked in');
+  a('notes the excluded never-ready count (7)', /7 channel\(s\) died before ever reaching ready/.test(r), r.match(/note:.*/)?.[0]);
+  a('churn counts only ready-then-dead (3 shown, not 4)', /churn: 3 in last 1m · 3 in last 5m · 3 ready-then-dead shown/.test(r), r.match(/churn:.*/)?.[0]);
+  a('reason tally excludes worker:exhausted', /by reason:.*worker:error 2/.test(r) && /reap:wait-tool 1/.test(r) && !/by reason:.*worker:exhausted/.test(r), r.match(/by reason:.*/)?.[0]);
+  // (2) RETRY column
+  a('served-then-aborted row: retryable but 0 retries → y/0 (follow-up turn)', /ch-11.*\b5\b.*2\.0h.*y\/0.*worker:error.*Response error: aborted/.test(r), r.match(/ch-11.*/)?.[0]);
+  a('first-turn 503 death: retried 4× → ↻4', /ch-14.*↻4.*worker:error.*503/.test(r), r.match(/ch-14.*/)?.[0]);
+  a('wait-tool death: not retryable → fatal + held tools', /ch-12.*fatal.*reap:wait-tool.*held 2 tool\(s\): Bash,Task/.test(r), r.match(/ch-12.*/)?.[0]);
 } catch (e) { console.log('  ✗ harness error:', e.message); fail++; }
 await new Promise((r) => pool.close(r));
 try { fs.unlinkSync(SOCK); } catch {}

@@ -667,7 +667,7 @@ function attachLiveCallbacks() {
         process.exit(1);
       }
     },
-    onError: (err) => {
+    onError: (err, meta) => {
       const msg = String(err?.message || err || '');
       send({ type: 'error', channelId: CHANNEL_ID, requestId: currentRequestId, message: msg });
       currentRequestId = null;
@@ -676,7 +676,10 @@ function attachLiveCallbacks() {
       // ambiguous live errors (stalls, reaps, generic stream errors) unattributed
       // so they are not mistaken for a bad token.
       const tokenFaultKind = classifyTokenFaultKind(msg);
-      setState('dead', tokenFaultKind ? { error: msg, errorKind: tokenFaultKind } : { error: msg });
+      // Retry diagnostics from cursor-agent (how many in-place retries it did, and
+      // whether the error TYPE was retryable) → tombstone → death page.
+      const retryMeta = { retries: meta?.retries ?? 0, retryable: meta?.retryable ?? null };
+      setState('dead', tokenFaultKind ? { error: msg, errorKind: tokenFaultKind, ...retryMeta } : { error: msg, ...retryMeta });
       process.exit(1);
     },
   });

@@ -95,6 +95,15 @@ function isRecoverableUpstreamError(msg, code) {
     || (c === 'ERR_STREAM' && /abort|reset|closed|socket|econn|timed?\s*out|broken|network/i.test(m))  // "Response error: aborted"
     || /RunSSE non-200:\s*50[234]|Bad Gateway|Service Unavailable|Response error: aborted|BidiAppend.*(fetch error|returned 50[234])/i.test(m);
 }
+// Is the error a retryable/transient TYPE at all — transport (NGHTTP2/socket) OR
+// recoverable-upstream — ignoring the per-turn gates. Used to LABEL a death so the
+// death page can say "retryable? yes, but we retried N times" vs "fatal, no retry".
+function isRetryableTransientType(msg, code) {
+  const m = String(msg || '');
+  if (isFatalUpstreamFault(m)) return false;
+  return /NGHTTP2_REFUSED_STREAM|REFUSED_STREAM|NGHTTP2_INTERNAL_ERROR|INTERNAL_ERROR|socket hang up|ECONNRESET|EPIPE|ETIMEDOUT/i.test(m)
+    || isRecoverableUpstreamError(m, code);
+}
 
 // ── Module-load: kick off proto load so the first startConversation()
 //   call is fast. cursor-agent.js already pre-warms, but if this module
@@ -345,7 +354,10 @@ function startConversation(token, options = {}) {
   function fail(msg) {
     if (closed) return;
     dumpStreamSummary(msg, 'fail');
-    currentCallbacks.onError(msg);
+    // Pass retry diagnostics so the death page can show whether this error TYPE was
+    // retryable and how many in-place retries we did before giving up. retries==0 on
+    // a retryable type usually means it was a follow-up turn (turn-1-only retry).
+    currentCallbacks.onError(msg, { retries: retryAttempts, retryable: isRetryableTransientType(msg) });
     close();
   }
 
@@ -1222,4 +1234,5 @@ module.exports = {
   // Exposed for tests: the recoverable-vs-fatal retry classification.
   isRecoverableUpstreamError,
   isFatalUpstreamFault,
+  isRetryableTransientType,
 };

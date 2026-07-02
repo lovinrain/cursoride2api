@@ -198,8 +198,14 @@ function getPendingToolsForChannel(channelId) {
 // "channel not present"). Tune size via RATLC_DEAD_TOMBSTONE_MAX.
 const deadTombstones = [];
 const DEAD_TOMBSTONE_MAX = Math.max(20, parseInt(process.env.RATLC_DEAD_TOMBSTONE_MAX || '60', 10));
+let neverReadyDeaths = 0;   // channels that died WITHOUT ever reaching ready (open failures)
 function recordDeadTombstone(ch) {
   if (!ch || !ch.id) return;
+  // The death tab is about channels that were READY and then went away. A channel
+  // that never reached ready never "died" in that sense — it failed to OPEN (token
+  // throttle etc.), which is already visible in the token error history / pool log.
+  // Keep those out of recentDeaths so the tab stays about real channel deaths.
+  if (!ch.openedAt) { neverReadyDeaths++; return; }
   deadTombstones.unshift({
     id: ch.id,
     group: ch.group || null,
@@ -213,6 +219,9 @@ function recordDeadTombstone(ch) {
     pendingTools: getPendingToolsForChannel(ch.id),
     openedAt: ch.openedAt || null,
     roundsServed: ch.roundsServed || 0,
+    // (2) retry diagnostics — did the worker retry this turn before giving up?
+    retries: ch.deathRetries ?? null,       // # in-place retries done
+    retryable: ch.deathRetryable ?? null,   // was the error a retryable/transient TYPE?
   });
   while (deadTombstones.length > DEAD_TOMBSTONE_MAX) deadTombstones.pop();
 }
@@ -822,6 +831,9 @@ function handleWorkerMessage(ch, msg) {
       }
       ch.error = msg.error || null;
       if (msg.errorKind) ch.errorKind = msg.errorKind;
+      // Retry diagnostics from the worker (for the death page's RETRY column).
+      if (msg.retries != null) ch.deathRetries = msg.retries;
+      if (msg.retryable != null) ch.deathRetryable = msg.retryable;
       // Worker-initiated death (auth/quota_exhausted/open-exhausted/…) — give it the
       // same semantic deathReason + post-mortem stamps as a watchdog reap, so EVERY
       // dead row in the TUI tells a uniform story (and gets the red treatment),
@@ -1777,6 +1789,7 @@ function statusSnapshot() {
       consumedToolUseIndex: consumedToolUseIndex.size,
       sessionAffinity: sessionAffinity.size,
       recentDeaths: deadTombstones.slice(0, 40).map((t) => ({ ...t, deathAgoMs: now - t.deathAt })),
+      neverReadyDeaths,   // channels that died before ever reaching ready (open failures; excluded from recentDeaths)
     },
     config: {
       model: POOL_MODEL,
